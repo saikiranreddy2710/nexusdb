@@ -13,6 +13,7 @@ nexus-wal = { workspace = true }
 nexus-mvcc = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
