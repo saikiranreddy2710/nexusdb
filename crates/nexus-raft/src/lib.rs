@@ -75,6 +75,9 @@ pub mod rpc;
 /// Network transport layer.
 pub mod transport;
 
+/// Persistent storage layer.
+pub mod storage;
+
 // Re-export key types for convenience
 pub use log::RaftLog;
 pub use node::{RaftConfig, RaftNode, Role};
@@ -84,6 +87,7 @@ pub use rpc::{
 };
 pub use state_machine::StateMachine;
 pub use transport::{Transport, TransportError};
+pub use storage::{FileStorage, PersistentLog, RaftState, Storage, StorageConfig, StorageError};
 
 /// A log index (position in the Raft log).
 ///

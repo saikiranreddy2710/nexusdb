@@ -19,6 +19,7 @@ bincode = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 dashmap = { workspace = true }
+crc32fast = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

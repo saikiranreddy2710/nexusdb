@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::rpc::{NodeId, RaftMessage};
 
-use super::frame::{self, HEADER_SIZE, MAX_MESSAGE_SIZE};
+use super::frame;
 use super::{IncomingMessage, NodeAddr, Transport, TransportError, TransportResult};
 
 /// Connection state for a peer.
