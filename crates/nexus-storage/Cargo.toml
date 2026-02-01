@@ -7,6 +7,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+io-uring = ["dep:io-uring"]
+
 [dependencies]
 nexus-common = { workspace = true }
 bytes = { workspace = true }
@@ -14,6 +18,13 @@ parking_lot = { workspace = true }
 crossbeam = { workspace = true }
 memmap2 = { workspace = true }
 crc32fast = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+
+# io_uring support (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

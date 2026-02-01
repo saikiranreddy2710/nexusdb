@@ -83,6 +83,12 @@ proptest = "1.4"
 # CRC for checksums
 crc32fast = "1.3"
 
+# io_uring for Linux
+io-uring = "0.6"
+
+# libc for low-level system calls
+libc = "0.2"
+
 # Metrics
 metrics = "0.22"
 
