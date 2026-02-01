@@ -12,6 +12,7 @@ nexus-common = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-epoch = { workspace = true }
 dashmap = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

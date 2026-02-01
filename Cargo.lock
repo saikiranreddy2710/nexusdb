@@ -848,6 +848,7 @@ dependencies = [
 name = "nexus-mvcc"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "crossbeam-epoch",
  "dashmap",
  "nexus-common",
