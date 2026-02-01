@@ -9,8 +9,9 @@ repository.workspace = true
 
 [dependencies]
 nexus-common = { workspace = true }
-nexus-query = { workspace = true }
 thiserror = { workspace = true }
+sqlparser = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
