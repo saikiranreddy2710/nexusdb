@@ -1,0 +1,22 @@
+[package]
+name = "nexus-query"
+description = "Query execution engine for NexusDB (Photon)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-common = { workspace = true }
+nexus-storage = { workspace = true }
+nexus-txn = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# Benchmarks will be added in Phase 5
+# [[bench]]
+# name = "query"
+# harness = false

@@ -1,0 +1,25 @@
+[package]
+name = "nexus-wal"
+description = "Write-ahead logging for NexusDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-common = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }
+crc32fast = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+# Benchmarks will be added in Phase 1
+# [[bench]]
+# name = "wal"
+# harness = false

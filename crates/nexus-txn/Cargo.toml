@@ -1,0 +1,18 @@
+[package]
+name = "nexus-txn"
+description = "Transaction manager for NexusDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-common = { workspace = true }
+nexus-wal = { workspace = true }
+nexus-mvcc = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

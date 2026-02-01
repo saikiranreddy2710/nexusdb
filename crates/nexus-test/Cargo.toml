@@ -1,0 +1,23 @@
+[package]
+name = "nexus-test"
+description = "Integration tests for NexusDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-common = { workspace = true }
+nexus-storage = { workspace = true }
+nexus-buffer = { workspace = true }
+nexus-wal = { workspace = true }
+nexus-txn = { workspace = true }
+nexus-raft = { workspace = true }
+nexus-server = { workspace = true }
+nexus-client = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

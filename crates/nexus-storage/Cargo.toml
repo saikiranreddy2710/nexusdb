@@ -1,0 +1,20 @@
+[package]
+name = "nexus-storage"
+description = "SageTree storage engine for NexusDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-common = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }
+memmap2 = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }

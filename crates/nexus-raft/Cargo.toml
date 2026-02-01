@@ -1,0 +1,21 @@
+[package]
+name = "nexus-raft"
+description = "Raft++ consensus protocol for NexusDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-common = { workspace = true }
+nexus-wal = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
