@@ -24,6 +24,11 @@
 //! │                    │ (Persistent │                         │
 //! │                    │   log)      │                         │
 //! │                    └─────────────┘                         │
+//! │                           │                                 │
+//! │                    ┌──────┴──────┐                         │
+//! │                    │  Transport  │                         │
+//! │                    │ (Network)   │                         │
+//! │                    └─────────────┘                         │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -67,6 +72,9 @@ pub mod state_machine;
 /// RPC message types.
 pub mod rpc;
 
+/// Network transport layer.
+pub mod transport;
+
 // Re-export key types for convenience
 pub use log::RaftLog;
 pub use node::{RaftConfig, RaftNode, Role};
@@ -75,6 +83,7 @@ pub use rpc::{
     RaftMessage, RequestVote, SnapshotResponse, Term, VoteResponse,
 };
 pub use state_machine::StateMachine;
+pub use transport::{Transport, TransportError};
 
 /// A log index (position in the Raft log).
 ///

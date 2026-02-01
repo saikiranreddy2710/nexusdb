@@ -400,11 +400,15 @@ mod tests {
 
         // Tick until timeout
         let mut ticked = 0;
-        while !state.tick() {
+        loop {
             ticked += 1;
+            if state.tick() {
+                break;
+            }
             assert!(ticked <= MAX_ELECTION_TIMEOUT);
         }
 
+        // Election timeout should be within the expected range
         assert!(ticked >= MIN_ELECTION_TIMEOUT);
         assert!(ticked <= MAX_ELECTION_TIMEOUT);
     }

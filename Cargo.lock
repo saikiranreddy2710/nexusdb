@@ -873,13 +873,16 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "bytes",
+ "dashmap",
  "nexus-common",
  "nexus-wal",
  "parking_lot",
  "rand 0.8.5",
  "serde",
  "tempfile",
+ "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
