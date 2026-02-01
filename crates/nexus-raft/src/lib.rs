@@ -81,6 +81,9 @@ pub mod storage;
 /// Cluster membership and configuration changes.
 pub mod membership;
 
+/// Leader leases for local reads.
+pub mod lease;
+
 // Re-export key types for convenience
 pub use log::RaftLog;
 pub use node::{RaftConfig, RaftNode, Role};
@@ -92,6 +95,7 @@ pub use state_machine::StateMachine;
 pub use transport::{Transport, TransportError};
 pub use storage::{FileStorage, PersistentLog, RaftState, Storage, StorageConfig, StorageError};
 pub use membership::{Configuration, ConfigurationManager, MembershipChange, QuorumTracker};
+pub use lease::{LeaseConfig, LeaseManager, ReadIndex, ReadIndexQueue, ReadStrategy};
 
 /// A log index (position in the Raft log).
 ///
