@@ -5,7 +5,7 @@
 
 mod database;
 
-pub use database::{NexusError, ErrorCode};
+pub use database::{ErrorCode, NexusError};
 
 /// Result type alias for NexusDB operations.
 pub type NexusResult<T> = std::result::Result<T, NexusError>;
