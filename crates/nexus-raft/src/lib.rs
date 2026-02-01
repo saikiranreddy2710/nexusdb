@@ -78,6 +78,9 @@ pub mod transport;
 /// Persistent storage layer.
 pub mod storage;
 
+/// Cluster membership and configuration changes.
+pub mod membership;
+
 // Re-export key types for convenience
 pub use log::RaftLog;
 pub use node::{RaftConfig, RaftNode, Role};
@@ -88,6 +91,7 @@ pub use rpc::{
 pub use state_machine::StateMachine;
 pub use transport::{Transport, TransportError};
 pub use storage::{FileStorage, PersistentLog, RaftState, Storage, StorageConfig, StorageError};
+pub use membership::{Configuration, ConfigurationManager, MembershipChange, QuorumTracker};
 
 /// A log index (position in the Raft log).
 ///
@@ -117,6 +121,18 @@ pub enum RaftError {
     InvalidConfig(String),
     /// Snapshot is being installed.
     SnapshotInProgress,
+    /// A configuration change is already in progress.
+    ConfigChangeInProgress,
+    /// Node already exists in the cluster.
+    NodeAlreadyExists(NodeId),
+    /// Node not found in the cluster.
+    NodeNotFound(NodeId),
+    /// Cannot remove the last node.
+    LastNode,
+    /// Configuration is empty.
+    EmptyConfiguration,
+    /// Invalid configuration data.
+    InvalidConfiguration(String),
     /// Internal error.
     Internal(String),
 }
@@ -137,6 +153,12 @@ impl std::fmt::Display for RaftError {
             }
             RaftError::InvalidConfig(msg) => write!(f, "invalid config: {}", msg),
             RaftError::SnapshotInProgress => write!(f, "snapshot in progress"),
+            RaftError::ConfigChangeInProgress => write!(f, "configuration change in progress"),
+            RaftError::NodeAlreadyExists(id) => write!(f, "node {} already exists", id),
+            RaftError::NodeNotFound(id) => write!(f, "node {} not found", id),
+            RaftError::LastNode => write!(f, "cannot remove the last node"),
+            RaftError::EmptyConfiguration => write!(f, "configuration cannot be empty"),
+            RaftError::InvalidConfiguration(msg) => write!(f, "invalid configuration: {}", msg),
             RaftError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }
