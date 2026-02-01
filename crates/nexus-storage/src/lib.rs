@@ -17,5 +17,8 @@ pub mod page;
 /// File management and I/O
 pub mod file;
 
+/// Buffer pool management
+pub mod buffer;
+
 /// SageTree implementation
 pub mod sagetree;
