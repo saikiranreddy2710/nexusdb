@@ -823,6 +823,7 @@ name = "nexus-client"
 version = "0.1.0"
 dependencies = [
  "nexus-common",
+ "parking_lot",
  "prost",
  "tempfile",
  "thiserror",
