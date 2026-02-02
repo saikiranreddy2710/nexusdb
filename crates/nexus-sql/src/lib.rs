@@ -26,3 +26,6 @@ pub mod physical;
 
 /// Query execution
 pub mod executor;
+
+/// Storage integration
+pub mod storage;

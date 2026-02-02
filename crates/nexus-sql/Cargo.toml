@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 nexus-common = { workspace = true }
+nexus-storage = { workspace = true }
 thiserror = { workspace = true }
 sqlparser = { workspace = true }
 serde = { workspace = true }

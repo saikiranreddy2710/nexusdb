@@ -911,6 +911,7 @@ name = "nexus-sql"
 version = "0.1.0"
 dependencies = [
  "nexus-common",
+ "nexus-storage",
  "proptest",
  "serde",
  "sqlparser",
