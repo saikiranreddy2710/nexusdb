@@ -13,6 +13,7 @@ nexus-storage = { workspace = true }
 nexus-buffer = { workspace = true }
 nexus-wal = { workspace = true }
 nexus-txn = { workspace = true }
+nexus-mvcc = { workspace = true }
 nexus-raft = { workspace = true }
 nexus-query = { workspace = true }
 nexus-sql = { workspace = true }
