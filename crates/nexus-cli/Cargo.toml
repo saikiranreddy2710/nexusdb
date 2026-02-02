@@ -1,0 +1,52 @@
+[package]
+name = "nexus-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for NexusDB"
+keywords = ["database", "cli", "sql", "repl"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "nexus"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+nexus-client = { workspace = true }
+
+# CLI framework
+clap = { workspace = true }
+
+# REPL / readline
+rustyline = { workspace = true }
+
+# Output formatting
+comfy-table = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization (for JSON output)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+dirs = { workspace = true }
+
+# Time formatting
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

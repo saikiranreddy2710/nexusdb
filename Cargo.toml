@@ -13,6 +13,7 @@ members = [
     "crates/nexus-proto",
     "crates/nexus-server",
     "crates/nexus-client",
+    "crates/nexus-cli",
     "crates/nexus-test",
 ]
 
@@ -105,6 +106,12 @@ libc = "0.2"
 
 # Metrics
 metrics = "0.22"
+
+# CLI tools
+clap = { version = "4.4", features = ["derive", "env"] }
+rustyline = "13.0"
+comfy-table = "7.1"
+dirs = "5.0"
 
 [profile.dev]
 opt-level = 0
