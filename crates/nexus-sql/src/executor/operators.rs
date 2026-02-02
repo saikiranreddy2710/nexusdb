@@ -43,6 +43,8 @@ pub struct SeqScanExec {
     current_batch: usize,
     /// Projection indices.
     projection: Option<Vec<usize>>,
+    /// Filters to apply during scan.
+    filters: Vec<PhysicalExpr>,
 }
 
 impl SeqScanExec {
@@ -54,6 +56,7 @@ impl SeqScanExec {
             data,
             current_batch: 0,
             projection: None,
+            filters: Vec::new(),
         }
     }
 
@@ -69,10 +72,17 @@ impl SeqScanExec {
         self
     }
 
+    /// Creates a scan with filters.
+    pub fn with_filters(mut self, filters: Vec<PhysicalExpr>) -> Self {
+        self.filters = filters;
+        self
+    }
+
     /// Creates from a SeqScanOperator.
     pub fn from_physical(op: &SeqScanOperator, data: Vec<RecordBatch>) -> Self {
         let mut exec = Self::new(op.projected_schema.clone(), op.table_name.clone(), data);
         exec.projection = op.projection.clone();
+        exec.filters = op.filters.clone();
         exec
     }
 }
@@ -83,22 +93,54 @@ impl Operator for SeqScanExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        if self.current_batch >= self.data.len() {
-            return Ok(None);
+        while self.current_batch < self.data.len() {
+            let batch = &self.data[self.current_batch];
+            self.current_batch += 1;
+
+            // Apply filters first (before projection, since filters reference original schema)
+            let filtered_batch = if self.filters.is_empty() {
+                batch.clone()
+            } else {
+                // Get the table schema (before projection) from the batch
+                let batch_schema = batch.schema();
+                let mut mask = Vec::with_capacity(batch.num_rows());
+
+                for row in batch.rows() {
+                    // Evaluate all filter predicates
+                    let passes = self.filters.iter().all(|filter| {
+                        match evaluate_expr(filter, &row, batch_schema) {
+                            Ok(val) => val.to_bool().unwrap_or(false),
+                            Err(_) => false,
+                        }
+                    });
+                    mask.push(passes);
+                }
+
+                // If no rows pass, continue to next batch
+                if !mask.iter().any(|&b| b) {
+                    continue;
+                }
+
+                batch.filter(&mask).map_err(ExecutionError::Internal)?
+            };
+
+            // Skip empty batches after filtering
+            if filtered_batch.is_empty() {
+                continue;
+            }
+
+            // Apply projection if specified
+            if let Some(ref indices) = self.projection {
+                return filtered_batch
+                    .project(indices)
+                    .map(Some)
+                    .map_err(ExecutionError::Internal);
+            } else {
+                return Ok(Some(filtered_batch));
+            }
         }
 
-        let batch = &self.data[self.current_batch];
-        self.current_batch += 1;
-
-        // Apply projection if specified
-        if let Some(ref indices) = self.projection {
-            batch
-                .project(indices)
-                .map(Some)
-                .map_err(ExecutionError::Internal)
-        } else {
-            Ok(Some(batch.clone()))
-        }
+        Ok(None)
     }
 
     fn reset(&mut self) {

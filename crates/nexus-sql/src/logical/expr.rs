@@ -641,8 +641,13 @@ impl LogicalExpr {
                 format!("{} {} {}", left.output_name(), op, right.output_name())
             }
             LogicalExpr::AggregateFunction { name, args, .. } => {
-                let args_str: Vec<_> = args.iter().map(|a| a.output_name()).collect();
-                format!("{}({})", name, args_str.join(", "))
+                // CountStar is displayed as "COUNT(*)" already, no need to add args
+                if matches!(name, AggregateFunc::CountStar) {
+                    "COUNT(*)".to_string()
+                } else {
+                    let args_str: Vec<_> = args.iter().map(|a| a.output_name()).collect();
+                    format!("{}({})", name, args_str.join(", "))
+                }
             }
             LogicalExpr::ScalarFunction { name, args, .. } => {
                 let args_str: Vec<_> = args.iter().map(|a| a.output_name()).collect();

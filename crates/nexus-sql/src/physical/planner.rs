@@ -86,8 +86,11 @@ impl<'a> PhysicalPlanner<'a> {
         }
 
         // Convert and push down filters
+        // IMPORTANT: Use table_schema (not projected_schema) because filters may reference
+        // columns that are not in the final projection. The executor will apply filters
+        // on the full row before applying the projection.
         for filter in &scan.filters {
-            if let Ok(phys_filter) = create_physical_expr(filter, &scan.projected_schema) {
+            if let Ok(phys_filter) = create_physical_expr(filter, &scan.table_schema) {
                 phys_scan = phys_scan.with_filter(phys_filter);
             }
         }

@@ -31,7 +31,15 @@ pub struct TableStore {
 impl TableStore {
     /// Creates a new table store.
     pub fn new(info: TableInfo) -> Self {
-        let encoder = RowEncoder::new(info.table_id, info.primary_key.clone(), info.schema.clone());
+        // If no primary key is specified, use the first column as the default
+        // This ensures rows can be uniquely identified
+        let primary_key = if info.primary_key.is_empty() && !info.schema.is_empty() {
+            vec![0] // Use first column as implicit primary key
+        } else {
+            info.primary_key.clone()
+        };
+
+        let encoder = RowEncoder::new(info.table_id, primary_key, info.schema.clone());
         let decoder = RowDecoder::new(info.schema.clone());
 
         Self {

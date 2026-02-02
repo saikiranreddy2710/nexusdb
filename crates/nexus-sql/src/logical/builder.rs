@@ -678,6 +678,15 @@ fn build_expr(expr: &AstExpr, schema: &Schema) -> PlanResult<LogicalExpr> {
 
             if is_aggregate_function(&func.name) {
                 let agg_func = convert_aggregate_func(&func.name)?;
+
+                // Handle COUNT(*) specially - convert to CountStar with no args
+                let (agg_func, args) =
+                    if matches!(agg_func, AggregateFunc::Count) && has_wildcard_arg(&args) {
+                        (AggregateFunc::CountStar, vec![])
+                    } else {
+                        (agg_func, args)
+                    };
+
                 Ok(LogicalExpr::AggregateFunction {
                     name: agg_func,
                     args,
@@ -762,6 +771,12 @@ fn is_aggregate_function(name: &str) -> bool {
             | "BOOL_AND"
             | "BOOL_OR"
     )
+}
+
+/// Checks if the argument list contains a wildcard expression.
+fn has_wildcard_arg(args: &[LogicalExpr]) -> bool {
+    args.iter()
+        .any(|a| matches!(a, LogicalExpr::Wildcard | LogicalExpr::QualifiedWildcard(_)))
 }
 
 fn convert_aggregate_func(name: &str) -> PlanResult<AggregateFunc> {

@@ -617,17 +617,32 @@ pub fn create_physical_aggregate(
             distinct,
             filter,
         } => {
+            // Filter out wildcards from args - they're handled specially
+            // (e.g., COUNT(*) should have no physical args)
             let phys_args: Result<Vec<_>, _> = args
                 .iter()
+                .filter(|a| !matches!(a, LogicalExpr::Wildcard | LogicalExpr::QualifiedWildcard(_)))
                 .map(|a| create_physical_expr(a, schema))
                 .collect();
+
+            // If this is COUNT with wildcard arg, treat as CountStar
+            let func = if matches!(func, AggregateFunc::Count)
+                && args
+                    .iter()
+                    .any(|a| matches!(a, LogicalExpr::Wildcard | LogicalExpr::QualifiedWildcard(_)))
+            {
+                AggregateFunc::CountStar
+            } else {
+                *func
+            };
+
             let phys_filter = filter
                 .as_ref()
                 .map(|f| create_physical_expr(f, schema).map(Box::new))
                 .transpose()?;
 
             Ok(PhysicalAggregateExpr {
-                func: *func,
+                func,
                 args: phys_args?,
                 distinct: *distinct,
                 filter: phys_filter,

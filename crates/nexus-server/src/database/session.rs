@@ -827,4 +827,57 @@ mod tests {
             assert_eq!(result.total_rows, 1);
         }
     }
+
+    #[test]
+    fn test_session_select_with_where() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (2, 'Bob')")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (3, 'Charlie')")
+            .unwrap();
+
+        // Test SELECT with WHERE clause
+        let result = session.execute("SELECT * FROM users WHERE id = 1").unwrap();
+
+        if let StatementResult::Query(query_result) = result {
+            assert_eq!(
+                query_result.total_rows, 1,
+                "Expected 1 row for id = 1, got {}",
+                query_result.total_rows
+            );
+            let rows = query_result.rows();
+            assert_eq!(rows.len(), 1);
+            // First column should be id = 1
+            assert_eq!(rows[0].get(0), Some(&Value::Int(1)));
+        } else {
+            panic!("expected Query result");
+        }
+
+        // Test SELECT with WHERE clause and partial projection
+        let result = session
+            .execute("SELECT name FROM users WHERE id = 2")
+            .unwrap();
+
+        if let StatementResult::Query(query_result) = result {
+            assert_eq!(
+                query_result.total_rows, 1,
+                "Expected 1 row for id = 2, got {}",
+                query_result.total_rows
+            );
+            let rows = query_result.rows();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&Value::String("Bob".to_string())));
+        } else {
+            panic!("expected Query result");
+        }
+    }
 }
