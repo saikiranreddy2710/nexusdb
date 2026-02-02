@@ -60,3 +60,5 @@ pub use database::{
     Database, DatabaseConfig, DatabaseError, DatabaseResult, DatabaseStats, ExecuteResult, Session,
     SessionConfig, SessionId, SessionState, StatementResult,
 };
+
+pub use config::{ServerConfig, ServerConfigBuilder};

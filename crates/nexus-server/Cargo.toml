@@ -7,6 +7,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "nexusd"
+path = "src/bin/nexusd.rs"
+
 [dependencies]
 nexus-common = { workspace = true }
 nexus-storage = { workspace = true }
@@ -27,6 +31,12 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

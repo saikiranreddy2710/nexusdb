@@ -1145,7 +1145,10 @@ dependencies = [
 name = "nexus-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "dashmap",
+ "dirs",
  "futures-core",
  "futures-util",
  "nexus-buffer",
@@ -1160,8 +1163,11 @@ dependencies = [
  "nexus-wal",
  "parking_lot",
  "prost",
+ "serde",
  "tempfile",
+ "thiserror",
  "tokio",
+ "toml",
  "tonic",
  "tracing",
  "tracing-subscriber",
