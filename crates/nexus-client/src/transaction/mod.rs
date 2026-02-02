@@ -321,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn test_transaction_begin() {
         let client = mock_client();
-        client.connect().await.unwrap();
+        // connect_default() already connects in mock mode
 
         let txn = client.begin().await.unwrap();
         assert!(txn.is_active());
@@ -331,7 +331,6 @@ mod tests {
     #[tokio::test]
     async fn test_transaction_commit() {
         let client = mock_client();
-        client.connect().await.unwrap();
 
         let txn = client.begin().await.unwrap();
         txn.commit().await.unwrap();
@@ -341,7 +340,6 @@ mod tests {
     #[tokio::test]
     async fn test_transaction_rollback() {
         let client = mock_client();
-        client.connect().await.unwrap();
 
         let txn = client.begin().await.unwrap();
         txn.rollback().await.unwrap();
@@ -351,7 +349,6 @@ mod tests {
     #[tokio::test]
     async fn test_transaction_execute() {
         let client = mock_client();
-        client.connect().await.unwrap();
 
         let txn = client.begin().await.unwrap();
         let result = txn.execute("SELECT 1").await;
@@ -365,7 +362,6 @@ mod tests {
         use super::TransactionExt;
         
         let client = mock_client();
-        client.connect().await.unwrap();
 
         let result: Result<i32, ClientError> = client
             .run_transaction(|txn| {
@@ -385,7 +381,6 @@ mod tests {
         use super::TransactionExt;
         
         let client = mock_client();
-        client.connect().await.unwrap();
 
         let result: Result<i32, ClientError> = client
             .run_transaction(|_txn| {

@@ -17,11 +17,16 @@ nexus-mvcc = { workspace = true }
 nexus-raft = { workspace = true }
 nexus-query = { workspace = true }
 nexus-sql = { workspace = true }
+nexus-proto = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

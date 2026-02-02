@@ -1,0 +1,419 @@
+// NexusDB gRPC Protocol Definition
+syntax = "proto3";
+
+package nexus;
+
+// ============================================================================
+// NexusDB Service - Main database service
+// ============================================================================
+
+service NexusDB {
+    // Execute a SQL statement (query or command)
+    rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+    
+    // Execute a streaming query (for large result sets)
+    rpc ExecuteStream(ExecuteRequest) returns (stream RowBatch);
+    
+    // Prepare a statement for later execution
+    rpc Prepare(PrepareRequest) returns (PrepareResponse);
+    
+    // Execute a prepared statement
+    rpc ExecutePrepared(ExecutePreparedRequest) returns (ExecuteResponse);
+    
+    // Transaction management
+    rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);
+    rpc Commit(CommitRequest) returns (CommitResponse);
+    rpc Rollback(RollbackRequest) returns (RollbackResponse);
+    
+    // Connection management
+    rpc Ping(PingRequest) returns (PingResponse);
+    rpc GetServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+}
+
+// ============================================================================
+// Execute Request/Response
+// ============================================================================
+
+message ExecuteRequest {
+    // The SQL statement to execute
+    string sql = 1;
+    
+    // Optional parameters for parameterized queries
+    repeated Value parameters = 2;
+    
+    // Optional transaction ID (for transactional execution)
+    optional uint64 transaction_id = 3;
+    
+    // Maximum number of rows to return (0 = unlimited)
+    uint32 max_rows = 4;
+    
+    // Query timeout in milliseconds (0 = use server default)
+    uint32 timeout_ms = 5;
+}
+
+message ExecuteResponse {
+    // Whether the operation was successful
+    bool success = 1;
+    
+    // Error message if not successful
+    optional string error = 2;
+    
+    // Error code if not successful
+    optional ErrorCode error_code = 3;
+    
+    // The result of the operation
+    oneof result {
+        QueryResult query_result = 4;
+        CommandResult command_result = 5;
+    }
+    
+    // Execution statistics
+    ExecutionStats stats = 6;
+}
+
+// ============================================================================
+// Query Results
+// ============================================================================
+
+message QueryResult {
+    // Column metadata
+    repeated ColumnInfo columns = 1;
+    
+    // Row data
+    repeated Row rows = 2;
+    
+    // Whether there are more rows available
+    bool has_more = 3;
+}
+
+message CommandResult {
+    // The type of command executed
+    CommandType command_type = 1;
+    
+    // Number of rows affected
+    uint64 rows_affected = 2;
+    
+    // Optional message
+    optional string message = 3;
+}
+
+message RowBatch {
+    // Batch of rows for streaming
+    repeated Row rows = 1;
+    
+    // Whether this is the last batch
+    bool is_last = 2;
+}
+
+message Row {
+    // Values in the row
+    repeated Value values = 1;
+}
+
+message ColumnInfo {
+    // Column name
+    string name = 1;
+    
+    // Column data type
+    DataType data_type = 2;
+    
+    // Whether the column is nullable
+    bool nullable = 3;
+    
+    // Optional table name
+    optional string table_name = 4;
+}
+
+// ============================================================================
+// Value Types
+// ============================================================================
+
+message Value {
+    oneof value {
+        // Null value (no additional data needed)
+        bool is_null = 1;
+        
+        // Boolean
+        bool bool_value = 2;
+        
+        // Integer types
+        int32 int32_value = 3;
+        int64 int64_value = 4;
+        
+        // Floating point types
+        float float_value = 5;
+        double double_value = 6;
+        
+        // String
+        string string_value = 7;
+        
+        // Binary data
+        bytes bytes_value = 8;
+        
+        // Date/Time types (as epoch milliseconds)
+        int64 timestamp_value = 9;
+        int32 date_value = 10;  // Days since epoch
+        int64 time_value = 11;  // Microseconds since midnight
+        
+        // Decimal (as string for precision)
+        string decimal_value = 12;
+    }
+}
+
+enum DataType {
+    DATA_TYPE_UNKNOWN = 0;
+    DATA_TYPE_NULL = 1;
+    DATA_TYPE_BOOLEAN = 2;
+    DATA_TYPE_INT32 = 3;
+    DATA_TYPE_INT64 = 4;
+    DATA_TYPE_FLOAT32 = 5;
+    DATA_TYPE_FLOAT64 = 6;
+    DATA_TYPE_STRING = 7;
+    DATA_TYPE_BYTES = 8;
+    DATA_TYPE_TIMESTAMP = 9;
+    DATA_TYPE_DATE = 10;
+    DATA_TYPE_TIME = 11;
+    DATA_TYPE_DECIMAL = 12;
+}
+
+enum CommandType {
+    COMMAND_TYPE_UNKNOWN = 0;
+    COMMAND_TYPE_CREATE_TABLE = 1;
+    COMMAND_TYPE_DROP_TABLE = 2;
+    COMMAND_TYPE_CREATE_INDEX = 3;
+    COMMAND_TYPE_DROP_INDEX = 4;
+    COMMAND_TYPE_INSERT = 5;
+    COMMAND_TYPE_UPDATE = 6;
+    COMMAND_TYPE_DELETE = 7;
+    COMMAND_TYPE_BEGIN = 8;
+    COMMAND_TYPE_COMMIT = 9;
+    COMMAND_TYPE_ROLLBACK = 10;
+}
+
+// ============================================================================
+// Prepared Statements
+// ============================================================================
+
+message PrepareRequest {
+    // The SQL statement to prepare
+    string sql = 1;
+    
+    // Optional statement name
+    optional string name = 2;
+}
+
+message PrepareResponse {
+    // Whether the operation was successful
+    bool success = 1;
+    
+    // Error message if not successful
+    optional string error = 2;
+    
+    // Statement ID for later execution
+    uint64 statement_id = 3;
+    
+    // Parameter metadata
+    repeated ParameterInfo parameters = 4;
+    
+    // Result column metadata (if known)
+    repeated ColumnInfo columns = 5;
+}
+
+message ParameterInfo {
+    // Parameter position (1-based)
+    uint32 position = 1;
+    
+    // Expected data type
+    DataType data_type = 2;
+    
+    // Optional parameter name
+    optional string name = 3;
+}
+
+message ExecutePreparedRequest {
+    // The prepared statement ID
+    uint64 statement_id = 1;
+    
+    // Parameter values
+    repeated Value parameters = 2;
+    
+    // Optional transaction ID
+    optional uint64 transaction_id = 3;
+    
+    // Maximum number of rows to return
+    uint32 max_rows = 4;
+}
+
+// ============================================================================
+// Transaction Management
+// ============================================================================
+
+message BeginTransactionRequest {
+    // Isolation level
+    IsolationLevel isolation_level = 1;
+    
+    // Read-only transaction
+    bool read_only = 2;
+    
+    // Transaction timeout in milliseconds
+    uint32 timeout_ms = 3;
+}
+
+message BeginTransactionResponse {
+    // Whether the operation was successful
+    bool success = 1;
+    
+    // Error message if not successful
+    optional string error = 2;
+    
+    // Transaction ID
+    uint64 transaction_id = 3;
+}
+
+message CommitRequest {
+    // Transaction ID to commit
+    uint64 transaction_id = 1;
+}
+
+message CommitResponse {
+    // Whether the operation was successful
+    bool success = 1;
+    
+    // Error message if not successful
+    optional string error = 2;
+}
+
+message RollbackRequest {
+    // Transaction ID to rollback
+    uint64 transaction_id = 1;
+}
+
+message RollbackResponse {
+    // Whether the operation was successful
+    bool success = 1;
+    
+    // Error message if not successful
+    optional string error = 2;
+}
+
+enum IsolationLevel {
+    ISOLATION_LEVEL_READ_UNCOMMITTED = 0;
+    ISOLATION_LEVEL_READ_COMMITTED = 1;
+    ISOLATION_LEVEL_REPEATABLE_READ = 2;
+    ISOLATION_LEVEL_SERIALIZABLE = 3;
+    ISOLATION_LEVEL_SNAPSHOT = 4;
+}
+
+// ============================================================================
+// Connection Management
+// ============================================================================
+
+message PingRequest {
+    // Optional payload for echo
+    optional bytes payload = 1;
+}
+
+message PingResponse {
+    // Echo the payload back
+    optional bytes payload = 1;
+    
+    // Server timestamp
+    int64 server_time_ms = 2;
+}
+
+message ServerInfoRequest {}
+
+message ServerInfoResponse {
+    // Server version
+    string version = 1;
+    
+    // Server name
+    string server_name = 2;
+    
+    // Protocol version
+    uint32 protocol_version = 3;
+    
+    // Features supported
+    repeated string features = 4;
+    
+    // Server uptime in seconds
+    uint64 uptime_seconds = 5;
+    
+    // Active connections count
+    uint32 active_connections = 6;
+}
+
+// ============================================================================
+// Execution Statistics
+// ============================================================================
+
+message ExecutionStats {
+    // Time to parse the query (microseconds)
+    uint64 parse_time_us = 1;
+    
+    // Time to plan the query (microseconds)
+    uint64 plan_time_us = 2;
+    
+    // Time to execute the query (microseconds)
+    uint64 execute_time_us = 3;
+    
+    // Total time (microseconds)
+    uint64 total_time_us = 4;
+    
+    // Number of rows scanned
+    uint64 rows_scanned = 5;
+    
+    // Number of rows returned
+    uint64 rows_returned = 6;
+    
+    // Bytes read from storage
+    uint64 bytes_read = 7;
+    
+    // Whether the query was cached
+    bool was_cached = 8;
+}
+
+// ============================================================================
+// Error Codes
+// ============================================================================
+
+enum ErrorCode {
+    ERROR_CODE_UNKNOWN = 0;
+    
+    // Syntax errors
+    ERROR_CODE_SYNTAX_ERROR = 1;
+    ERROR_CODE_INVALID_QUERY = 2;
+    
+    // Schema errors
+    ERROR_CODE_TABLE_NOT_FOUND = 10;
+    ERROR_CODE_COLUMN_NOT_FOUND = 11;
+    ERROR_CODE_TABLE_ALREADY_EXISTS = 12;
+    ERROR_CODE_TYPE_MISMATCH = 13;
+    
+    // Constraint errors
+    ERROR_CODE_PRIMARY_KEY_VIOLATION = 20;
+    ERROR_CODE_UNIQUE_VIOLATION = 21;
+    ERROR_CODE_FOREIGN_KEY_VIOLATION = 22;
+    ERROR_CODE_CHECK_VIOLATION = 23;
+    ERROR_CODE_NOT_NULL_VIOLATION = 24;
+    
+    // Transaction errors
+    ERROR_CODE_TRANSACTION_NOT_FOUND = 30;
+    ERROR_CODE_TRANSACTION_ABORTED = 31;
+    ERROR_CODE_DEADLOCK_DETECTED = 32;
+    ERROR_CODE_SERIALIZATION_FAILURE = 33;
+    ERROR_CODE_LOCK_TIMEOUT = 34;
+    
+    // Connection errors
+    ERROR_CODE_CONNECTION_CLOSED = 40;
+    ERROR_CODE_AUTHENTICATION_FAILED = 41;
+    ERROR_CODE_AUTHORIZATION_FAILED = 42;
+    
+    // Resource errors
+    ERROR_CODE_OUT_OF_MEMORY = 50;
+    ERROR_CODE_DISK_FULL = 51;
+    ERROR_CODE_TIMEOUT = 52;
+    
+    // Internal errors
+    ERROR_CODE_INTERNAL_ERROR = 100;
+}

@@ -18,6 +18,10 @@ pub enum ClientError {
     #[error("connection closed")]
     ConnectionClosed,
 
+    /// Timeout (generic).
+    #[error("operation timed out")]
+    Timeout,
+
     /// Query execution failed.
     #[error("query failed: {0}")]
     QueryFailed(String),

@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 nexus-common = { workspace = true }
+nexus-proto = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }

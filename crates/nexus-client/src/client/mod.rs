@@ -7,6 +7,12 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use tokio::sync::Mutex as AsyncMutex;
+use tonic::transport::Channel;
+
+use nexus_proto::proto::{
+    nexus_db_client::NexusDbClient, BeginTransactionRequest, CommitRequest, ExecuteRequest,
+    PingRequest, RollbackRequest, ServerInfoRequest,
+};
 
 use super::error::{ClientError, ClientResult, ConnectionState};
 use super::query::QueryBuilder;
@@ -291,6 +297,23 @@ pub struct ClientStats {
     pub connection_failures: u64,
 }
 
+/// Server information.
+#[derive(Debug, Clone)]
+pub struct ServerInfo {
+    /// Server version.
+    pub version: String,
+    /// Server name.
+    pub server_name: String,
+    /// Protocol version.
+    pub protocol_version: u32,
+    /// Supported features.
+    pub features: Vec<String>,
+    /// Server uptime in seconds.
+    pub uptime_seconds: u64,
+    /// Number of active connections.
+    pub active_connections: u32,
+}
+
 /// Internal connection state.
 struct ConnectionInner {
     /// Connection state.
@@ -301,6 +324,8 @@ struct ConnectionInner {
     last_activity: Instant,
     /// Current transaction ID.
     transaction_id: Option<u64>,
+    /// gRPC client (when connected).
+    grpc_client: Option<NexusDbClient<Channel>>,
 }
 
 /// NexusDB client.
@@ -329,6 +354,7 @@ impl Client {
                 connected_at: None,
                 last_activity: Instant::now(),
                 transaction_id: None,
+                grpc_client: None,
             }),
             op_lock: AsyncMutex::new(()),
             query_counter: AtomicU64::new(0),
@@ -338,15 +364,86 @@ impl Client {
     }
 
     /// Creates a new client with default configuration.
+    /// 
+    /// This creates a client in "mock" mode for testing purposes.
+    /// For real connections, use `Client::new(config).connect().await`.
     pub fn connect_default() -> ClientResult<Self> {
         let client = Self::new(ClientConfig::default());
-        // For now, just mark as connected (real implementation would connect)
+        // Mark as connected in mock mode (no gRPC client)
         {
             let mut inner = client.inner.write();
             inner.state = ConnectionState::Connected;
             inner.connected_at = Some(Instant::now());
         }
         Ok(client)
+    }
+
+    /// Pings the server to check connectivity.
+    pub async fn ping(&self) -> ClientResult<Duration> {
+        self.ensure_connected()?;
+
+        let mut client = {
+            let inner = self.inner.read();
+            match &inner.grpc_client {
+                Some(c) => c.clone(),
+                None => {
+                    // Mock mode - return instant response
+                    return Ok(Duration::from_micros(1));
+                }
+            }
+        };
+
+        let start = Instant::now();
+        let request = tonic::Request::new(PingRequest {
+            payload: Some(b"ping".to_vec()),
+        });
+
+        client
+            .ping(request)
+            .await
+            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+
+        Ok(start.elapsed())
+    }
+
+    /// Gets server information.
+    pub async fn server_info(&self) -> ClientResult<ServerInfo> {
+        self.ensure_connected()?;
+
+        let mut client = {
+            let inner = self.inner.read();
+            match &inner.grpc_client {
+                Some(c) => c.clone(),
+                None => {
+                    // Mock mode - return mock info
+                    return Ok(ServerInfo {
+                        version: "mock".to_string(),
+                        server_name: "NexusDB (mock)".to_string(),
+                        protocol_version: 1,
+                        features: vec!["mock".to_string()],
+                        uptime_seconds: 0,
+                        active_connections: 1,
+                    });
+                }
+            }
+        };
+
+        let request = tonic::Request::new(ServerInfoRequest {});
+
+        let response = client
+            .get_server_info(request)
+            .await
+            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?
+            .into_inner();
+
+        Ok(ServerInfo {
+            version: response.version,
+            server_name: response.server_name,
+            protocol_version: response.protocol_version,
+            features: response.features,
+            uptime_seconds: response.uptime_seconds,
+            active_connections: response.active_connections,
+        })
     }
 
     /// Connects to the server.
@@ -364,23 +461,64 @@ impl Client {
             inner.state = ConnectionState::Connecting;
         }
 
-        // TODO: Implement actual gRPC connection
-        // For now, simulate successful connection
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Build the endpoint URL
+        let scheme = if self.config.use_tls { "https" } else { "http" };
+        let endpoint = format!("{}://{}:{}", scheme, self.config.host, self.config.port);
 
-        {
-            let mut inner = self.inner.write();
-            inner.state = ConnectionState::Connected;
-            inner.connected_at = Some(Instant::now());
-            inner.last_activity = Instant::now();
+        // Connect to the gRPC server with timeout
+        let connect_result = tokio::time::timeout(
+            self.config.connect_timeout,
+            NexusDbClient::connect(endpoint.clone()),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(client)) => {
+                {
+                    let mut inner = self.inner.write();
+                    inner.state = ConnectionState::Connected;
+                    inner.connected_at = Some(Instant::now());
+                    inner.last_activity = Instant::now();
+                    inner.grpc_client = Some(client);
+                }
+
+                {
+                    let mut stats = self.stats.write();
+                    stats.successful_connections += 1;
+                }
+
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                {
+                    let mut inner = self.inner.write();
+                    inner.state = ConnectionState::Failed;
+                }
+
+                {
+                    let mut stats = self.stats.write();
+                    stats.connection_failures += 1;
+                }
+
+                Err(ClientError::ConnectionFailed(format!(
+                    "failed to connect to {}: {}",
+                    endpoint, e
+                )))
+            }
+            Err(_) => {
+                {
+                    let mut inner = self.inner.write();
+                    inner.state = ConnectionState::Failed;
+                }
+
+                {
+                    let mut stats = self.stats.write();
+                    stats.connection_failures += 1;
+                }
+
+                Err(ClientError::Timeout)
+            }
         }
-
-        {
-            let mut stats = self.stats.write();
-            stats.successful_connections += 1;
-        }
-
-        Ok(())
     }
 
     /// Disconnects from the server.
@@ -402,6 +540,7 @@ impl Client {
             inner.state = ConnectionState::Closed;
             inner.connected_at = None;
             inner.transaction_id = None;
+            inner.grpc_client = None;
         }
 
         Ok(())
@@ -520,10 +659,37 @@ impl Client {
             }
         }
 
-        let txn_id = self.txn_counter.fetch_add(1, Ordering::Relaxed);
+        // Get gRPC client (if available)
+        let client_opt = {
+            let inner = self.inner.read();
+            inner.grpc_client.clone()
+        };
 
-        // Execute BEGIN
-        // TODO: Implement actual BEGIN via gRPC
+        let txn_id = if let Some(mut client) = client_opt {
+            // Execute BEGIN via gRPC
+            let request = tonic::Request::new(BeginTransactionRequest {
+                isolation_level: 0, // Default: READ_UNCOMMITTED
+                read_only: false,
+                timeout_ms: self.config.query_timeout.as_millis() as u32,
+            });
+
+            let response = client
+                .begin_transaction(request)
+                .await
+                .map_err(|e| ClientError::TransactionError(e.to_string()))?
+                .into_inner();
+
+            if !response.success {
+                return Err(ClientError::TransactionError(
+                    response.error.unwrap_or_else(|| "failed to begin transaction".to_string()),
+                ));
+            }
+
+            response.transaction_id
+        } else {
+            // Mock mode - generate a local transaction ID
+            self.txn_counter.fetch_add(1, Ordering::Relaxed)
+        };
 
         {
             let mut inner = self.inner.write();
@@ -547,14 +713,39 @@ impl Client {
 
     /// Internal commit without lock.
     async fn commit_internal(&self) -> ClientResult<()> {
-        {
+        let txn_id = {
             let inner = self.inner.read();
-            if inner.transaction_id.is_none() {
-                return Err(ClientError::NoTransaction);
+            match inner.transaction_id {
+                Some(id) => id,
+                None => return Err(ClientError::NoTransaction),
+            }
+        };
+
+        // Get gRPC client (if available)
+        let client_opt = {
+            let inner = self.inner.read();
+            inner.grpc_client.clone()
+        };
+
+        if let Some(mut client) = client_opt {
+            // Execute COMMIT via gRPC
+            let request = tonic::Request::new(CommitRequest {
+                transaction_id: txn_id,
+            });
+
+            let response = client
+                .commit(request)
+                .await
+                .map_err(|e| ClientError::TransactionError(e.to_string()))?
+                .into_inner();
+
+            if !response.success {
+                return Err(ClientError::TransactionError(
+                    response.error.unwrap_or_else(|| "failed to commit".to_string()),
+                ));
             }
         }
-
-        // TODO: Execute COMMIT via gRPC
+        // Mock mode: no gRPC call needed
 
         {
             let mut inner = self.inner.write();
@@ -578,14 +769,27 @@ impl Client {
 
     /// Internal rollback without lock.
     async fn rollback_internal(&self) -> ClientResult<()> {
-        {
+        let txn_id = {
             let inner = self.inner.read();
-            if inner.transaction_id.is_none() {
-                return Ok(()); // Rollback on no transaction is a no-op
+            match inner.transaction_id {
+                Some(id) => id,
+                None => return Ok(()), // Rollback on no transaction is a no-op
             }
-        }
+        };
 
-        // TODO: Execute ROLLBACK via gRPC
+        // Execute ROLLBACK via gRPC
+        let client_opt = {
+            let inner = self.inner.read();
+            inner.grpc_client.clone()
+        };
+
+        if let Some(mut client) = client_opt {
+            let request = tonic::Request::new(RollbackRequest {
+                transaction_id: txn_id,
+            });
+
+            let _ = client.rollback(request).await; // Ignore errors on rollback
+        }
 
         {
             let mut inner = self.inner.write();
@@ -630,15 +834,101 @@ impl Client {
         }
     }
 
-    /// Internal query execution (stub for now).
+    /// Internal query execution.
     async fn execute_query_internal(
         &self,
-        _sql: &str,
+        sql: &str,
         _query_id: u64,
     ) -> ClientResult<QueryResult> {
-        // TODO: Implement actual query execution
-        // For now, return an empty result
-        Ok(QueryResult::empty())
+        // Get a clone of the gRPC client
+        let client_opt = {
+            let inner = self.inner.read();
+            inner.grpc_client.clone()
+        };
+
+        // If no gRPC client, we're in mock mode
+        let mut client = match client_opt {
+            Some(c) => c,
+            None => {
+                // Mock mode - return empty result
+                return Ok(QueryResult::empty());
+            }
+        };
+
+        // Execute the query via gRPC
+        let request = tonic::Request::new(ExecuteRequest {
+            sql: sql.to_string(),
+            parameters: vec![],
+            transaction_id: None,
+            max_rows: 0, // Unlimited
+            timeout_ms: self.config.query_timeout.as_millis() as u32,
+        });
+
+        let response = client
+            .execute(request)
+            .await
+            .map_err(|e| ClientError::QueryFailed(e.to_string()))?
+            .into_inner();
+
+        if !response.success {
+            return Err(ClientError::QueryFailed(
+                response.error.unwrap_or_else(|| "unknown error".to_string()),
+            ));
+        }
+
+        // Convert the response to QueryResult
+        match response.result {
+            Some(nexus_proto::proto::execute_response::Result::QueryResult(qr)) => {
+                let columns: Vec<String> = qr.columns.iter().map(|c| c.name.clone()).collect();
+                let rows: Vec<Vec<Value>> = qr
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.values
+                            .iter()
+                            .map(|v| proto_value_to_value(v))
+                            .collect()
+                    })
+                    .collect();
+
+                Ok(QueryResult {
+                    columns,
+                    rows,
+                    rows_affected: 0,
+                    execution_time: Duration::ZERO,
+                })
+            }
+            Some(nexus_proto::proto::execute_response::Result::CommandResult(cr)) => {
+                Ok(QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: cr.rows_affected,
+                    execution_time: Duration::ZERO,
+                })
+            }
+            None => Ok(QueryResult::empty()),
+        }
+    }
+}
+
+/// Converts a proto Value to a client Value.
+fn proto_value_to_value(v: &nexus_proto::proto::Value) -> Value {
+    use nexus_proto::proto::value::Value as ProtoValue;
+
+    match &v.value {
+        Some(ProtoValue::IsNull(_)) => Value::Null,
+        Some(ProtoValue::BoolValue(b)) => Value::Boolean(*b),
+        Some(ProtoValue::Int32Value(i)) => Value::Integer(*i as i64),
+        Some(ProtoValue::Int64Value(i)) => Value::Integer(*i),
+        Some(ProtoValue::FloatValue(f)) => Value::Float(*f as f64),
+        Some(ProtoValue::DoubleValue(f)) => Value::Float(*f),
+        Some(ProtoValue::StringValue(s)) => Value::String(s.clone()),
+        Some(ProtoValue::BytesValue(b)) => Value::Bytes(b.clone()),
+        Some(ProtoValue::TimestampValue(t)) => Value::Integer(*t), // Store as epoch ms
+        Some(ProtoValue::DateValue(d)) => Value::Integer(*d as i64), // Days since epoch
+        Some(ProtoValue::TimeValue(t)) => Value::Integer(*t), // Microseconds
+        Some(ProtoValue::DecimalValue(s)) => Value::String(s.clone()), // Keep as string
+        None => Value::Null,
     }
 }
 
@@ -749,33 +1039,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_connect() {
-        let client = Client::new(ClientConfig::default());
-        assert!(!client.is_connected());
-
-        client.connect().await.unwrap();
+        // Use mock mode for tests (no actual server connection)
+        let client = Client::connect_default().unwrap();
         assert!(client.is_connected());
         assert_eq!(client.state(), ConnectionState::Connected);
     }
 
     #[tokio::test]
     async fn test_client_disconnect() {
-        let client = Client::new(ClientConfig::default());
-        client.connect().await.unwrap();
+        let client = Client::connect_default().unwrap();
         client.disconnect().await.unwrap();
         assert_eq!(client.state(), ConnectionState::Closed);
     }
 
     #[tokio::test]
     async fn test_client_stats() {
-        let client = Client::new(ClientConfig::default());
-        client.connect().await.unwrap();
+        let client = Client::connect_default().unwrap();
 
         client.execute("SELECT 1").await.unwrap();
         client.execute("SELECT 2").await.unwrap();
 
         let stats = client.stats();
         assert_eq!(stats.queries_executed, 2);
-        assert_eq!(stats.connection_attempts, 1);
-        assert_eq!(stats.successful_connections, 1);
     }
 }

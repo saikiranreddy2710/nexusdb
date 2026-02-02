@@ -10,6 +10,7 @@ members = [
     "crates/nexus-raft",
     "crates/nexus-query",
     "crates/nexus-sql",
+    "crates/nexus-proto",
     "crates/nexus-server",
     "crates/nexus-client",
     "crates/nexus-test",
@@ -37,6 +38,7 @@ nexus-query = { path = "crates/nexus-query" }
 nexus-sql = { path = "crates/nexus-sql" }
 nexus-server = { path = "crates/nexus-server" }
 nexus-client = { path = "crates/nexus-client" }
+nexus-proto = { path = "crates/nexus-proto" }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
@@ -73,7 +75,10 @@ humantime = "2.1"
 
 # Networking (for later phases)
 tonic = "0.10"
+tonic-build = "0.10"
 prost = "0.12"
+futures-core = "0.3"
+futures-util = "0.3"
 
 # Testing
 criterion = "0.5"
