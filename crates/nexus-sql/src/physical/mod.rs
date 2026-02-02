@@ -34,14 +34,14 @@
 //! let physical_plan = planner.create_physical_plan(&logical_plan)?;
 //! ```
 
+mod context;
 mod expr;
 mod operator;
 mod plan;
 mod planner;
-mod context;
 
+pub use context::*;
 pub use expr::*;
 pub use operator::*;
 pub use plan::*;
 pub use planner::*;
-pub use context::*;

@@ -1,12 +1,13 @@
 //! # nexus-sql
 //!
-//! SQL parser and query planner for NexusDB.
+//! SQL parser, query planner, and executor for NexusDB.
 //!
 //! This crate implements:
 //! - SQL parsing (PostgreSQL-compatible)
 //! - Logical query planning
 //! - Query optimization
 //! - Physical plan generation
+//! - Query execution
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -22,3 +23,6 @@ pub mod optimizer;
 
 /// Physical plan generation
 pub mod physical;
+
+/// Query execution
+pub mod executor;
