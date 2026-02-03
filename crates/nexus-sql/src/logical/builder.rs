@@ -213,9 +213,9 @@ fn build_select(
     if has_aggregates || has_group_by {
         plan = build_aggregate(select, plan, ctx)?;
 
-        // Apply HAVING clause
+        // Apply HAVING clause - use build_having_expr to map aggregates to column refs
         if let Some(ref having) = select.having {
-            let predicate = build_expr(having, &plan.schema())?;
+            let predicate = build_having_expr(having, &plan.schema())?;
             plan = Arc::new(LogicalOperator::Filter(FilterOperator {
                 input: plan,
                 predicate,
@@ -391,6 +391,11 @@ fn build_aggregate(
         extract_aggregates(&item.expr, &input_schema, &mut aggregates)?;
     }
 
+    // Also extract aggregates from HAVING clause
+    if let Some(ref having) = select.having {
+        extract_aggregates(having, &input_schema, &mut aggregates)?;
+    }
+
     // Build output schema
     let mut fields = Vec::new();
     for expr in &group_by {
@@ -462,9 +467,9 @@ fn build_projection(
     let mut exprs = Vec::new();
     let mut fields = Vec::new();
 
-    // Check if input is an aggregate - if so, we need to map aggregate functions
-    // to column references in the aggregate's output schema
-    let is_aggregate_input = matches!(input.as_ref(), LogicalOperator::Aggregate(_));
+    // Check if input is an aggregate (directly or through a filter like HAVING)
+    // If so, we need to map aggregate functions to column references in the aggregate's output schema
+    let is_aggregate_input = has_aggregate_in_chain(&input);
 
     for item in &select.columns {
         match &item.expr {
@@ -520,6 +525,18 @@ fn build_projection(
     })))
 }
 
+/// Check if the input operator chain contains an Aggregate operator.
+/// This is needed because when we have a HAVING clause, the projection's input
+/// is a Filter (for HAVING), not the Aggregate directly.
+fn has_aggregate_in_chain(op: &Arc<LogicalOperator>) -> bool {
+    match op.as_ref() {
+        LogicalOperator::Aggregate(_) => true,
+        LogicalOperator::Filter(f) => has_aggregate_in_chain(&f.input),
+        // Only follow through operators that don't change the column semantics
+        _ => false,
+    }
+}
+
 /// Find a matching column in the schema for an expression.
 /// This is used to map aggregate function calls to their output columns.
 fn find_matching_column(expr: &AstExpr, schema: &Schema) -> Option<LogicalExpr> {
@@ -573,6 +590,48 @@ fn format_aggregate_name(name: &str, args: &[AstExpr], distinct: bool) -> String
         format!("{}(DISTINCT {})", name.to_uppercase(), args_str)
     } else {
         format!("{}({})", name.to_uppercase(), args_str)
+    }
+}
+
+/// Build an expression for HAVING clause, mapping aggregate functions to column references.
+/// This is needed because aggregate functions in HAVING should reference the aggregate output columns.
+fn build_having_expr(expr: &AstExpr, schema: &Schema) -> PlanResult<LogicalExpr> {
+    match expr {
+        // For aggregate functions, map to column reference
+        AstExpr::Function(f) if is_aggregate_function(&f.name) => {
+            if let Some(col_ref) = find_matching_column(expr, schema) {
+                Ok(col_ref)
+            } else {
+                Err(PlanError::ColumnNotFound(format!(
+                    "Aggregate function {} not found in GROUP BY output",
+                    format_aggregate_name(&f.name, &f.args, f.distinct)
+                )))
+            }
+        }
+        // For binary operations, recursively process both sides
+        AstExpr::BinaryOp { left, op, right } => {
+            let left = build_having_expr(left, schema)?;
+            let right = build_having_expr(right, schema)?;
+            let op = convert_binary_op(op)?;
+            Ok(LogicalExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            })
+        }
+        // For unary operations
+        AstExpr::UnaryOp { op, expr: inner } => {
+            let inner = build_having_expr(inner, schema)?;
+            let op = convert_unary_op(op)?;
+            Ok(LogicalExpr::UnaryOp {
+                op,
+                expr: Box::new(inner),
+            })
+        }
+        // For nested expressions
+        AstExpr::Nested(inner) => build_having_expr(inner, schema),
+        // For other expressions, use normal build_expr
+        _ => build_expr(expr, schema),
     }
 }
 
@@ -983,5 +1042,50 @@ mod tests {
 
         let explain = plan.explain();
         assert!(explain.contains("Schema:"));
+    }
+
+    #[test]
+    fn test_having_clause() {
+        let catalog = test_catalog();
+        let stmt = Parser::parse_one(
+            "SELECT user_id, SUM(total) FROM orders GROUP BY user_id HAVING SUM(total) > 100",
+        )
+        .unwrap();
+        let plan = build_plan(&stmt, &catalog).unwrap();
+
+        let display = plan.display();
+        assert!(
+            display.contains("Aggregate"),
+            "Plan should have Aggregate: {}",
+            display
+        );
+        assert!(
+            display.contains("Filter"),
+            "Plan should have Filter for HAVING: {}",
+            display
+        );
+
+        // Verify that the filter predicate uses a column reference, not an aggregate function
+        // The plan structure should be: Projection -> Filter -> Aggregate
+        if let super::LogicalOperator::Projection(proj) = plan.root.as_ref() {
+            if let super::LogicalOperator::Filter(filter) = proj.input.as_ref() {
+                // The predicate should be a comparison with a column, not an aggregate
+                assert!(
+                    !matches!(
+                        &filter.predicate,
+                        super::LogicalExpr::AggregateFunction { .. }
+                    ),
+                    "Filter predicate should not be an aggregate function directly"
+                );
+                // Check that if it's a BinaryOp, the left side is a Column
+                if let super::LogicalExpr::BinaryOp { left, .. } = &filter.predicate {
+                    assert!(
+                        matches!(left.as_ref(), super::LogicalExpr::Column(_)),
+                        "Filter predicate left side should be a column reference, got: {:?}",
+                        left
+                    );
+                }
+            }
+        }
     }
 }

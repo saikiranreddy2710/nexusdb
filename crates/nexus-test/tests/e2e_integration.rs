@@ -795,3 +795,70 @@ async fn test_count_star_no_group_by() {
     client.disconnect().await.expect("Disconnect failed");
     server_handle.abort();
 }
+
+/// Test HAVING clause to filter groups.
+#[tokio::test]
+async fn test_having_clause() {
+    let Some((client, server_handle)) = start_server_and_connect().await else {
+        eprintln!("Skipping test - could not connect to server");
+        return;
+    };
+
+    // Setup
+    let result = client.execute("CREATE TABLE sales (id INT PRIMARY KEY, product TEXT, amount INT)").await;
+    assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
+
+    // Insert test data
+    client.execute("INSERT INTO sales VALUES (1, 'Widget', 100)").await.ok();
+    client.execute("INSERT INTO sales VALUES (2, 'Widget', 200)").await.ok();
+    client.execute("INSERT INTO sales VALUES (3, 'Gadget', 150)").await.ok();
+    client.execute("INSERT INTO sales VALUES (4, 'Widget', 50)").await.ok();
+    client.execute("INSERT INTO sales VALUES (5, 'Gadget', 50)").await.ok();
+
+    // GROUP BY with HAVING - only products with total > 200
+    let result = client.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 200").await;
+    assert!(result.is_ok(), "HAVING clause failed: {:?}", result);
+    let query_result = result.unwrap();
+    // Widget: 350, Gadget: 200 -> only Widget should be returned
+    assert_eq!(query_result.row_count(), 1, "HAVING should filter to 1 group");
+
+    // Cleanup
+    let _ = client.execute("DROP TABLE sales").await;
+
+    client.disconnect().await.expect("Disconnect failed");
+    server_handle.abort();
+}
+
+/// Test HAVING with COUNT.
+#[tokio::test]
+async fn test_having_with_count() {
+    let Some((client, server_handle)) = start_server_and_connect().await else {
+        eprintln!("Skipping test - could not connect to server");
+        return;
+    };
+
+    // Setup
+    let result = client.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT, amount INT)").await;
+    assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
+
+    // Insert test data - Alice: 3 orders, Bob: 1 order, Charlie: 2 orders
+    client.execute("INSERT INTO orders VALUES (1, 'Alice', 100)").await.ok();
+    client.execute("INSERT INTO orders VALUES (2, 'Bob', 200)").await.ok();
+    client.execute("INSERT INTO orders VALUES (3, 'Alice', 150)").await.ok();
+    client.execute("INSERT INTO orders VALUES (4, 'Charlie', 75)").await.ok();
+    client.execute("INSERT INTO orders VALUES (5, 'Alice', 50)").await.ok();
+    client.execute("INSERT INTO orders VALUES (6, 'Charlie', 125)").await.ok();
+
+    // GROUP BY with HAVING COUNT(*) >= 2
+    let result = client.execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) >= 2").await;
+    assert!(result.is_ok(), "HAVING COUNT failed: {:?}", result);
+    let query_result = result.unwrap();
+    // Alice: 3, Charlie: 2 -> 2 groups should be returned (Bob filtered out)
+    assert_eq!(query_result.row_count(), 2, "HAVING should filter to 2 groups");
+
+    // Cleanup
+    let _ = client.execute("DROP TABLE orders").await;
+
+    client.disconnect().await.expect("Disconnect failed");
+    server_handle.abort();
+}

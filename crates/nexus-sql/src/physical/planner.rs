@@ -818,4 +818,42 @@ mod tests {
         assert!(explain.contains("SeqScan"));
         assert!(explain.contains("users"));
     }
+
+    #[test]
+    fn test_plan_having_clause() {
+        // Test planning a filter on top of an aggregate (HAVING clause)
+        let schema = orders_schema();
+        let scan = Arc::new(LogicalOperator::Scan(ScanOperator::new("orders", schema)));
+
+        // Create aggregate with SUM(amount) grouped by user_id
+        let agg_schema = Schema::new(vec![
+            Field::nullable("user_id", DataType::Int),
+            Field::not_null("SUM(amount)", DataType::BigInt),
+        ]);
+
+        let agg = Arc::new(LogicalOperator::Aggregate(AggregateOperator {
+            input: scan,
+            group_by: vec![LogicalExpr::col("user_id")],
+            aggregates: vec![LogicalExpr::AggregateFunction {
+                name: crate::logical::AggregateFunc::Sum,
+                args: vec![LogicalExpr::col("amount")],
+                distinct: false,
+                filter: None,
+            }],
+            schema: Arc::new(agg_schema),
+        }));
+
+        // Create filter (HAVING SUM(amount) > 100)
+        // The predicate references the aggregate output column, not the aggregate function
+        let filter = LogicalOperator::Filter(FilterOperator {
+            input: agg,
+            predicate: LogicalExpr::col("SUM(amount)").gt(LogicalExpr::lit_i64(100)),
+        });
+
+        let plan = create_physical_plan(&filter);
+        assert!(plan.is_ok(), "HAVING physical plan failed: {:?}", plan);
+
+        let plan = plan.unwrap();
+        assert!(matches!(plan.root(), PhysicalOperator::Filter(_)));
+    }
 }

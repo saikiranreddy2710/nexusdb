@@ -880,4 +880,51 @@ mod tests {
             panic!("expected Query result");
         }
     }
+
+    #[test]
+    fn test_session_having_clause() {
+        let mut session = create_session();
+
+        // Create table
+        session
+            .execute("CREATE TABLE sales (id INT PRIMARY KEY, product TEXT, amount INT)")
+            .unwrap();
+
+        // Insert test data
+        session
+            .execute("INSERT INTO sales VALUES (1, 'Widget', 100)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (2, 'Widget', 200)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (3, 'Gadget', 150)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (4, 'Widget', 50)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (5, 'Gadget', 50)")
+            .unwrap();
+
+        // First test: simple GROUP BY without HAVING
+        let result = session.execute("SELECT product, SUM(amount) FROM sales GROUP BY product");
+        assert!(result.is_ok(), "GROUP BY failed: {:?}", result);
+
+        // Second test: GROUP BY with HAVING
+        let result = session.execute(
+            "SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 200",
+        );
+        assert!(result.is_ok(), "HAVING clause failed: {:?}", result);
+
+        if let StatementResult::Query(query_result) = result.unwrap() {
+            // Widget: 350, Gadget: 200 -> only Widget should be returned
+            assert_eq!(
+                query_result.total_rows, 1,
+                "HAVING should filter to 1 group"
+            );
+        } else {
+            panic!("expected Query result");
+        }
+    }
 }
