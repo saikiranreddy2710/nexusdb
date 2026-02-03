@@ -1,0 +1,91 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: en-US
+
+early_access: false
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+      - develop
+  path_instructions:
+    - path: "crates/nexus-storage/**"
+      instructions: |
+        This is the SageTree storage engine - a novel fractional cascading B-tree.
+        Focus on:
+        - Memory safety and proper use of unsafe code
+        - Page layout and buffer pool management
+        - Write amplification optimization
+        - Concurrent access patterns
+    - path: "crates/nexus-raft/**"
+      instructions: |
+        This is the Raft++ consensus implementation with parallel commit.
+        Focus on:
+        - Correctness of Raft state machine transitions
+        - Leader election and log replication logic
+        - Network partition handling
+        - Linearizability guarantees
+    - path: "crates/nexus-sql/**"
+      instructions: |
+        This is the Photon query engine using Apache Arrow concepts.
+        Focus on:
+        - SQL parsing correctness
+        - Query optimization rules
+        - Physical plan execution
+        - Vectorized execution patterns
+        - JOIN and aggregate implementations
+    - path: "crates/nexus-wal/**"
+      instructions: |
+        This is the Write-Ahead Log implementation.
+        Focus on:
+        - Durability guarantees
+        - Group commit optimization
+        - Recovery correctness
+        - fsync semantics
+    - path: "crates/nexus-txn/**"
+      instructions: |
+        This is the MVCC transaction manager.
+        Focus on:
+        - Snapshot isolation correctness
+        - Deadlock detection
+        - Transaction lifecycle management
+        - Visibility rules
+    - path: "crates/nexus-server/**"
+      instructions: |
+        This is the database server with PostgreSQL wire protocol.
+        Focus on:
+        - Protocol correctness
+        - Connection handling
+        - Session management
+        - Error handling
+    - path: "crates/nexus-test/**"
+      instructions: |
+        This contains integration and end-to-end tests.
+        Focus on:
+        - Test coverage
+        - Edge cases
+        - Performance regression tests
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: auto
+  issues:
+    scope: auto
+  jira:
+    project_keys: []
+  pull_requests:
+    scope: auto
