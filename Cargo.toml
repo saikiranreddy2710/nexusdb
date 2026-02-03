@@ -15,6 +15,7 @@ members = [
     "crates/nexus-client",
     "crates/nexus-cli",
     "crates/nexus-test",
+    "crates/nexus-bench",
 ]
 
 [workspace.package]

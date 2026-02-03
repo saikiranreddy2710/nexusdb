@@ -1,0 +1,38 @@
+[package]
+name = "nexus-bench"
+description = "Performance benchmarks for NexusDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-common = { workspace = true }
+nexus-storage = { workspace = true }
+nexus-buffer = { workspace = true }
+nexus-wal = { workspace = true }
+nexus-sql = { workspace = true }
+nexus-server = { workspace = true }
+nexus-client = { workspace = true }
+nexus-proto = { workspace = true }
+
+criterion = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }
+tempfile = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bench]]
+name = "storage"
+harness = false
+
+[[bench]]
+name = "sql"
+harness = false
+
+[[bench]]
+name = "database"
+harness = false
