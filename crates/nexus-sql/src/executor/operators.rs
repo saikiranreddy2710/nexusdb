@@ -342,11 +342,15 @@ pub struct HashJoinExec {
     /// Output schema.
     schema: Arc<Schema>,
     /// Hash table built from left side.
-    hash_table: Option<HashMap<Vec<Value>, Vec<Row>>>,
+    hash_table: Option<HashMap<Vec<Value>, Vec<(Row, bool)>>>,
     /// Buffer for output rows.
     output_buffer: Vec<Row>,
     /// Current position in output buffer.
     output_pos: usize,
+    /// Whether we've finished probing.
+    probe_finished: bool,
+    /// Whether we've emitted unmatched rows for RIGHT/FULL join.
+    unmatched_emitted: bool,
 }
 
 impl HashJoinExec {
@@ -369,11 +373,14 @@ impl HashJoinExec {
             hash_table: None,
             output_buffer: Vec::new(),
             output_pos: 0,
+            probe_finished: false,
+            unmatched_emitted: false,
         }
     }
 
     fn build_hash_table(&mut self) -> Result<(), ExecutionError> {
-        let mut hash_table: HashMap<Vec<Value>, Vec<Row>> = HashMap::new();
+        // For RIGHT and FULL joins, we track which left rows matched
+        let mut hash_table: HashMap<Vec<Value>, Vec<(Row, bool)>> = HashMap::new();
         let left_schema = self.left.schema();
 
         while let Some(batch) = self.left.next_batch()? {
@@ -385,12 +392,13 @@ impl HashJoinExec {
                     .collect();
                 let key = key?;
 
-                // Skip NULL keys for inner/left joins
+                // Skip NULL keys for inner joins only
                 if key.iter().any(|v| v.is_null()) && self.join_type == JoinType::Inner {
                     continue;
                 }
 
-                hash_table.entry(key).or_default().push(row);
+                // Store (row, matched) - matched flag is used for RIGHT/FULL joins
+                hash_table.entry(key).or_default().push((row, false));
             }
         }
 
@@ -399,10 +407,11 @@ impl HashJoinExec {
     }
 
     fn probe(&mut self) -> Result<bool, ExecutionError> {
-        let hash_table = self.hash_table.as_ref().unwrap();
+        let hash_table = self.hash_table.as_mut().unwrap();
         let right_schema = self.right.schema();
         let left_schema = self.left.schema();
         let left_nulls = Row::nulls(left_schema.fields().len());
+        let right_nulls = Row::nulls(right_schema.fields().len());
 
         while let Some(batch) = self.right.next_batch()? {
             for right_row in batch.rows() {
@@ -416,7 +425,7 @@ impl HashJoinExec {
                 // Handle NULL keys
                 if key.iter().any(|v| v.is_null()) {
                     match self.join_type {
-                        JoinType::Left | JoinType::Full => {
+                        JoinType::Right | JoinType::Full => {
                             self.output_buffer.push(left_nulls.concat(&right_row));
                         }
                         _ => continue,
@@ -424,24 +433,41 @@ impl HashJoinExec {
                     continue;
                 }
 
-                if let Some(left_rows) = hash_table.get(&key) {
-                    for left_row in left_rows {
+                if let Some(left_rows) = hash_table.get_mut(&key) {
+                    for (left_row, matched) in left_rows.iter_mut() {
                         let combined = left_row.concat(&right_row);
                         self.output_buffer.push(combined);
+                        *matched = true; // Mark as matched for RIGHT/FULL join
                     }
                 } else {
-                    // No match found
+                    // No match found - handle based on join type
                     match self.join_type {
-                        JoinType::Left | JoinType::Full => {
+                        JoinType::Right | JoinType::Full => {
+                            // Right row with NULL left columns
                             self.output_buffer.push(left_nulls.concat(&right_row));
                         }
-                        JoinType::Right => {
-                            // Will be handled separately
-                        }
-                        _ => {}
+                        _ => {} // Inner/Left: no output for unmatched right rows
                     }
                 }
             }
+
+            if !self.output_buffer.is_empty() {
+                return Ok(true);
+            }
+        }
+
+        self.probe_finished = true;
+
+        // For FULL and LEFT joins, emit unmatched left rows
+        if !self.unmatched_emitted && matches!(self.join_type, JoinType::Left | JoinType::Full) {
+            for (_key, left_rows) in hash_table.iter() {
+                for (left_row, matched) in left_rows {
+                    if !matched {
+                        self.output_buffer.push(left_row.concat(&right_nulls));
+                    }
+                }
+            }
+            self.unmatched_emitted = true;
 
             if !self.output_buffer.is_empty() {
                 return Ok(true);
@@ -475,6 +501,11 @@ impl Operator for HashJoinExec {
             return Ok(Some(batch));
         }
 
+        // If probe is finished, we're done
+        if self.probe_finished && self.unmatched_emitted {
+            return Ok(None);
+        }
+
         // Probe right side
         self.output_buffer.clear();
         self.output_pos = 0;
@@ -499,6 +530,186 @@ impl Operator for HashJoinExec {
         self.hash_table = None;
         self.output_buffer.clear();
         self.output_pos = 0;
+        self.probe_finished = false;
+        self.unmatched_emitted = false;
+    }
+}
+
+/// Nested loop join operator for cross joins and small tables.
+#[derive(Debug)]
+pub struct NestedLoopJoinExec {
+    /// Left input.
+    left: Box<dyn Operator>,
+    /// Right input.
+    right: Box<dyn Operator>,
+    /// Join type.
+    join_type: JoinType,
+    /// Optional filter condition.
+    filter: Option<PhysicalExpr>,
+    /// Output schema.
+    schema: Arc<Schema>,
+    /// Materialized left rows.
+    left_rows: Option<Vec<Row>>,
+    /// Current left row index.
+    left_idx: usize,
+    /// Right rows for current iteration.
+    right_rows: Vec<Row>,
+    /// Current right row index.
+    right_idx: usize,
+    /// Buffer for output rows.
+    output_buffer: Vec<Row>,
+    /// Current position in output buffer.
+    output_pos: usize,
+    /// Track which left rows matched (for LEFT/FULL joins).
+    left_matched: Vec<bool>,
+    /// Whether we've emitted unmatched left rows.
+    left_unmatched_emitted: bool,
+}
+
+impl NestedLoopJoinExec {
+    /// Creates a new nested loop join operator.
+    pub fn new(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        join_type: JoinType,
+        filter: Option<PhysicalExpr>,
+        schema: Arc<Schema>,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            join_type,
+            filter,
+            schema,
+            left_rows: None,
+            left_idx: 0,
+            right_rows: Vec::new(),
+            right_idx: 0,
+            output_buffer: Vec::new(),
+            output_pos: 0,
+            left_matched: Vec::new(),
+            left_unmatched_emitted: false,
+        }
+    }
+
+    fn materialize_left(&mut self) -> Result<(), ExecutionError> {
+        let mut left_rows = Vec::new();
+        while let Some(batch) = self.left.next_batch()? {
+            left_rows.extend(batch.rows());
+        }
+        self.left_matched = vec![false; left_rows.len()];
+        self.left_rows = Some(left_rows);
+        Ok(())
+    }
+
+    fn materialize_right(&mut self) -> Result<(), ExecutionError> {
+        self.right_rows.clear();
+        while let Some(batch) = self.right.next_batch()? {
+            self.right_rows.extend(batch.rows());
+        }
+        Ok(())
+    }
+
+    fn join_rows(&mut self) -> Result<(), ExecutionError> {
+        let left_rows = self.left_rows.as_ref().unwrap();
+        let right_schema = self.right.schema();
+        let left_schema = self.left.schema();
+        let right_nulls = Row::nulls(right_schema.fields().len());
+        let left_nulls = Row::nulls(left_schema.fields().len());
+
+        // Track which right rows matched (for RIGHT/FULL joins)
+        let mut right_matched = vec![false; self.right_rows.len()];
+
+        for (left_idx, left_row) in left_rows.iter().enumerate() {
+            let mut left_has_match = false;
+
+            for (right_idx, right_row) in self.right_rows.iter().enumerate() {
+                let combined = left_row.concat(right_row);
+
+                // Apply filter if present
+                let passes_filter = if let Some(ref filter) = self.filter {
+                    match evaluate_expr(filter, &combined, &self.schema) {
+                        Ok(Value::Boolean(b)) => b,
+                        Ok(Value::Null) => false,
+                        _ => false,
+                    }
+                } else {
+                    true // Cross join or no filter
+                };
+
+                if passes_filter {
+                    self.output_buffer.push(combined);
+                    left_has_match = true;
+                    right_matched[right_idx] = true;
+                }
+            }
+
+            if left_has_match {
+                self.left_matched[left_idx] = true;
+            }
+        }
+
+        // For LEFT and FULL joins: emit unmatched left rows
+        if matches!(self.join_type, JoinType::Left | JoinType::Full) {
+            for (left_idx, left_row) in left_rows.iter().enumerate() {
+                if !self.left_matched[left_idx] {
+                    self.output_buffer.push(left_row.concat(&right_nulls));
+                }
+            }
+        }
+
+        // For RIGHT and FULL joins: emit unmatched right rows
+        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+            for (right_idx, right_row) in self.right_rows.iter().enumerate() {
+                if !right_matched[right_idx] {
+                    self.output_buffer.push(left_nulls.concat(right_row));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Operator for NestedLoopJoinExec {
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
+        // Materialize inputs on first call
+        if self.left_rows.is_none() {
+            self.materialize_left()?;
+            self.materialize_right()?;
+            self.join_rows()?;
+        }
+
+        // Return buffered output
+        if self.output_pos < self.output_buffer.len() {
+            let batch_size = 1024.min(self.output_buffer.len() - self.output_pos);
+            let rows: Vec<Row> =
+                self.output_buffer[self.output_pos..self.output_pos + batch_size].to_vec();
+            self.output_pos += batch_size;
+
+            let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
+                .map_err(ExecutionError::Internal)?;
+            return Ok(Some(batch));
+        }
+
+        Ok(None)
+    }
+
+    fn reset(&mut self) {
+        self.left.reset();
+        self.right.reset();
+        self.left_rows = None;
+        self.left_idx = 0;
+        self.right_rows.clear();
+        self.right_idx = 0;
+        self.output_buffer.clear();
+        self.output_pos = 0;
+        self.left_matched.clear();
+        self.left_unmatched_emitted = false;
     }
 }
 
@@ -608,8 +819,9 @@ impl Operator for HashAggregateExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        // Aggregate all input on first call
-        if self.groups.is_none() {
+        // Aggregate all input on first call (check results instead of groups,
+        // since build_results() takes ownership of groups)
+        if self.results.is_none() {
             self.aggregate()?;
             let results = self.build_results();
             self.results = Some(results.into_iter());

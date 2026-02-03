@@ -459,14 +459,21 @@ impl ProjectionPushdownRule {
                     return Ok(None);
                 }
 
+                // Get the new left and right operators
+                let new_left = left_opt.map(Arc::new).unwrap_or_else(|| join.left.clone());
+                let new_right = right_opt
+                    .map(Arc::new)
+                    .unwrap_or_else(|| join.right.clone());
+
+                // Recompute the join schema from the child schemas
+                let new_schema = Arc::new(new_left.schema().merge(&new_right.schema()));
+
                 Ok(Some(LogicalOperator::Join(JoinOperator {
-                    left: left_opt.map(Arc::new).unwrap_or_else(|| join.left.clone()),
-                    right: right_opt
-                        .map(Arc::new)
-                        .unwrap_or_else(|| join.right.clone()),
+                    left: new_left,
+                    right: new_right,
                     join_type: join.join_type,
                     condition: join.condition.clone(),
-                    schema: join.schema.clone(),
+                    schema: new_schema,
                     equi_keys: join.equi_keys.clone(),
                     filter: join.filter.clone(),
                 })))

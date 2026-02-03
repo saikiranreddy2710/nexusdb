@@ -462,6 +462,10 @@ fn build_projection(
     let mut exprs = Vec::new();
     let mut fields = Vec::new();
 
+    // Check if input is an aggregate - if so, we need to map aggregate functions
+    // to column references in the aggregate's output schema
+    let is_aggregate_input = matches!(input.as_ref(), LogicalOperator::Aggregate(_));
+
     for item in &select.columns {
         match &item.expr {
             AstExpr::Wildcard => {
@@ -481,7 +485,19 @@ fn build_projection(
                 }
             }
             _ => {
-                let expr = build_expr(&item.expr, &input_schema)?;
+                // For aggregate inputs, try to map the expression to a column reference
+                let expr = if is_aggregate_input {
+                    // Try to find a matching column in the aggregate output schema
+                    if let Some(col_ref) = find_matching_column(&item.expr, &input_schema) {
+                        col_ref
+                    } else {
+                        // Fall back to building the expression (for non-aggregate expressions)
+                        build_expr(&item.expr, &input_schema)?
+                    }
+                } else {
+                    build_expr(&item.expr, &input_schema)?
+                };
+
                 let name = item.alias.clone().unwrap_or_else(|| expr.output_name());
                 let data_type = expr.data_type(&input_schema).unwrap_or(DataType::Int);
 
@@ -502,6 +518,62 @@ fn build_projection(
         exprs,
         schema: Arc::new(Schema::new(fields)),
     })))
+}
+
+/// Find a matching column in the schema for an expression.
+/// This is used to map aggregate function calls to their output columns.
+fn find_matching_column(expr: &AstExpr, schema: &Schema) -> Option<LogicalExpr> {
+    // Get the output name of the expression
+    let expr_name = get_expr_output_name(expr)?;
+
+    // Look for a column with this name in the schema
+    for field in schema.fields() {
+        if field.column.name == expr_name {
+            return Some(LogicalExpr::Column(field.column.clone()));
+        }
+    }
+
+    // Also try just the simple name for aggregate functions
+    if let AstExpr::Function(f) = expr {
+        let agg_name = format_aggregate_name(&f.name, &f.args, f.distinct);
+        for field in schema.fields() {
+            if field.column.name == agg_name {
+                return Some(LogicalExpr::Column(field.column.clone()));
+            }
+        }
+    }
+
+    None
+}
+
+/// Get the output name for an AST expression.
+fn get_expr_output_name(expr: &AstExpr) -> Option<String> {
+    match expr {
+        AstExpr::Column(col_ref) => Some(col_ref.column.clone()),
+        AstExpr::Function(f) => Some(format_aggregate_name(&f.name, &f.args, f.distinct)),
+        _ => None,
+    }
+}
+
+/// Format the name of an aggregate function for matching.
+fn format_aggregate_name(name: &str, args: &[AstExpr], distinct: bool) -> String {
+    let args_str = if args.is_empty() || args.iter().any(|a| matches!(a, AstExpr::Wildcard)) {
+        "*".to_string()
+    } else {
+        args.iter()
+            .filter_map(|a| match a {
+                AstExpr::Column(col_ref) => Some(col_ref.column.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if distinct {
+        format!("{}(DISTINCT {})", name.to_uppercase(), args_str)
+    } else {
+        format!("{}({})", name.to_uppercase(), args_str)
+    }
 }
 
 fn build_insert(

@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use super::{
     DistinctExec, EmptyExec, ExecutionError, FilterExec, HashAggregateExec, HashJoinExec,
-    LimitExec, Operator, ProjectionExec, RecordBatch, SeqScanExec, SortExec, TopNExec, Value,
-    ValuesExec,
+    LimitExec, NestedLoopJoinExec, Operator, ProjectionExec, RecordBatch, SeqScanExec, SortExec,
+    TopNExec, Value, ValuesExec,
 };
 use crate::logical::Schema;
 use crate::physical::{ExecutionContext, ExecutionMetrics, PhysicalOperator, PhysicalPlan};
@@ -179,16 +179,15 @@ impl QueryExecutor {
             }
 
             PhysicalOperator::NestedLoopJoin(join) => {
-                // Fall back to hash join with empty keys (cross join)
+                // Use NestedLoopJoinExec for cross joins and joins without equi-keys
                 let left = self.build_operator(&join.left)?;
                 let right = self.build_operator(&join.right)?;
 
-                Ok(Box::new(HashJoinExec::new(
+                Ok(Box::new(NestedLoopJoinExec::new(
                     left,
                     right,
-                    Vec::new(),
-                    Vec::new(),
                     join.join_type,
+                    join.condition.clone(),
                     join.schema.clone(),
                 )))
             }
@@ -532,7 +531,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Test hanging - needs investigation"]
     fn test_execute_aggregate() {
         let scan = Arc::new(create_scan());
 
