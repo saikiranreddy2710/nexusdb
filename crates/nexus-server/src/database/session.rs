@@ -281,6 +281,11 @@ impl Session {
             // Query - use plan cache
             Statement::Select(_) => self.execute_query(statement, sql, start),
 
+            // SHOW/DESCRIBE statements
+            Statement::ShowTables => self.execute_show_tables(),
+            Statement::ShowDatabases => self.execute_show_databases(),
+            Statement::DescribeTable(table_name) => self.execute_describe_table(table_name),
+
             _ => Err(DatabaseError::NotImplemented(
                 "statement type not yet supported".to_string(),
             )),
@@ -591,6 +596,121 @@ impl Session {
         let execute_result = ExecuteResult::from_batches(result.schema, result.batches, elapsed);
 
         Ok(StatementResult::Query(execute_result))
+    }
+
+    // =========================================================================
+    // SHOW/DESCRIBE Commands
+    // =========================================================================
+
+    /// Executes SHOW TABLES.
+    fn execute_show_tables(&self) -> DatabaseResult<StatementResult> {
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        let table_names = self.storage.list_tables();
+        let mut sorted_names = table_names;
+        sorted_names.sort();
+
+        // Build schema for result
+        let schema = Arc::new(Schema::new(vec![
+            Field::not_null("table_name", DataType::Text),
+        ]));
+
+        // Build rows
+        let rows: Vec<Row> = sorted_names
+            .into_iter()
+            .map(|name| Row::new(vec![Value::String(name)]))
+            .collect();
+
+        let total_rows = rows.len();
+        let batch = nexus_sql::executor::RecordBatch::from_rows(schema.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+
+        let result = ExecuteResult {
+            schema,
+            batches: vec![batch],
+            total_rows,
+            execution_time: std::time::Duration::from_millis(0),
+        };
+
+        Ok(StatementResult::Query(result))
+    }
+
+    /// Executes SHOW DATABASES.
+    fn execute_show_databases(&self) -> DatabaseResult<StatementResult> {
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        // Currently we only have a single default database
+        let schema = Arc::new(Schema::new(vec![
+            Field::not_null("database_name", DataType::Text),
+        ]));
+
+        let rows = vec![Row::new(vec![Value::String("nexusdb".to_string())])];
+
+        let batch = nexus_sql::executor::RecordBatch::from_rows(schema.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+
+        let result = ExecuteResult {
+            schema,
+            batches: vec![batch],
+            total_rows: 1,
+            execution_time: std::time::Duration::from_millis(0),
+        };
+
+        Ok(StatementResult::Query(result))
+    }
+
+    /// Executes DESCRIBE TABLE.
+    fn execute_describe_table(&self, table_name: &str) -> DatabaseResult<StatementResult> {
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        let table_info = self.storage.get_table_info(table_name).ok_or_else(|| {
+            DatabaseError::StorageError(nexus_sql::storage::StorageError::TableNotFound(
+                table_name.to_string(),
+            ))
+        })?;
+
+        // Build schema for result
+        let schema = Arc::new(Schema::new(vec![
+            Field::not_null("column_name", DataType::Text),
+            Field::not_null("data_type", DataType::Text),
+            Field::not_null("nullable", DataType::Boolean),
+            Field::not_null("primary_key", DataType::Boolean),
+        ]));
+
+        let pk_columns: std::collections::HashSet<usize> =
+            table_info.primary_key.iter().copied().collect();
+
+        // Build rows for each column
+        let rows: Vec<Row> = table_info
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                Row::new(vec![
+                    Value::String(field.name().to_string()),
+                    Value::String(format!("{:?}", field.data_type)),
+                    Value::Boolean(field.nullable),
+                    Value::Boolean(pk_columns.contains(&i)),
+                ])
+            })
+            .collect();
+
+        let total_rows = rows.len();
+        let batch = nexus_sql::executor::RecordBatch::from_rows(schema.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+
+        let result = ExecuteResult {
+            schema,
+            batches: vec![batch],
+            total_rows,
+            execution_time: std::time::Duration::from_millis(0),
+        };
+
+        Ok(StatementResult::Query(result))
     }
 
     // =========================================================================
@@ -908,6 +1028,82 @@ mod tests {
             let rows = query_result.rows();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get(0), Some(&Value::String("Bob".to_string())));
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_show_tables() {
+        let mut session = create_session();
+
+        // No tables initially
+        let result = session.execute("SHOW TABLES").unwrap();
+        if let StatementResult::Query(query_result) = result {
+            assert_eq!(query_result.total_rows, 0);
+        } else {
+            panic!("expected Query result");
+        }
+
+        // Create some tables
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE orders (id INT PRIMARY KEY, amount INT)")
+            .unwrap();
+
+        // Should show 2 tables
+        let result = session.execute("SHOW TABLES").unwrap();
+        if let StatementResult::Query(query_result) = result {
+            assert_eq!(query_result.total_rows, 2);
+            let rows = query_result.rows();
+            // Should be sorted alphabetically
+            assert_eq!(rows[0].get(0), Some(&Value::String("orders".to_string())));
+            assert_eq!(rows[1].get(0), Some(&Value::String("users".to_string())));
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_describe_table() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT)")
+            .unwrap();
+
+        let result = session.execute("DESCRIBE users").unwrap();
+        if let StatementResult::Query(query_result) = result {
+            assert_eq!(query_result.total_rows, 3);
+            let rows = query_result.rows();
+
+            // Check column names
+            assert_eq!(rows[0].get(0), Some(&Value::String("id".to_string())));
+            assert_eq!(rows[1].get(0), Some(&Value::String("name".to_string())));
+            assert_eq!(rows[2].get(0), Some(&Value::String("email".to_string())));
+
+            // Check primary key column
+            assert_eq!(rows[0].get(3), Some(&Value::Boolean(true))); // id is PK
+            assert_eq!(rows[1].get(3), Some(&Value::Boolean(false))); // name is not PK
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_show_databases() {
+        let mut session = create_session();
+
+        let result = session.execute("SHOW databases").unwrap();
+        if let StatementResult::Query(query_result) = result {
+            assert_eq!(query_result.total_rows, 1);
+            let rows = query_result.rows();
+            assert_eq!(
+                rows[0].get(0),
+                Some(&Value::String("nexusdb".to_string()))
+            );
         } else {
             panic!("expected Query result");
         }

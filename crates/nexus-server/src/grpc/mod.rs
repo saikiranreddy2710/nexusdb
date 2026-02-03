@@ -2,7 +2,9 @@
 //!
 //! This module implements the NexusDB gRPC service defined in nexus-proto.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use tonic::{Request, Response, Status};
@@ -15,7 +17,7 @@ use nexus_proto::proto::{
     Row, RowBatch, ServerInfoRequest, ServerInfoResponse, Value,
 };
 
-use crate::database::{Database, ExecuteResult, StatementResult};
+use crate::database::{Database, ExecuteResult, SessionId, StatementResult};
 
 /// NexusDB gRPC service implementation.
 pub struct NexusDbService {
@@ -23,6 +25,11 @@ pub struct NexusDbService {
     db: Arc<Database>,
     /// Server start time.
     start_time: Instant,
+    /// Maps transaction IDs to session IDs for persistent transactions.
+    /// This allows transactions to span multiple gRPC calls.
+    transaction_sessions: RwLock<HashMap<u64, SessionId>>,
+    /// Next transaction ID counter.
+    next_txn_id: AtomicU64,
 }
 
 impl NexusDbService {
@@ -31,7 +38,27 @@ impl NexusDbService {
         Self {
             db,
             start_time: Instant::now(),
+            transaction_sessions: RwLock::new(HashMap::new()),
+            next_txn_id: AtomicU64::new(1),
         }
+    }
+
+    /// Executes SQL using a specific transaction/session, or a temporary session if no transaction.
+    fn execute_with_txn(&self, sql: &str, transaction_id: Option<u64>) -> Result<StatementResult, crate::database::DatabaseError> {
+        if let Some(txn_id) = transaction_id {
+            // Use the existing session for this transaction
+            let sessions = self.transaction_sessions.read().unwrap();
+            if let Some(&session_id) = sessions.get(&txn_id) {
+                if let Some(session_arc) = self.db.get_session(session_id) {
+                    let mut session = session_arc.write().unwrap();
+                    return session.execute(sql);
+                }
+            }
+            // Transaction not found, fall through to temporary session
+        }
+        
+        // Use a temporary session (autocommit)
+        self.db.execute(sql)
     }
 
     /// Converts an ExecuteResult to a QueryResult proto.
@@ -188,8 +215,8 @@ impl NexusDb for NexusDbService {
         let req = request.into_inner();
         let start = Instant::now();
 
-        // Execute the SQL
-        match self.db.execute(&req.sql) {
+        // Execute the SQL using the transaction session if provided
+        match self.execute_with_txn(&req.sql, req.transaction_id) {
             Ok(result) => {
                 let elapsed = start.elapsed();
                 let stats = ExecutionStats {
@@ -320,63 +347,144 @@ impl NexusDb for NexusDbService {
         &self,
         _request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
-        // For now, we can't easily expose session-level transactions via stateless gRPC
-        // In a real implementation, we'd need session affinity or transaction tokens
+        // Create a persistent session for this transaction
+        let session_id = self.db.create_session();
         
-        // Execute BEGIN and return a transaction ID
-        match self.db.execute("BEGIN") {
-            Ok(_) => {
-                // Generate a pseudo transaction ID (in real impl, would come from session)
-                let txn_id = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64;
-
-                Ok(Response::new(BeginTransactionResponse {
-                    success: true,
-                    error: None,
-                    transaction_id: txn_id,
-                }))
+        // Begin the transaction in this session
+        if let Some(session_arc) = self.db.get_session(session_id) {
+            let mut session = session_arc.write().unwrap();
+            match session.begin() {
+                Ok(()) => {
+                    // Generate a unique transaction ID and map it to this session
+                    let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
+                    
+                    let mut sessions = self.transaction_sessions.write().unwrap();
+                    sessions.insert(txn_id, session_id);
+                    
+                    Ok(Response::new(BeginTransactionResponse {
+                        success: true,
+                        error: None,
+                        transaction_id: txn_id,
+                    }))
+                }
+                Err(e) => {
+                    // Clean up the session on error
+                    self.db.close_session(session_id);
+                    Ok(Response::new(BeginTransactionResponse {
+                        success: false,
+                        error: Some(e.to_string()),
+                        transaction_id: 0,
+                    }))
+                }
             }
-            Err(e) => Ok(Response::new(BeginTransactionResponse {
+        } else {
+            Ok(Response::new(BeginTransactionResponse {
                 success: false,
-                error: Some(e.to_string()),
+                error: Some("Failed to create session".to_string()),
                 transaction_id: 0,
-            })),
+            }))
         }
     }
 
     /// Commit a transaction.
     async fn commit(
         &self,
-        _request: Request<CommitRequest>,
+        request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        match self.db.execute("COMMIT") {
-            Ok(_) => Ok(Response::new(CommitResponse {
-                success: true,
-                error: None,
-            })),
-            Err(e) => Ok(Response::new(CommitResponse {
+        let req = request.into_inner();
+        let txn_id = req.transaction_id;
+        
+        // Find the session for this transaction
+        let session_id = {
+            let sessions = self.transaction_sessions.read().unwrap();
+            sessions.get(&txn_id).copied()
+        };
+        
+        if let Some(session_id) = session_id {
+            if let Some(session_arc) = self.db.get_session(session_id) {
+                let mut session = session_arc.write().unwrap();
+                match session.commit() {
+                    Ok(()) => {
+                        drop(session);
+                        // Clean up: remove the transaction mapping and close the session
+                        {
+                            let mut sessions = self.transaction_sessions.write().unwrap();
+                            sessions.remove(&txn_id);
+                        }
+                        self.db.close_session(session_id);
+                        
+                        Ok(Response::new(CommitResponse {
+                            success: true,
+                            error: None,
+                        }))
+                    }
+                    Err(e) => Ok(Response::new(CommitResponse {
+                        success: false,
+                        error: Some(e.to_string()),
+                    })),
+                }
+            } else {
+                Ok(Response::new(CommitResponse {
+                    success: false,
+                    error: Some("Session not found".to_string()),
+                }))
+            }
+        } else {
+            Ok(Response::new(CommitResponse {
                 success: false,
-                error: Some(e.to_string()),
-            })),
+                error: Some(format!("Transaction {} not found", txn_id)),
+            }))
         }
     }
 
     /// Rollback a transaction.
     async fn rollback(
         &self,
-        _request: Request<RollbackRequest>,
+        request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
-        match self.db.execute("ROLLBACK") {
-            Ok(_) => Ok(Response::new(RollbackResponse {
-                success: true,
-                error: None,
-            })),
-            Err(e) => Ok(Response::new(RollbackResponse {
+        let req = request.into_inner();
+        let txn_id = req.transaction_id;
+        
+        // Find the session for this transaction
+        let session_id = {
+            let sessions = self.transaction_sessions.read().unwrap();
+            sessions.get(&txn_id).copied()
+        };
+        
+        if let Some(session_id) = session_id {
+            if let Some(session_arc) = self.db.get_session(session_id) {
+                let mut session = session_arc.write().unwrap();
+                match session.rollback() {
+                    Ok(()) => {
+                        drop(session);
+                        // Clean up: remove the transaction mapping and close the session
+                        {
+                            let mut sessions = self.transaction_sessions.write().unwrap();
+                            sessions.remove(&txn_id);
+                        }
+                        self.db.close_session(session_id);
+                        
+                        Ok(Response::new(RollbackResponse {
+                            success: true,
+                            error: None,
+                        }))
+                    }
+                    Err(e) => Ok(Response::new(RollbackResponse {
+                        success: false,
+                        error: Some(e.to_string()),
+                    })),
+                }
+            } else {
+                Ok(Response::new(RollbackResponse {
+                    success: false,
+                    error: Some("Session not found".to_string()),
+                }))
+            }
+        } else {
+            Ok(Response::new(RollbackResponse {
                 success: false,
-                error: Some(e.to_string()),
-            })),
+                error: Some(format!("Transaction {} not found", txn_id)),
+            }))
         }
     }
 

@@ -463,12 +463,123 @@ impl<'a> PhysicalPlanner<'a> {
     ///
     /// Window functions require sorting the input by partition and order keys,
     /// then computing the window function for each partition.
-    fn plan_window(&self, _window: &WindowOperator) -> Result<PhysicalOperator, PlanningError> {
-        // TODO: Implement window function planning
-        // For now, return an error
-        Err(PlanningError::Unsupported(
-            "Window functions not yet implemented".to_string(),
-        ))
+    fn plan_window(&self, window: &WindowOperator) -> Result<PhysicalOperator, PlanningError> {
+        use crate::logical::{WindowFunc as LogicalWindowFunc, LogicalExpr};
+        use super::operator::{
+            WindowExpr, WindowFrame, WindowFrameBound, WindowFrameType, WindowFunc, 
+            WindowPhysicalOperator, SortExpr as PhysSortExpr,
+        };
+        
+        // Plan the child operator
+        let input = Arc::new(self.plan_operator(&window.input)?);
+        let input_schema = window.input.schema();
+        
+        // Convert logical window expressions to physical
+        let mut physical_window_exprs = Vec::new();
+        
+        for (i, expr) in window.window_exprs.iter().enumerate() {
+            if let LogicalExpr::WindowFunction {
+                func,
+                args,
+                partition_by,
+                order_by,
+                window_frame,
+            } = expr
+            {
+                // Convert the window function type
+                let physical_func = match func {
+                    LogicalWindowFunc::RowNumber => WindowFunc::RowNumber,
+                    LogicalWindowFunc::Rank => WindowFunc::Rank,
+                    LogicalWindowFunc::DenseRank => WindowFunc::DenseRank,
+                    LogicalWindowFunc::Ntile => WindowFunc::Ntile,
+                    LogicalWindowFunc::Lag => WindowFunc::Lag,
+                    LogicalWindowFunc::Lead => WindowFunc::Lead,
+                    LogicalWindowFunc::FirstValue => WindowFunc::FirstValue,
+                    LogicalWindowFunc::LastValue => WindowFunc::LastValue,
+                    LogicalWindowFunc::NthValue => WindowFunc::NthValue,
+                    LogicalWindowFunc::Aggregate(agg) => WindowFunc::Aggregate(*agg),
+                    LogicalWindowFunc::PercentRank | LogicalWindowFunc::CumeDist => {
+                        return Err(PlanningError::Unsupported(
+                            format!("Window function {:?} not yet implemented", func),
+                        ));
+                    }
+                };
+                
+                // Convert arguments
+                let physical_args: Result<Vec<PhysicalExpr>, PlanningError> = args
+                    .iter()
+                    .map(|a| create_physical_expr(a, &input_schema)
+                        .map_err(|e| PlanningError::ExpressionError(e.to_string())))
+                    .collect();
+                let physical_args = physical_args?;
+                
+                // Convert partition by (if any)
+                let physical_partition_by: Result<Vec<PhysicalExpr>, PlanningError> = partition_by
+                    .iter()
+                    .map(|e| create_physical_expr(e, &input_schema)
+                        .map_err(|e| PlanningError::ExpressionError(e.to_string())))
+                    .collect();
+                let physical_partition_by = physical_partition_by?;
+                
+                // Convert order by (if any)
+                let physical_order_by: Vec<PhysSortExpr> = order_by
+                    .iter()
+                    .filter_map(|o| {
+                        create_physical_expr(&o.expr, &input_schema)
+                            .ok()
+                            .map(|e| PhysSortExpr {
+                                expr: e,
+                                asc: o.asc,
+                                nulls_first: o.nulls_first,
+                            })
+                    })
+                    .collect();
+                
+                // Convert window frame (if any)
+                let physical_frame = window_frame.as_ref().map(|f| {
+                    use crate::logical::{WindowFrameBound as LB, WindowFrameType as LT};
+                    
+                    let frame_type = match f.frame_type {
+                        LT::Rows => WindowFrameType::Rows,
+                        LT::Range => WindowFrameType::Range,
+                        LT::Groups => WindowFrameType::Groups,
+                    };
+                    
+                    let convert_bound = |b: &LB| match b {
+                        LB::UnboundedPreceding => WindowFrameBound::UnboundedPreceding,
+                        LB::UnboundedFollowing => WindowFrameBound::UnboundedFollowing,
+                        LB::CurrentRow => WindowFrameBound::CurrentRow,
+                        LB::Preceding(n) => WindowFrameBound::Preceding(*n),
+                        LB::Following(n) => WindowFrameBound::Following(*n),
+                    };
+                    
+                    WindowFrame {
+                        frame_type,
+                        start: convert_bound(&f.start),
+                        end: convert_bound(&f.end),
+                    }
+                });
+                
+                physical_window_exprs.push(WindowExpr {
+                    func: physical_func,
+                    args: physical_args,
+                    partition_by: physical_partition_by,
+                    order_by: physical_order_by,
+                    frame: physical_frame,
+                    name: format!("window_{}", i),
+                });
+            } else {
+                return Err(PlanningError::Internal(
+                    "Expected window function expression".to_string(),
+                ));
+            }
+        }
+        
+        Ok(PhysicalOperator::Window(WindowPhysicalOperator {
+            input,
+            window_exprs: physical_window_exprs,
+            schema: window.schema.clone(),
+        }))
     }
 
     /// Plans a CTE (Common Table Expression).

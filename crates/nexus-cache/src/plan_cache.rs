@@ -182,9 +182,15 @@ impl<P: Clone> PlanCache<P> {
     }
 
     /// Invalidates all plans that reference the given table.
-    pub fn invalidate_table(&self, table_name: &str) {
-        let pattern = table_name.to_lowercase();
-        self.invalidate_where(|sql| sql.to_lowercase().contains(&pattern));
+    ///
+    /// Note: Due to LruCache API limitations (no key iteration support), this
+    /// currently clears the entire cache. A future improvement would add key
+    /// tracking or iteration support for selective invalidation.
+    pub fn invalidate_table(&self, _table_name: &str) {
+        // Since LruCache doesn't support iteration over keys, we cannot
+        // selectively remove entries matching the table name. Clear the
+        // entire cache as a safe fallback.
+        self.cache.write().clear();
     }
 
     /// Returns the number of cached plans.

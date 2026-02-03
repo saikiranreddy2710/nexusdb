@@ -11,7 +11,9 @@ The goal was to understand how databases really work under the hood — not just
 ## Features
 
 **Storage Engine (SageTree)**
-- Custom B+ tree implementation with fractional cascading
+- SageTree B-tree variant with Bw-tree–style delta chains and fractional cascading
+- MVCC-aware index structure designed for snapshot isolation
+- Bloom filter integration for fast negative key lookups
 - Buffer pool with clock-sweep eviction
 - Write-ahead logging for durability
 
@@ -67,17 +69,22 @@ NexusDB> SELECT * FROM users;
 
 ```
 crates/
-├── nexus-storage    # B+ tree, buffer pool, page management
+├── nexus-common     # Shared types, config, errors, memory utilities
+├── nexus-cache      # Bloom filters and in-memory caches
+├── nexus-storage    # SageTree index, buffer pool, page layout/management
+├── nexus-buffer     # Standalone buffer pool components
 ├── nexus-wal        # Write-ahead log
 ├── nexus-raft       # Distributed consensus
 ├── nexus-sql        # Parser, planner, optimizer, executor
-├── nexus-txn        # Transaction manager
+├── nexus-query      # Logical/physical query planning and operators
+├── nexus-txn        # Transaction manager (2PL, deadlock detection)
 ├── nexus-mvcc       # Multi-version concurrency control
 ├── nexus-server     # Database server and session management
 ├── nexus-client     # Rust client library
 ├── nexus-proto      # gRPC protocol definitions
 ├── nexus-cli        # Command-line interface
-└── nexus-test       # Integration tests
+├── nexus-test       # Integration and end-to-end tests
+└── nexus-bench      # Microbenchmarks and performance experiments
 ```
 
 ## Architecture
@@ -181,13 +188,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Performance
 
-Haven't done serious benchmarking yet, but early numbers on my M1 MacBook:
+`nexus-bench` contains Criterion-based microbenchmarks for the storage engine (`SageTree`), SQL/database layer, and caches (LRU/ARC/Bloom).
 
-- Simple point queries: ~50k/sec
-- Bulk inserts: ~100k rows/sec
-- Scan with filter: ~1M rows/sec
+On a recent M‑series MacBook (bench profile, in-memory, `cargo bench -p nexus-bench -- --quick`), representative numbers are:
 
-Take these with a grain of salt — there's definitely room for optimization.
+- SageTree point lookups: **3.5–5.5M keys/sec** (depending on tree size)
+- SageTree sequential inserts: **~0.6M keys/sec**
+- End-to-end `INSERT + SELECT` workload: **~150–180k rows/sec**
+
+These are single-node, in-memory figures primarily useful for regression tracking — real-world performance will depend heavily on workload, data size, and deployment.
 
 ## Why Build This?
 

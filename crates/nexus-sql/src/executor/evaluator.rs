@@ -565,6 +565,7 @@ pub struct Accumulator {
     /// The aggregate function.
     func: AggregateFunc,
     /// Whether DISTINCT.
+    #[allow(dead_code)]
     distinct: bool,
     /// Accumulated state.
     state: AccumulatorState,

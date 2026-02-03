@@ -10,7 +10,7 @@ use std::time::Instant;
 use super::{
     DistinctExec, EmptyExec, ExecutionError, FilterExec, HashAggregateExec, HashJoinExec,
     LimitExec, NestedLoopJoinExec, Operator, ProjectionExec, RecordBatch, SeqScanExec, SortExec,
-    TopNExec, Value, ValuesExec,
+    TopNExec, Value, ValuesExec, WindowExec,
 };
 use crate::logical::Schema;
 use crate::physical::{ExecutionContext, ExecutionMetrics, PhysicalOperator, PhysicalPlan};
@@ -19,6 +19,7 @@ use crate::physical::{ExecutionContext, ExecutionMetrics, PhysicalOperator, Phys
 #[derive(Debug)]
 pub struct QueryExecutor {
     /// Execution context.
+    #[allow(dead_code)]
     ctx: ExecutionContext,
     /// Table data (for in-memory execution).
     tables: HashMap<String, Vec<RecordBatch>>,
@@ -273,6 +274,15 @@ impl QueryExecutor {
                 // For single-node execution, exchange is a no-op
                 self.build_operator(&exchange.input)
             }
+
+            PhysicalOperator::Window(window) => {
+                let child = self.build_operator(&window.input)?;
+                Ok(Box::new(WindowExec::new(
+                    child,
+                    window.window_exprs.clone(),
+                    window.schema.clone(),
+                )))
+            }
         }
     }
 }
@@ -366,6 +376,7 @@ impl QueryResult {
 struct SetOperationExec {
     left: Box<dyn Operator>,
     right: Box<dyn Operator>,
+    #[allow(dead_code)]
     op: crate::logical::SetOpType,
     schema: Arc<Schema>,
     state: SetOpState,

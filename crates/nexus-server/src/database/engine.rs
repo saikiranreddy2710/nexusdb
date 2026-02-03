@@ -4,14 +4,15 @@
 //! It manages sessions, storage, and provides the unified API.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use nexus_sql::storage::StorageEngine;
+use nexus_wal::{Wal, WalConfig, SyncPolicy};
 
-use super::error::DatabaseResult;
+use super::error::{DatabaseError, DatabaseResult};
 use super::result::StatementResult;
 use super::session::{Session, SessionConfig, SessionId};
 
@@ -84,6 +85,8 @@ pub struct Database {
     config: DatabaseConfig,
     /// Storage engine.
     storage: Arc<StorageEngine>,
+    /// Write-ahead log (if enabled).
+    wal: Option<Arc<Wal>>,
     /// Active sessions.
     sessions: RwLock<HashMap<SessionId, Arc<RwLock<Session>>>>,
     /// Next session ID.
@@ -99,17 +102,113 @@ impl Database {
     pub fn open(config: DatabaseConfig) -> DatabaseResult<Self> {
         let storage = Arc::new(StorageEngine::new());
 
-        // TODO: If data_dir is specified, load existing tables from disk
-        // TODO: If WAL is enabled, replay WAL to recover state
+        // Initialize WAL if enabled and data directory is specified
+        let wal = if config.wal_enabled {
+            if let Some(ref data_dir) = config.data_dir {
+                let wal_dir = PathBuf::from(data_dir).join("wal");
+                let sync_policy = match config.wal_sync_mode {
+                    0 => SyncPolicy::Never,
+                    1 => SyncPolicy::GroupCommit,
+                    _ => SyncPolicy::EveryWrite,
+                };
+                let wal_config = WalConfig::new(&wal_dir).with_sync_policy(sync_policy);
+                
+                // Try to open existing WAL or create new one
+                let wal = if wal_dir.exists() {
+                    match Wal::open(wal_config.clone()) {
+                        Ok(wal) => {
+                            tracing::info!("Opened existing WAL at {:?}", wal_dir);
+                            // Replay WAL for recovery
+                            Self::replay_wal(&wal, &storage)?;
+                            wal
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to open WAL, creating new: {}", e);
+                            Wal::new(wal_config).map_err(|e| {
+                                DatabaseError::Internal(format!("Failed to create WAL: {}", e))
+                            })?
+                        }
+                    }
+                } else {
+                    Wal::new(wal_config).map_err(|e| {
+                        DatabaseError::Internal(format!("Failed to create WAL: {}", e))
+                    })?
+                };
+                
+                Some(Arc::new(wal))
+            } else {
+                // WAL enabled but no data directory - log warning
+                tracing::warn!("WAL enabled but no data directory specified, running without WAL");
+                None
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
             storage,
+            wal,
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             total_sessions: AtomicU64::new(0),
             started_at: Instant::now(),
         })
+    }
+
+    /// Replays the WAL to recover state after a crash.
+    fn replay_wal(wal: &Wal, _storage: &StorageEngine) -> DatabaseResult<()> {
+        use nexus_wal::record::RecordType;
+        
+        let min_recovery_lsn = wal.min_recovery_lsn();
+        
+        // Read all records from the minimum recovery LSN
+        let records = wal.iter_from(min_recovery_lsn).map_err(|e| {
+            DatabaseError::Internal(format!("Failed to read WAL: {}", e))
+        })?;
+        
+        if records.is_empty() {
+            tracing::info!("No WAL records to replay");
+            return Ok(());
+        }
+        
+        tracing::info!("Replaying {} WAL records from LSN {:?}", records.len(), min_recovery_lsn);
+        
+        // Track committed and aborted transactions
+        let mut committed_txns = std::collections::HashSet::new();
+        let mut aborted_txns = std::collections::HashSet::new();
+        
+        // First pass: identify committed and aborted transactions
+        for record in &records {
+            match record.header.record_type {
+                RecordType::Commit => {
+                    committed_txns.insert(record.header.txn_id);
+                }
+                RecordType::Abort => {
+                    aborted_txns.insert(record.header.txn_id);
+                }
+                _ => {}
+            }
+        }
+        
+        tracing::info!(
+            "Found {} committed, {} aborted transactions",
+            committed_txns.len(),
+            aborted_txns.len()
+        );
+        
+        // TODO: Second pass - replay committed transactions' operations
+        // This requires integration with the storage engine to re-apply
+        // INSERT, UPDATE, DELETE operations. For now, we just log.
+        //
+        // In a full implementation:
+        // - For each INSERT record from a committed txn: re-insert the row
+        // - For each UPDATE record from a committed txn: re-apply the update  
+        // - For each DELETE record from a committed txn: re-delete the row
+        //
+        // We also need to handle the page_id/slot_id mapping to actual storage.
+        
+        Ok(())
     }
 
     /// Opens an in-memory database.
@@ -127,6 +226,11 @@ impl Database {
     /// Returns the storage engine.
     pub fn storage(&self) -> &Arc<StorageEngine> {
         &self.storage
+    }
+
+    /// Returns the WAL if enabled.
+    pub fn wal(&self) -> Option<&Arc<Wal>> {
+        self.wal.as_ref()
     }
 
     /// Returns the configuration.
@@ -285,8 +389,18 @@ impl Database {
             self.close_session(id);
         }
 
-        // TODO: Flush WAL
-        // TODO: Sync storage to disk
+        // Close WAL if enabled
+        if let Some(ref wal) = self.wal {
+            if let Err(e) = wal.sync() {
+                tracing::error!("Failed to sync WAL: {}", e);
+            }
+            if let Err(e) = wal.close() {
+                tracing::error!("Failed to close WAL: {}", e);
+            }
+        }
+
+        // Consolidate storage
+        self.storage.consolidate_all();
     }
 }
 

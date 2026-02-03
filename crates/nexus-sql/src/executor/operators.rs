@@ -29,6 +29,7 @@ pub struct SeqScanExec {
     /// Output schema.
     schema: Arc<Schema>,
     /// Table name.
+    #[allow(dead_code)]
     table_name: String,
     /// Data to scan (for in-memory tables).
     data: Vec<RecordBatch>,
@@ -1182,6 +1183,250 @@ impl Operator for EmptyExec {
     }
 
     fn reset(&mut self) {}
+}
+
+/// Window function executor.
+#[derive(Debug)]
+pub struct WindowExec {
+    /// Child operator.
+    child: Box<dyn Operator>,
+    /// Window expressions.
+    window_exprs: Vec<crate::physical::WindowExpr>,
+    /// Output schema.
+    schema: Arc<Schema>,
+    /// Accumulated rows from child.
+    accumulated: Option<Vec<Row>>,
+    /// Whether we've computed results.
+    computed: bool,
+    /// Result rows.
+    results: Vec<Row>,
+    /// Current position in results.
+    position: usize,
+}
+
+impl WindowExec {
+    /// Creates a new window executor.
+    pub fn new(
+        child: Box<dyn Operator>,
+        window_exprs: Vec<crate::physical::WindowExpr>,
+        schema: Arc<Schema>,
+    ) -> Self {
+        Self {
+            child,
+            window_exprs,
+            schema,
+            accumulated: None,
+            computed: false,
+            results: Vec::new(),
+            position: 0,
+        }
+    }
+
+    /// Computes window functions over accumulated rows.
+    fn compute_windows(&mut self, rows: Vec<Row>) -> Result<Vec<Row>, ExecutionError> {
+        use crate::physical::WindowFunc;
+        
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let input_schema = self.child.schema();
+        let _num_input_cols = input_schema.len();
+        let mut result_rows = Vec::with_capacity(rows.len());
+
+        // For each row, compute window function values
+        for (row_num, row) in rows.iter().enumerate() {
+            let mut new_values = row.values().to_vec();
+
+            // Compute each window expression
+            for window_expr in &self.window_exprs {
+                let window_value = match window_expr.func {
+                    WindowFunc::RowNumber => {
+                        // Simple ROW_NUMBER() without partitions
+                        // TODO: Implement partition support
+                        Value::BigInt((row_num + 1) as i64)
+                    }
+                    WindowFunc::Rank | WindowFunc::DenseRank => {
+                        // For now, same as ROW_NUMBER (no partition/order support)
+                        Value::BigInt((row_num + 1) as i64)
+                    }
+                    WindowFunc::Ntile => {
+                        // NTILE(n) - need first argument for bucket count
+                        if let Some(arg) = window_expr.args.first() {
+                            if let crate::physical::PhysicalExpr::Literal(
+                                crate::parser::Literal::Integer(n),
+                            ) = arg
+                            {
+                                let bucket_size = (rows.len() as i64 + n - 1) / n;
+                                let bucket = (row_num as i64 / bucket_size) + 1;
+                                Value::BigInt(bucket.min(*n))
+                            } else {
+                                Value::BigInt(1)
+                            }
+                        } else {
+                            Value::BigInt(1)
+                        }
+                    }
+                    WindowFunc::Lag => {
+                        // LAG(expr, offset) - value from previous row
+                        let offset = window_expr
+                            .args
+                            .get(1)
+                            .and_then(|a| {
+                                if let crate::physical::PhysicalExpr::Literal(
+                                    crate::parser::Literal::Integer(n),
+                                ) = a
+                                {
+                                    Some(*n as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(1);
+
+                        if row_num >= offset {
+                            // Get value from offset rows back
+                            if let Some(arg_expr) = window_expr.args.first() {
+                                evaluate_expr(arg_expr, &rows[row_num - offset], &input_schema)
+                                    .unwrap_or(Value::Null)
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    WindowFunc::Lead => {
+                        // LEAD(expr, offset) - value from next row
+                        let offset = window_expr
+                            .args
+                            .get(1)
+                            .and_then(|a| {
+                                if let crate::physical::PhysicalExpr::Literal(
+                                    crate::parser::Literal::Integer(n),
+                                ) = a
+                                {
+                                    Some(*n as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(1);
+
+                        if row_num + offset < rows.len() {
+                            if let Some(arg_expr) = window_expr.args.first() {
+                                evaluate_expr(arg_expr, &rows[row_num + offset], &input_schema)
+                                    .unwrap_or(Value::Null)
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    WindowFunc::FirstValue => {
+                        // FIRST_VALUE(expr)
+                        if let Some(arg_expr) = window_expr.args.first() {
+                            evaluate_expr(arg_expr, &rows[0], &input_schema)
+                                .unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    WindowFunc::LastValue => {
+                        // LAST_VALUE(expr)
+                        if let Some(arg_expr) = window_expr.args.first() {
+                            evaluate_expr(arg_expr, rows.last().unwrap(), &input_schema)
+                                .unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    WindowFunc::NthValue => {
+                        // NTH_VALUE(expr, n)
+                        let n = window_expr
+                            .args
+                            .get(1)
+                            .and_then(|a| {
+                                if let crate::physical::PhysicalExpr::Literal(
+                                    crate::parser::Literal::Integer(n),
+                                ) = a
+                                {
+                                    Some(*n as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(1);
+
+                        if n > 0 && n <= rows.len() {
+                            if let Some(arg_expr) = window_expr.args.first() {
+                                evaluate_expr(arg_expr, &rows[n - 1], &input_schema)
+                                    .unwrap_or(Value::Null)
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    WindowFunc::Aggregate(_) => {
+                        // Aggregate as window function - not yet implemented
+                        // TODO: Implement SUM(), AVG(), etc. over windows
+                        Value::Null
+                    }
+                };
+
+                new_values.push(window_value);
+            }
+
+            result_rows.push(Row::new(new_values));
+        }
+
+        Ok(result_rows)
+    }
+}
+
+impl Operator for WindowExec {
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
+        // First, accumulate all input rows
+        if !self.computed {
+            let mut all_rows = Vec::new();
+            while let Some(batch) = self.child.next_batch()? {
+                all_rows.extend(batch.rows());
+            }
+            
+            // Compute window functions
+            self.results = self.compute_windows(all_rows)?;
+            self.computed = true;
+        }
+
+        // Return results in batches
+        if self.position >= self.results.len() {
+            return Ok(None);
+        }
+
+        let batch_size = 1000;
+        let end = (self.position + batch_size).min(self.results.len());
+        let batch_rows: Vec<_> = self.results[self.position..end].to_vec();
+        self.position = end;
+
+        let batch = RecordBatch::from_rows(self.schema.clone(), &batch_rows)
+            .map_err(ExecutionError::Internal)?;
+        Ok(Some(batch))
+    }
+
+    fn reset(&mut self) {
+        self.child.reset();
+        self.accumulated = None;
+        self.computed = false;
+        self.results.clear();
+        self.position = 0;
+    }
 }
 
 /// Error type for execution.

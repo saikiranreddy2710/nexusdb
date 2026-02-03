@@ -228,15 +228,14 @@ Type SQL statements followed by a semicolon to execute them.
     }
 
     async fn list_tables(&self, repl: &mut Repl) -> Result<CommandResult> {
-        // Execute a query to list tables
-        let sql = "SELECT name, type FROM system.tables ORDER BY name";
-        repl.execute_and_print(sql).await?;
+        // Execute SHOW TABLES command
+        repl.execute_and_print("SHOW TABLES").await?;
         Ok(CommandResult::Continue)
     }
 
     async fn list_databases(&self, repl: &mut Repl) -> Result<CommandResult> {
-        let sql = "SELECT name FROM system.databases ORDER BY name";
-        repl.execute_and_print(sql).await?;
+        // Execute SHOW DATABASES command
+        repl.execute_and_print("SHOW DATABASES").await?;
         Ok(CommandResult::Continue)
     }
 

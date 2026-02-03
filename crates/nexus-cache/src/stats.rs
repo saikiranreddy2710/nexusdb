@@ -103,7 +103,11 @@ impl CacheStats {
 
     /// Returns the miss ratio (0.0 to 1.0).
     pub fn miss_ratio(&self) -> f64 {
-        1.0 - self.hit_ratio()
+        if self.accesses() == 0 {
+            0.0
+        } else {
+            1.0 - self.hit_ratio()
+        }
     }
 
     /// Resets all statistics.

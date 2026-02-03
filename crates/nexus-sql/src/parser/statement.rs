@@ -38,6 +38,12 @@ pub enum Statement {
     Explain(Box<Statement>),
     /// EXPLAIN ANALYZE query.
     ExplainAnalyze(Box<Statement>),
+    /// SHOW TABLES statement.
+    ShowTables,
+    /// SHOW DATABASES statement.
+    ShowDatabases,
+    /// DESCRIBE/DESC table statement.
+    DescribeTable(String),
 }
 
 impl Statement {
@@ -146,6 +152,26 @@ impl Statement {
                     Ok(Statement::Explain(Box::new(inner)))
                 }
             }
+            sql_ast::Statement::ShowTables { .. } => Ok(Statement::ShowTables),
+            // Handle DESCRIBE table
+            sql_ast::Statement::ExplainTable {
+                table_name,
+                describe_alias: _,
+            } => Ok(Statement::DescribeTable(table_name.to_string())),
+            // Handle SHOW with various objects (databases, schemas, etc.)
+            sql_ast::Statement::ShowVariable { variable } => {
+                // Check if it's "databases" or similar
+                let var_str = variable
+                    .iter()
+                    .map(|i| i.value.to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if var_str == "databases" {
+                    Ok(Statement::ShowDatabases)
+                } else {
+                    Err(ParseError::Unsupported(format!("SHOW {}", var_str)))
+                }
+            }
             _ => Err(ParseError::Unsupported(format!("Statement: {:?}", stmt))),
         }
     }
@@ -154,7 +180,12 @@ impl Statement {
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
-            Statement::Select(_) | Statement::Explain(_) | Statement::ExplainAnalyze(_)
+            Statement::Select(_)
+                | Statement::Explain(_)
+                | Statement::ExplainAnalyze(_)
+                | Statement::ShowTables
+                | Statement::ShowDatabases
+                | Statement::DescribeTable(_)
         )
     }
 

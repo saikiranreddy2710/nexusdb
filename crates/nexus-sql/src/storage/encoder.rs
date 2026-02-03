@@ -91,6 +91,7 @@ pub struct RowEncoder {
     /// Primary key column indices.
     primary_key_indices: Vec<usize>,
     /// Schema.
+    #[allow(dead_code)]
     schema: Arc<Schema>,
     /// Encoding format.
     format: EncodingFormat,
@@ -345,6 +346,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[derive(Debug)]
 pub struct RowDecoder {
     /// Schema.
+    #[allow(dead_code)]
     schema: Arc<Schema>,
     /// Encoding format.
     format: EncodingFormat,

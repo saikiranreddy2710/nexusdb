@@ -120,6 +120,9 @@ pub enum PhysicalOperator {
 
     /// Empty result.
     Empty(EmptyOperator),
+
+    /// Window function operator.
+    Window(WindowPhysicalOperator),
 }
 
 impl PhysicalOperator {
@@ -143,6 +146,7 @@ impl PhysicalOperator {
             PhysicalOperator::Exchange(op) => op.input.schema(),
             PhysicalOperator::Values(op) => op.schema.clone(),
             PhysicalOperator::Empty(op) => op.schema.clone(),
+            PhysicalOperator::Window(op) => op.schema.clone(),
         }
     }
 
@@ -163,6 +167,7 @@ impl PhysicalOperator {
             PhysicalOperator::Limit(op) => vec![&op.input],
             PhysicalOperator::Distinct(op) => vec![&op.input],
             PhysicalOperator::Exchange(op) => vec![&op.input],
+            PhysicalOperator::Window(op) => vec![&op.input],
 
             PhysicalOperator::HashJoin(op) => vec![&op.left, &op.right],
             PhysicalOperator::MergeJoin(op) => vec![&op.left, &op.right],
@@ -191,6 +196,7 @@ impl PhysicalOperator {
             PhysicalOperator::Exchange(_) => "Exchange",
             PhysicalOperator::Values(_) => "Values",
             PhysicalOperator::Empty(_) => "Empty",
+            PhysicalOperator::Window(_) => "Window",
         }
     }
 
@@ -547,6 +553,107 @@ pub struct EmptyOperator {
     pub schema: SchemaRef,
     /// Whether to produce a single empty row.
     pub produce_one_row: bool,
+}
+
+/// Window function operator.
+#[derive(Debug, Clone)]
+pub struct WindowPhysicalOperator {
+    /// Input operator.
+    pub input: Arc<PhysicalOperator>,
+    /// Window function expressions.
+    pub window_exprs: Vec<WindowExpr>,
+    /// Output schema (input schema + window columns).
+    pub schema: SchemaRef,
+}
+
+/// A window function expression.
+#[derive(Debug, Clone)]
+pub struct WindowExpr {
+    /// The window function.
+    pub func: WindowFunc,
+    /// Arguments to the function.
+    pub args: Vec<PhysicalExpr>,
+    /// Partition by expressions.
+    pub partition_by: Vec<PhysicalExpr>,
+    /// Order by expressions.
+    pub order_by: Vec<SortExpr>,
+    /// Window frame specification.
+    pub frame: Option<WindowFrame>,
+    /// Output column name.
+    pub name: String,
+}
+
+/// Window function type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunc {
+    /// ROW_NUMBER() - assigns sequential row numbers.
+    RowNumber,
+    /// RANK() - assigns rank with gaps.
+    Rank,
+    /// DENSE_RANK() - assigns rank without gaps.
+    DenseRank,
+    /// NTILE(n) - divides rows into n buckets.
+    Ntile,
+    /// LAG(expr, offset) - value from previous row.
+    Lag,
+    /// LEAD(expr, offset) - value from next row.
+    Lead,
+    /// FIRST_VALUE(expr) - first value in frame.
+    FirstValue,
+    /// LAST_VALUE(expr) - last value in frame.
+    LastValue,
+    /// NTH_VALUE(expr, n) - nth value in frame.
+    NthValue,
+    /// Aggregate as window function (SUM, AVG, etc.).
+    Aggregate(crate::logical::AggregateFunc),
+}
+
+/// Window frame specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFrame {
+    /// Frame type (ROWS or RANGE).
+    pub frame_type: WindowFrameType,
+    /// Start bound.
+    pub start: WindowFrameBound,
+    /// End bound.
+    pub end: WindowFrameBound,
+}
+
+/// Window frame type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameType {
+    /// ROWS frame.
+    Rows,
+    /// RANGE frame.
+    Range,
+    /// GROUPS frame.
+    Groups,
+}
+
+/// Window frame bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameBound {
+    /// UNBOUNDED PRECEDING.
+    UnboundedPreceding,
+    /// UNBOUNDED FOLLOWING.
+    UnboundedFollowing,
+    /// CURRENT ROW.
+    CurrentRow,
+    /// N PRECEDING.
+    Preceding(u64),
+    /// N FOLLOWING.
+    Following(u64),
+}
+
+/// Sort expression for ORDER BY in window functions.
+#[derive(Debug, Clone)]
+pub struct SortExpr {
+    /// The expression to sort by.
+    pub expr: PhysicalExpr,
+    /// Sort direction.
+    pub asc: bool,
+    /// Nulls ordering.
+    pub nulls_first: bool,
 }
 
 #[cfg(test)]

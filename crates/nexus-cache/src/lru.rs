@@ -184,6 +184,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     {
         if let Some(node_ptr) = self.map.remove(key) {
             self.unlink(node_ptr);
+            self.stats.record_removal();
             // Safety: We just removed it from the map, so we own it
             let node = unsafe { Box::from_raw(node_ptr.as_ptr()) };
             Some(node.value)

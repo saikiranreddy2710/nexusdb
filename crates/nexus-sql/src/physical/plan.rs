@@ -191,6 +191,9 @@ impl PhysicalPlan {
                     output.push_str(" (one_row)");
                 }
             }
+            PhysicalOperator::Window(window) => {
+                output.push_str(&format!(" (exprs={})", window.window_exprs.len()));
+            }
         }
 
         output.push('\n');

@@ -272,15 +272,32 @@ impl CountingBloomFilter {
 
     /// Removes an item from the filter.
     ///
-    /// Note: Removing an item that wasn't inserted can cause false negatives.
-    pub fn remove<T: Hash>(&mut self, item: &T) {
-        if self.contains(item) {
-            for (seed_a, seed_b) in &self.seeds {
-                let index = self.hash_item(item, *seed_a, *seed_b);
-                self.counters[index] = self.counters[index].saturating_sub(1);
+    /// Returns `true` if the item was likely present and removed, `false` if
+    /// any counter was already zero (item was not present).
+    ///
+    /// Note: Removing an item that wasn't inserted can cause false negatives
+    /// for other items that share counter positions.
+    pub fn remove<T: Hash>(&mut self, item: &T) -> bool {
+        // Compute all indices first
+        let indices: Vec<usize> = self
+            .seeds
+            .iter()
+            .map(|(seed_a, seed_b)| self.hash_item(item, *seed_a, *seed_b))
+            .collect();
+
+        // Check that all counters are > 0 before decrementing
+        for &index in &indices {
+            if self.counters[index] == 0 {
+                return false;
             }
-            self.count = self.count.saturating_sub(1);
         }
+
+        // All counters are positive, so decrement each one
+        for &index in &indices {
+            self.counters[index] = self.counters[index].saturating_sub(1);
+        }
+        self.count = self.count.saturating_sub(1);
+        true
     }
 
     /// Checks if an item might be in the filter.
