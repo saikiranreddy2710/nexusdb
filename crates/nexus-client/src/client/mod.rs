@@ -597,8 +597,7 @@ impl Client {
             inner.last_activity = Instant::now();
         }
 
-        // TODO: Implement actual query execution via gRPC
-        // For now, return a mock result
+        // Execute query via gRPC (falls back to mock mode if not connected)
         let result = self.execute_query_internal(sql, query_id).await?;
 
         let elapsed = start.elapsed();
