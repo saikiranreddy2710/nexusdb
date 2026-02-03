@@ -1,0 +1,37 @@
+[package]
+name = "nexus-cache"
+version = "0.1.0"
+edition = "2021"
+authors = ["NexusDB Contributors"]
+license = "Apache-2.0"
+description = "High-performance caching utilities for NexusDB"
+repository = "https://github.com/saikiranreddy2710/nexusdb"
+keywords = ["database", "cache", "lru", "bloom-filter"]
+
+[dependencies]
+# Core utilities
+parking_lot = "0.12"
+hashbrown = { version = "0.14", features = ["raw"] }
+ahash = "0.8"
+
+# For bloom filters
+siphasher = "1.0"
+bitvec = "1.0"
+
+# Metrics and timing
+atomic = "0.6"
+
+# Error handling
+thiserror = "1.0"
+
+[dev-dependencies]
+rand = "0.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+[features]
+default = []
+metrics = []
