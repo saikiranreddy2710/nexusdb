@@ -297,11 +297,13 @@ impl Drop for Database {
 }
 
 /// A convenience wrapper for using a session within a database.
+#[allow(dead_code)]
 pub struct DatabaseSession<'a> {
     db: &'a Database,
     session_id: SessionId,
 }
 
+#[allow(dead_code)]
 impl<'a> DatabaseSession<'a> {
     /// Creates a new database session.
     pub fn new(db: &'a Database) -> Self {

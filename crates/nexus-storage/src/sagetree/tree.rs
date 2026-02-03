@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
+use nexus_cache::bloom::BloomFilter;
 use nexus_common::types::{Key, Lsn, PageId, TxnId, Value};
 
 use super::config::SageTreeConfig;
@@ -116,6 +117,8 @@ pub struct SageTree {
     internal_nodes: RwLock<HashMap<PageId, InternalNode>>,
     /// Statistics.
     stats: RwLock<TreeStats>,
+    /// Bloom filter for fast negative lookups.
+    bloom_filter: RwLock<BloomFilter>,
 }
 
 impl SageTree {
@@ -126,6 +129,10 @@ impl SageTree {
 
     /// Creates a new empty SageTree with the given configuration.
     pub fn with_config(config: SageTreeConfig) -> Self {
+        // Create a bloom filter sized for expected items
+        // Using 1% false positive rate for 100K expected items initially
+        let bloom_filter = BloomFilter::with_rate(100_000, 0.01);
+
         Self {
             config,
             allocator: PageAllocator::new(),
@@ -134,6 +141,7 @@ impl SageTree {
             nodes: RwLock::new(HashMap::new()),
             internal_nodes: RwLock::new(HashMap::new()),
             stats: RwLock::new(TreeStats::default()),
+            bloom_filter: RwLock::new(bloom_filter),
         }
     }
 
@@ -167,7 +175,20 @@ impl SageTree {
     // =========================================================================
 
     /// Gets a value by key.
+    ///
+    /// Uses a Bloom filter for fast negative lookups - if the key is
+    /// definitely not in the tree, we can return early without traversing.
     pub fn get(&self, key: &Key) -> SageTreeResult<Option<Value>> {
+        // Fast path: check bloom filter for definite negative
+        {
+            let bloom = self.bloom_filter.read().unwrap();
+            if !bloom.contains(key) {
+                // Key is definitely not in the tree
+                return Ok(None);
+            }
+        }
+        // Bloom filter says key might exist, so we need to check the tree
+
         let root = self.root.read().unwrap();
         let root_id = match *root {
             Some(id) => id,
@@ -222,6 +243,12 @@ impl SageTree {
             if node.needs_consolidation() {
                 node.consolidate();
             }
+        }
+
+        // Add key to bloom filter for fast negative lookups
+        {
+            let mut bloom = self.bloom_filter.write().unwrap();
+            bloom.insert(&key);
         }
 
         // Update stats

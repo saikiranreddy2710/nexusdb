@@ -10,17 +10,32 @@ use nexus_sql::logical::Schema;
 #[derive(Debug)]
 pub enum StatementResult {
     /// DDL statement (CREATE, DROP, ALTER).
-    Ddl { command: String },
+    Ddl {
+        /// The DDL command that was executed.
+        command: String,
+    },
     /// SELECT query result.
     Query(ExecuteResult),
     /// INSERT result.
-    Insert { rows_affected: u64 },
+    Insert {
+        /// Number of rows inserted.
+        rows_affected: u64,
+    },
     /// UPDATE result.
-    Update { rows_affected: u64 },
+    Update {
+        /// Number of rows updated.
+        rows_affected: u64,
+    },
     /// DELETE result.
-    Delete { rows_affected: u64 },
+    Delete {
+        /// Number of rows deleted.
+        rows_affected: u64,
+    },
     /// Transaction control (BEGIN, COMMIT, ROLLBACK).
-    Transaction { command: String },
+    Transaction {
+        /// The transaction command that was executed.
+        command: String,
+    },
     /// Empty result (e.g., for comments).
     Empty,
 }
@@ -67,7 +82,7 @@ impl StatementResult {
     /// Display as a string.
     pub fn display(&self) -> String {
         match self {
-            StatementResult::Ddl { command } => format!("{}", command),
+            StatementResult::Ddl { command } => command.to_string(),
             StatementResult::Query(result) => result.display(),
             StatementResult::Insert { rows_affected } => {
                 format!("INSERT {}", rows_affected)
@@ -78,7 +93,7 @@ impl StatementResult {
             StatementResult::Delete { rows_affected } => {
                 format!("DELETE {}", rows_affected)
             }
-            StatementResult::Transaction { command } => format!("{}", command),
+            StatementResult::Transaction { command } => command.to_string(),
             StatementResult::Empty => String::new(),
         }
     }

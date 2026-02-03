@@ -22,6 +22,7 @@ nexus-raft = { workspace = true }
 nexus-query = { workspace = true }
 nexus-sql = { workspace = true }
 nexus-proto = { workspace = true }
+nexus-cache = { path = "../nexus-cache" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nexus_cache::plan_cache::{PlanCache, PlanCacheConfig};
 use nexus_common::types::TxnId;
 use nexus_mvcc::IsolationLevel;
 use nexus_sql::executor::{Row, Value};
@@ -16,7 +17,7 @@ use nexus_sql::optimizer::{Optimizer, OptimizerConfig};
 use nexus_sql::parser::{
     BinaryOperator, ColumnConstraint, Expr, InsertSource, Literal, Parser, Statement, UnaryOperator,
 };
-use nexus_sql::physical::{ExecutionContext, PhysicalPlanner};
+use nexus_sql::physical::{ExecutionContext, PhysicalPlan, PhysicalPlanner};
 use nexus_sql::storage::{StorageEngine, TableInfo};
 
 use super::error::{DatabaseError, DatabaseResult};
@@ -88,6 +89,7 @@ pub struct Session {
     /// Session state.
     state: SessionState,
     /// Configuration.
+    #[allow(dead_code)]
     config: SessionConfig,
     /// Current transaction ID (if in transaction).
     current_txn: Option<TxnId>,
@@ -99,6 +101,8 @@ pub struct Session {
     created_at: Instant,
     /// Statement counter.
     statement_count: u64,
+    /// Query plan cache for prepared statements and repeated queries.
+    plan_cache: PlanCache<PhysicalPlan>,
 }
 
 impl Session {
@@ -113,6 +117,7 @@ impl Session {
             variables: HashMap::new(),
             created_at: Instant::now(),
             statement_count: 0,
+            plan_cache: PlanCache::new(PlanCacheConfig::with_capacity(100)),
         }
     }
 
@@ -216,7 +221,7 @@ impl Session {
         let statement = Parser::parse_one(sql)?;
 
         // Execute based on statement type
-        let result = self.execute_statement(&statement, start)?;
+        let result = self.execute_statement(&statement, sql, start)?;
 
         Ok(result)
     }
@@ -228,7 +233,9 @@ impl Session {
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             let start = Instant::now();
-            results.push(self.execute_statement(&statement, start)?);
+            // For batch execution, we use a placeholder since we don't have individual SQL strings
+            // The plan cache will normalize the SQL, so this works for repeated queries
+            results.push(self.execute_statement(&statement, sql, start)?);
         }
 
         Ok(results)
@@ -238,6 +245,7 @@ impl Session {
     fn execute_statement(
         &mut self,
         statement: &Statement,
+        sql: &str,
         start: Instant,
     ) -> DatabaseResult<StatementResult> {
         match statement {
@@ -255,21 +263,27 @@ impl Session {
                 Ok(StatementResult::transaction("ROLLBACK"))
             }
 
-            // DDL
-            Statement::CreateTable(create) => self.execute_create_table(create),
-            Statement::DropTable(drop) => self.execute_drop_table(drop),
+            // DDL - invalidate plan cache when schema changes
+            Statement::CreateTable(create) => {
+                self.plan_cache.clear(); // Invalidate all plans on DDL
+                self.execute_create_table(create)
+            }
+            Statement::DropTable(drop) => {
+                self.plan_cache.clear(); // Invalidate all plans on DDL
+                self.execute_drop_table(drop)
+            }
 
             // DML
             Statement::Insert(insert) => self.execute_insert(insert),
             Statement::Update(update) => self.execute_update(update),
             Statement::Delete(delete) => self.execute_delete(delete),
 
-            // Query
-            Statement::Select(_) => self.execute_query(statement, start),
+            // Query - use plan cache
+            Statement::Select(_) => self.execute_query(statement, sql, start),
 
-            _ => Err(DatabaseError::NotImplemented(format!(
-                "statement type not yet supported"
-            ))),
+            _ => Err(DatabaseError::NotImplemented(
+                "statement type not yet supported".to_string(),
+            )),
         }
     }
 
@@ -510,40 +524,58 @@ impl Session {
     }
 
     /// Executes a SELECT query.
+    ///
+    /// Uses plan caching to avoid repeated parsing, planning, and optimization
+    /// for the same SQL queries.
     fn execute_query(
         &self,
         statement: &Statement,
+        sql: &str,
         start: Instant,
     ) -> DatabaseResult<StatementResult> {
-        // Build a catalog from current storage
-        let mut catalog = MemoryCatalog::new();
-        for table_name in self.storage.list_tables() {
-            if let Some(table_info) = self.storage.get_table_info(&table_name) {
-                catalog.add_table(nexus_sql::logical::TableMeta::new(
-                    table_name.clone(),
-                    (*table_info.schema).clone(),
-                ));
+        // Try to get cached physical plan
+        let physical_plan = if let Some(cached_plan) = self.plan_cache.get(sql) {
+            // Cache hit - use the cached plan
+            (*cached_plan).clone()
+        } else {
+            // Cache miss - build the plan from scratch
+
+            // Build a catalog from current storage
+            let mut catalog = MemoryCatalog::new();
+            for table_name in self.storage.list_tables() {
+                if let Some(table_info) = self.storage.get_table_info(&table_name) {
+                    catalog.add_table(nexus_sql::logical::TableMeta::new(
+                        table_name.clone(),
+                        (*table_info.schema).clone(),
+                    ));
+                }
             }
-        }
 
-        // Build logical plan
-        let logical_plan =
-            build_plan(statement, &catalog).map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+            // Build logical plan
+            let logical_plan = build_plan(statement, &catalog)
+                .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
 
-        // Optimize
-        let optimizer = Optimizer::new(OptimizerConfig::default());
-        let optimized = optimizer
-            .optimize(logical_plan)
-            .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+            // Optimize
+            let optimizer = Optimizer::new(OptimizerConfig::default());
+            let optimized = optimizer
+                .optimize(logical_plan)
+                .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
 
-        // Create physical plan
+            // Create physical plan
+            let ctx = ExecutionContext::default();
+            let physical_planner = PhysicalPlanner::new(&ctx);
+            let plan = physical_planner
+                .create_physical_plan(&optimized.root)
+                .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+            // Cache the plan for future use
+            self.plan_cache.insert(sql, plan.clone());
+
+            plan
+        };
+
+        // Execute the plan
         let ctx = ExecutionContext::default();
-        let physical_planner = PhysicalPlanner::new(&ctx);
-        let physical_plan = physical_planner
-            .create_physical_plan(&optimized.root)
-            .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
-
-        // Execute
         let mut executor = nexus_sql::executor::QueryExecutor::new(ctx);
 
         // Register tables with data

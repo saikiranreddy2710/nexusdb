@@ -13,6 +13,7 @@ io-uring = ["dep:io-uring"]
 
 [dependencies]
 nexus-common = { workspace = true }
+nexus-cache = { path = "../nexus-cache" }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam = { workspace = true }
