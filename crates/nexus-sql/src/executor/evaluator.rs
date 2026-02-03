@@ -4,7 +4,6 @@
 
 use super::{Column, RecordBatch, Row, Value};
 use crate::logical::{AggregateFunc, BinaryOp, Schema, UnaryOp};
-use crate::parser::DataType;
 use crate::physical::{PhysicalAggregateExpr, PhysicalExpr};
 
 /// Evaluates a physical expression on a single row.
@@ -763,7 +762,7 @@ impl std::error::Error for EvalError {}
 mod tests {
     use super::*;
     use crate::logical::Field;
-    use crate::parser::Literal;
+    use crate::parser::{DataType, Literal};
 
     fn test_schema() -> Schema {
         Schema::new(vec![

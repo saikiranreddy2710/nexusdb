@@ -10,21 +10,20 @@ use std::sync::Arc;
 
 use crate::logical::{
     AggregateOperator, CteOperator, DistinctOperator, EmptyRelationOperator, FilterOperator,
-    JoinOperator, JoinType, LimitOperator, LogicalExpr, LogicalOperator, ProjectionOperator,
-    ScanOperator, Schema, SetOperationOperator, SortOperator, SubqueryAliasOperator,
-    ValuesOperator, WindowOperator,
+    JoinOperator, JoinType, LimitOperator, LogicalOperator, ProjectionOperator, ScanOperator,
+    SetOperationOperator, SortOperator, SubqueryAliasOperator, ValuesOperator, WindowOperator,
 };
 
-use super::context::{ExecutionConfig, ExecutionContext};
+use super::context::ExecutionContext;
 use super::expr::{
     create_physical_aggregate, create_physical_expr, PhysicalExpr, PhysicalSortExpr,
 };
 use super::operator::{
-    AggregationMode, DistinctPhysicalOperator, Distribution, EmptyOperator, ExchangeOperator,
-    FilterPhysicalOperator, HashAggregateOperator, HashJoinOperator, JoinKey,
-    LimitPhysicalOperator, MergeJoinOperator, NestedLoopJoinOperator, PhysicalOperator,
-    ProjectionPhysicalOperator, SchemaRef, SeqScanOperator, SetOperationPhysicalOperator,
-    SortAggregateOperator, SortPhysicalOperator, TopNOperator, ValuesPhysicalOperator,
+    AggregationMode, DistinctPhysicalOperator, EmptyOperator, FilterPhysicalOperator,
+    HashAggregateOperator, HashJoinOperator, JoinKey, LimitPhysicalOperator, MergeJoinOperator,
+    NestedLoopJoinOperator, PhysicalOperator, ProjectionPhysicalOperator, SeqScanOperator,
+    SetOperationPhysicalOperator, SortAggregateOperator, SortPhysicalOperator, TopNOperator,
+    ValuesPhysicalOperator,
 };
 use super::plan::PhysicalPlan;
 
@@ -522,7 +521,7 @@ impl From<String> for PlanningError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical::Field;
+    use crate::logical::{Field, LogicalExpr, Schema};
     use crate::parser::DataType;
 
     fn users_schema() -> Schema {

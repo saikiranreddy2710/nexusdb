@@ -8,7 +8,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
 use nexus_common::types::{Lsn, TxnId};
@@ -16,7 +15,7 @@ use nexus_common::types::{Lsn, TxnId};
 use crate::config::WalConfig;
 use crate::error::{WalError, WalResult};
 use crate::record::header::RecordHeader;
-use crate::record::types::{RecordFlags, RecordType, WalPayload, WalRecord};
+use crate::record::types::WalRecord;
 use crate::segment::WalSegment;
 
 /// WAL writer statistics.
@@ -304,6 +303,7 @@ impl std::fmt::Debug for WalWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use nexus_common::types::PageId;
     use tempfile::TempDir;
 

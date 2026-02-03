@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use nexus_sql::storage::StorageEngine;
 
-use super::error::{DatabaseError, DatabaseResult};
+use super::error::DatabaseResult;
 use super::result::StatementResult;
-use super::session::{Session, SessionConfig, SessionId, SessionState};
+use super::session::{Session, SessionConfig, SessionId};
 
 /// Database configuration.
 #[derive(Debug, Clone)]
@@ -352,6 +352,7 @@ impl<'a> Drop for DatabaseSession<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::error::DatabaseError;
     use nexus_sql::executor::Value;
 
     #[test]

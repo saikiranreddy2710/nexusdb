@@ -7,7 +7,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::Bytes;
 use parking_lot::Mutex;
 
 use nexus_common::types::Lsn;
@@ -16,7 +15,7 @@ use crate::config::WalConfig;
 use crate::error::{WalError, WalResult};
 use crate::record::header::RecordHeader;
 use crate::record::payload::{Payload, SegmentHeaderPayload};
-use crate::record::types::{RecordFlags, RecordType, WalPayload, WalRecord};
+use crate::record::types::{RecordFlags, RecordType, WalRecord};
 
 /// Segment state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +66,7 @@ impl WalSegment {
         }
 
         // Create and optionally preallocate the file
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)

@@ -2,7 +2,7 @@
 //!
 //! This module defines the record types and the main WalRecord enum.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use nexus_common::types::{Lsn, TxnId};
 
 use super::header::RecordHeader;

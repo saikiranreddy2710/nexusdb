@@ -4,9 +4,7 @@
 //! snapshot of the database state. After a checkpoint, recovery only needs
 //! to replay WAL records after the checkpoint.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;

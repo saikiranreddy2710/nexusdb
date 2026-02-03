@@ -6,7 +6,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -119,7 +118,7 @@ impl GroupCommitManager {
     /// Performs a sync, completing all pending requests.
     pub fn do_sync(&self) -> WalResult<()> {
         // Get all pending requests
-        let mut pending = self.pending.lock();
+        let pending = self.pending.lock();
         if pending.is_empty() {
             return Ok(());
         }
@@ -202,6 +201,7 @@ impl std::fmt::Debug for GroupCommitManager {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn test_config(dir: &Path) -> Arc<WalConfig> {

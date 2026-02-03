@@ -4,11 +4,10 @@
 //! all WAL operations including writing, reading, and recovery.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use nexus_common::types::{Lsn, TxnId};
 
@@ -459,6 +458,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use nexus_common::types::PageId;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn test_config(dir: &Path) -> WalConfig {

@@ -6,17 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{
-    evaluate_expr, Accumulator, Column, EvalError, RecordBatch, RecordBatchBuilder, Row, Value,
-};
+use super::{evaluate_expr, Accumulator, Column, EvalError, RecordBatch, Row, Value};
 use crate::logical::{Field, JoinType, Schema};
 use crate::parser::DataType;
-use crate::physical::{
-    AggregationMode, DistinctPhysicalOperator, FilterPhysicalOperator, HashAggregateOperator,
-    HashJoinOperator, LimitPhysicalOperator, PhysicalAggregateExpr, PhysicalExpr, PhysicalOperator,
-    PhysicalSortExpr, ProjectionPhysicalOperator, SeqScanOperator, SortPhysicalOperator,
-    TopNOperator, ValuesPhysicalOperator,
-};
+use crate::physical::{PhysicalAggregateExpr, PhysicalExpr, PhysicalSortExpr, SeqScanOperator};
 
 /// Trait for executable operators.
 pub trait Operator: std::fmt::Debug {
