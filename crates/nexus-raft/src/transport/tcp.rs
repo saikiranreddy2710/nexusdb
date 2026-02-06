@@ -133,7 +133,10 @@ impl TcpTransport {
         for peer in peers {
             let transport_clone = Arc::clone(&transport);
             tokio::spawn(async move {
-                if let Err(e) = transport_clone.connect_to_peer(peer.node_id, peer.addr).await {
+                if let Err(e) = transport_clone
+                    .connect_to_peer(peer.node_id, peer.addr)
+                    .await
+                {
                     warn!("Failed to connect to peer {}: {}", peer.node_id, e);
                 }
             });
@@ -179,12 +182,13 @@ impl TcpTransport {
 
         debug!("Connecting to peer {} at {}", peer_id, addr);
 
-        let stream = TcpStream::connect(addr).await.map_err(|e| {
-            TransportError::ConnectionFailed {
-                node_id: peer_id,
-                reason: e.to_string(),
-            }
-        })?;
+        let stream =
+            TcpStream::connect(addr)
+                .await
+                .map_err(|e| TransportError::ConnectionFailed {
+                    node_id: peer_id,
+                    reason: e.to_string(),
+                })?;
 
         let (mut read_half, mut write_half) = stream.into_split();
         let (outbox_tx, mut outbox_rx) = mpsc::channel::<RaftMessage>(100);

@@ -220,7 +220,7 @@ impl NumaAllocator {
         &self,
         size: usize,
         alignment: usize,
-        _node: NumaNode,
+        node: NumaNode,
     ) -> AlignedBuffer {
         #[cfg(target_os = "linux")]
         {
@@ -254,7 +254,7 @@ impl NumaAllocator {
         // For now, we use mmap with hints
         // This is a simplified implementation - a real one would use libnuma
 
-        let layout = Layout::from_size_align(size, alignment).ok()?;
+        let _layout = Layout::from_size_align(size, alignment).ok()?;
 
         // Use mmap for large allocations
         if size >= 2 * 1024 * 1024 {
@@ -307,7 +307,7 @@ impl NumaAllocator {
     /// # Returns
     ///
     /// `true` if binding succeeded, `false` otherwise.
-    pub fn bind_to_node(&self, _buffer: &AlignedBuffer, _node: NumaNode) -> bool {
+    pub fn bind_to_node(&self, _buffer: &AlignedBuffer, node: NumaNode) -> bool {
         #[cfg(target_os = "linux")]
         {
             if self.numa_available && !node.is_any() && !node.is_local() {

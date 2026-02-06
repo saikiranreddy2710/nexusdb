@@ -612,9 +612,10 @@ impl Session {
         sorted_names.sort();
 
         // Build schema for result
-        let schema = Arc::new(Schema::new(vec![
-            Field::not_null("table_name", DataType::Text),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::not_null(
+            "table_name",
+            DataType::Text,
+        )]));
 
         // Build rows
         let rows: Vec<Row> = sorted_names
@@ -642,9 +643,10 @@ impl Session {
         use nexus_sql::parser::DataType;
 
         // Currently we only have a single default database
-        let schema = Arc::new(Schema::new(vec![
-            Field::not_null("database_name", DataType::Text),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::not_null(
+            "database_name",
+            DataType::Text,
+        )]));
 
         let rows = vec![Row::new(vec![Value::String("nexusdb".to_string())])];
 
@@ -1100,10 +1102,7 @@ mod tests {
         if let StatementResult::Query(query_result) = result {
             assert_eq!(query_result.total_rows, 1);
             let rows = query_result.rows();
-            assert_eq!(
-                rows[0].get(0),
-                Some(&Value::String("nexusdb".to_string()))
-            );
+            assert_eq!(rows[0].get(0), Some(&Value::String("nexusdb".to_string())));
         } else {
             panic!("expected Query result");
         }

@@ -89,4 +89,6 @@ pub use client::{Client, ClientConfig, ClientStats, FromValue, QueryResult, Valu
 pub use error::{ClientError, ClientResult, ConnectionState};
 pub use pool::{ConnectionPool, PoolConfig, PoolStats, PooledClient};
 pub use query::{PreparedStatement, QueryBuilder};
-pub use transaction::{AccessMode, IsolationLevel, Savepoint, Transaction, TransactionExt, TransactionOptions};
+pub use transaction::{
+    AccessMode, IsolationLevel, Savepoint, Transaction, TransactionExt, TransactionOptions,
+};

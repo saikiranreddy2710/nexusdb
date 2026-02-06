@@ -61,7 +61,7 @@ impl Command {
     /// Parses a command string.
     pub fn parse(input: &str) -> Self {
         let input = input.trim();
-        
+
         // Remove leading backslash
         let cmd = if input.starts_with('\\') {
             &input[1..]
@@ -97,9 +97,9 @@ impl Command {
     pub async fn execute(&self, repl: &mut Repl) -> Result<CommandResult> {
         match self {
             Command::Quit => Ok(CommandResult::Exit),
-            
+
             Command::Help => Ok(CommandResult::Output(Self::help_text())),
-            
+
             Command::Describe(name) => {
                 if let Some(name) = name {
                     self.describe_object(repl, name).await
@@ -107,15 +107,15 @@ impl Command {
                     self.list_all_objects(repl).await
                 }
             }
-            
+
             Command::ListTables => self.list_tables(repl).await,
-            
+
             Command::ListDatabases => self.list_databases(repl).await,
-            
+
             Command::ConnectionInfo => self.connection_info(repl).await,
-            
+
             Command::Timing => Ok(CommandResult::ToggleTiming(true)), // Toggle handled in repl
-            
+
             Command::Format(format) => {
                 let fmt = match format.to_lowercase().as_str() {
                     "table" => OutputFormat::Table,
@@ -131,19 +131,19 @@ impl Command {
                 };
                 Ok(CommandResult::SetFormat(fmt))
             }
-            
+
             Command::Version => Ok(CommandResult::Output(format!(
                 "NexusDB CLI v{}\nNexusDB Client v{}",
                 env!("CARGO_PKG_VERSION"),
                 env!("CARGO_PKG_VERSION")
             ))),
-            
+
             Command::Clear => {
                 // Clear screen using ANSI escape codes
                 print!("\x1B[2J\x1B[1;1H");
                 Ok(CommandResult::Continue)
             }
-            
+
             Command::Include(path) => {
                 if path.is_empty() {
                     Ok(CommandResult::Output("Usage: \\i <filename>".to_string()))
@@ -151,24 +151,24 @@ impl Command {
                     self.include_file(repl, path).await
                 }
             }
-            
+
             Command::Begin => {
                 repl.execute_and_print("BEGIN").await?;
                 Ok(CommandResult::Continue)
             }
-            
+
             Command::Commit => {
                 repl.execute_and_print("COMMIT").await?;
                 Ok(CommandResult::Continue)
             }
-            
+
             Command::Rollback => {
                 repl.execute_and_print("ROLLBACK").await?;
                 Ok(CommandResult::Continue)
             }
-            
+
             Command::Status => self.server_status(repl).await,
-            
+
             Command::Unknown(cmd) => Ok(CommandResult::Output(format!(
                 "Unknown command '\\{}'. Type \\? for help.",
                 cmd
@@ -253,7 +253,7 @@ Type SQL statements followed by a semicolon to execute them.
 
     async fn include_file(&self, repl: &mut Repl, path: &str) -> Result<CommandResult> {
         let content = std::fs::read_to_string(path)?;
-        
+
         // Split into statements and execute
         for line in content.lines() {
             let line = line.trim();
@@ -261,7 +261,7 @@ Type SQL statements followed by a semicolon to execute them.
                 repl.execute_and_print(line).await?;
             }
         }
-        
+
         Ok(CommandResult::Continue)
     }
 
@@ -284,10 +284,15 @@ Type SQL statements followed by a semicolon to execute them.
                     );
                     Ok(CommandResult::Output(output))
                 }
-                Err(e) => Ok(CommandResult::Output(format!("Failed to get status: {}", e))),
+                Err(e) => Ok(CommandResult::Output(format!(
+                    "Failed to get status: {}",
+                    e
+                ))),
             }
         } else {
-            Ok(CommandResult::Output("Not connected to server.".to_string()))
+            Ok(CommandResult::Output(
+                "Not connected to server.".to_string(),
+            ))
         }
     }
 }

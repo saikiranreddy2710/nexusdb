@@ -22,7 +22,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use io_uring::{IoUring, opcode, types};
+use io_uring::{opcode, types, IoUring};
 use parking_lot::Mutex;
 
 use super::error::{IoError, IoResult};
@@ -49,15 +49,15 @@ impl UringFile {
     /// Opens a file with io_uring.
     pub async fn open(path: impl AsRef<Path>, options: OpenOptions) -> IoResult<Self> {
         let path = path.as_ref().to_path_buf();
-        
+
         // Open the file using standard open for now
         // A production implementation would use io_uring's OPENAT
         let std_file = super::std_io::StandardFile::open(&path, options.clone()).await?;
-        
+
         // Get the file descriptor
         // Note: This is a simplified implementation
         // A real implementation would properly manage the fd lifetime
-        
+
         todo!("Full io_uring implementation requires careful fd management")
     }
 

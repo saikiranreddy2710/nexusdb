@@ -40,11 +40,11 @@ impl StandardFile {
         let direct_io = options.direct_io;
         let writable = options.write;
 
-        let file = task::spawn_blocking(move || {
-            Self::open_sync(&path_clone, &options)
-        })
-        .await
-        .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })??;
+        let file = task::spawn_blocking(move || Self::open_sync(&path_clone, &options))
+            .await
+            .map_err(|e| IoError::Io {
+                source: std::io::Error::new(std::io::ErrorKind::Other, e),
+            })??;
 
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
@@ -56,7 +56,7 @@ impl StandardFile {
 
     /// Synchronously opens a file with the specified options.
     fn open_sync(path: &Path, options: &OpenOptions) -> IoResult<StdFile> {
-        let std_opts = options.to_std_options();
+        let mut std_opts = options.to_std_options();
 
         // Apply platform-specific direct I/O flags
         #[cfg(target_os = "linux")]
@@ -96,9 +96,7 @@ impl StandardFile {
     #[cfg(target_os = "linux")]
     fn preallocate_sync(file: &StdFile, offset: u64, len: u64) -> IoResult<()> {
         use std::os::unix::io::AsRawFd;
-        let ret = unsafe {
-            libc::posix_fallocate(file.as_raw_fd(), offset as i64, len as i64)
-        };
+        let ret = unsafe { libc::posix_fallocate(file.as_raw_fd(), offset as i64, len as i64) };
         if ret != 0 {
             return Err(IoError::Io {
                 source: std::io::Error::from_raw_os_error(ret),
@@ -110,7 +108,7 @@ impl StandardFile {
     #[cfg(target_os = "macos")]
     fn preallocate_sync(file: &StdFile, _offset: u64, len: u64) -> IoResult<()> {
         use std::os::unix::io::AsRawFd;
-        
+
         // macOS uses F_PREALLOCATE
         #[repr(C)]
         struct FStore {
@@ -120,12 +118,12 @@ impl StandardFile {
             fst_length: i64,
             fst_bytesalloc: i64,
         }
-        
+
         const F_ALLOCATECONTIG: u32 = 0x02;
         const F_ALLOCATEALL: u32 = 0x04;
         const F_PEOFPOSMODE: i32 = 3;
         const F_PREALLOCATE: i32 = 42;
-        
+
         let mut fstore = FStore {
             fst_flags: F_ALLOCATECONTIG | F_ALLOCATEALL,
             fst_posmode: F_PEOFPOSMODE,
@@ -133,24 +131,20 @@ impl StandardFile {
             fst_length: len as i64,
             fst_bytesalloc: 0,
         };
-        
-        let ret = unsafe {
-            libc::fcntl(file.as_raw_fd(), F_PREALLOCATE, &mut fstore)
-        };
-        
+
+        let ret = unsafe { libc::fcntl(file.as_raw_fd(), F_PREALLOCATE, &mut fstore) };
+
         if ret == -1 {
             // Try without contiguous allocation
             fstore.fst_flags = F_ALLOCATEALL;
-            let ret = unsafe {
-                libc::fcntl(file.as_raw_fd(), F_PREALLOCATE, &mut fstore)
-            };
+            let ret = unsafe { libc::fcntl(file.as_raw_fd(), F_PREALLOCATE, &mut fstore) };
             if ret == -1 {
                 return Err(IoError::Io {
                     source: std::io::Error::last_os_error(),
                 });
             }
         }
-        
+
         Ok(())
     }
 
@@ -181,27 +175,32 @@ impl FileHandle for StandardFile {
                 .map_err(|e| IoError::Io { source: e })
         })
         .await
-        .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })?
+        .map_err(|e| IoError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        })?
     }
 
     async fn read_at(&self, buf: &mut [u8], offset: u64) -> IoResult<usize> {
         let file = Arc::clone(&self.file);
         let len = buf.len();
-        
+
         // Create a buffer we can send to the blocking task
         let mut owned_buf = vec![0u8; len];
-        
+
         let (result, read_buf) = task::spawn_blocking(move || {
             let mut file = file.lock();
             file.seek(SeekFrom::Start(offset))
                 .map_err(|e| IoError::Io { source: e })?;
-            let n = file.read(&mut owned_buf)
+            let n = file
+                .read(&mut owned_buf)
                 .map_err(|e| IoError::Io { source: e })?;
             Ok::<_, IoError>((n, owned_buf))
         })
         .await
-        .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })??;
-        
+        .map_err(|e| IoError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        })??;
+
         buf[..result].copy_from_slice(&read_buf[..result]);
         Ok(result)
     }
@@ -216,7 +215,7 @@ impl FileHandle for StandardFile {
 
         let file = Arc::clone(&self.file);
         let owned_buf = buf.to_vec();
-        
+
         task::spawn_blocking(move || {
             let mut file = file.lock();
             file.seek(SeekFrom::Start(offset))
@@ -225,29 +224,33 @@ impl FileHandle for StandardFile {
                 .map_err(|e| IoError::Io { source: e })
         })
         .await
-        .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })?
+        .map_err(|e| IoError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        })?
     }
 
     async fn sync(&self) -> IoResult<()> {
         let file = Arc::clone(&self.file);
         task::spawn_blocking(move || {
             let file = file.lock();
-            file.sync_all()
-                .map_err(|e| IoError::Io { source: e })
+            file.sync_all().map_err(|e| IoError::Io { source: e })
         })
         .await
-        .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })?
+        .map_err(|e| IoError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        })?
     }
 
     async fn datasync(&self) -> IoResult<()> {
         let file = Arc::clone(&self.file);
         task::spawn_blocking(move || {
             let file = file.lock();
-            file.sync_data()
-                .map_err(|e| IoError::Io { source: e })
+            file.sync_data().map_err(|e| IoError::Io { source: e })
         })
         .await
-        .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })?
+        .map_err(|e| IoError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        })?
     }
 
     async fn set_len(&self, size: u64) -> IoResult<()> {
@@ -261,11 +264,12 @@ impl FileHandle for StandardFile {
         let file = Arc::clone(&self.file);
         task::spawn_blocking(move || {
             let file = file.lock();
-            file.set_len(size)
-                .map_err(|e| IoError::Io { source: e })
+            file.set_len(size).map_err(|e| IoError::Io { source: e })
         })
         .await
-        .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })?
+        .map_err(|e| IoError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        })?
     }
 
     async fn allocate(&self, offset: u64, len: u64) -> IoResult<()> {
@@ -282,14 +286,16 @@ impl FileHandle for StandardFile {
             Self::preallocate_sync(&file, offset, len)
         })
         .await
-        .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })?
+        .map_err(|e| IoError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        })?
     }
 
     async fn advise(&self, offset: u64, len: u64, advice: FileAdvice) -> IoResult<()> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
-            
+
             let posix_advice = match advice {
                 FileAdvice::Normal => libc::POSIX_FADV_NORMAL,
                 FileAdvice::Sequential => libc::POSIX_FADV_SEQUENTIAL,
@@ -314,7 +320,9 @@ impl FileHandle for StandardFile {
                 }
             })
             .await
-            .map_err(|e| IoError::Io { source: std::io::Error::new(std::io::ErrorKind::Other, e) })?
+            .map_err(|e| IoError::Io {
+                source: std::io::Error::new(std::io::ErrorKind::Other, e),
+            })?
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -367,7 +375,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("rw.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
 
         // Write data
         let data = b"Hello, World!";
@@ -389,7 +399,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("offset.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
 
         // Write at offset 100
         let data = b"Test data";
@@ -411,7 +423,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("exact.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
 
         let data = b"0123456789";
         file.write_at(data, 0).await.unwrap();
@@ -428,7 +442,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("short.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
 
         let data = b"Short";
         file.write_at(data, 0).await.unwrap();
@@ -445,7 +461,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("len.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
 
         // Extend file
         file.set_len(1024).await.unwrap();
@@ -461,7 +479,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sync.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
 
         file.write_at(b"data", 0).await.unwrap();
         file.sync().await.unwrap();
@@ -473,7 +493,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("advise.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
         file.set_len(4096).await.unwrap();
 
         // These should not error even if fadvise is not available
@@ -488,12 +510,16 @@ mod tests {
 
         // Create the file first
         {
-            let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+            let file = StandardFile::open(&path, OpenOptions::for_create())
+                .await
+                .unwrap();
             file.write_at(b"data", 0).await.unwrap();
         }
 
         // Open read-only
-        let file = StandardFile::open(&path, OpenOptions::for_read()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_read())
+            .await
+            .unwrap();
         let result = file.write_at(b"new data", 0).await;
         assert!(result.is_err());
     }
@@ -503,7 +529,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("alloc.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
 
         // Allocate space
         file.allocate(0, 1024 * 1024).await.unwrap();
@@ -516,8 +544,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("concurrent.db");
 
-        let file = StandardFile::open(&path, OpenOptions::for_create()).await.unwrap();
-        
+        let file = StandardFile::open(&path, OpenOptions::for_create())
+            .await
+            .unwrap();
+
         // Write some data
         for i in 0..10u8 {
             file.write_at(&[i; 100], i as u64 * 100).await.unwrap();

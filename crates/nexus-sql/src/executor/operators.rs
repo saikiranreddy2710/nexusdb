@@ -1225,7 +1225,7 @@ impl WindowExec {
     /// Computes window functions over accumulated rows.
     fn compute_windows(&mut self, rows: Vec<Row>) -> Result<Vec<Row>, ExecutionError> {
         use crate::physical::WindowFunc;
-        
+
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1327,8 +1327,7 @@ impl WindowExec {
                     WindowFunc::FirstValue => {
                         // FIRST_VALUE(expr)
                         if let Some(arg_expr) = window_expr.args.first() {
-                            evaluate_expr(arg_expr, &rows[0], &input_schema)
-                                .unwrap_or(Value::Null)
+                            evaluate_expr(arg_expr, &rows[0], &input_schema).unwrap_or(Value::Null)
                         } else {
                             Value::Null
                         }
@@ -1399,7 +1398,7 @@ impl Operator for WindowExec {
             while let Some(batch) = self.child.next_batch()? {
                 all_rows.extend(batch.rows());
             }
-            
+
             // Compute window functions
             self.results = self.compute_windows(all_rows)?;
             self.computed = true;

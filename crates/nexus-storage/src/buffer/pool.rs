@@ -58,9 +58,9 @@ pub struct BufferPool {
 impl BufferPool {
     /// Creates a new buffer pool with the given configuration.
     pub fn new(config: BufferPoolConfig) -> BufferResult<Self> {
-        config
-            .validate()
-            .map_err(|e| BufferError::Config { message: e.to_string() })?;
+        config.validate().map_err(|e| BufferError::Config {
+            message: e.to_string(),
+        })?;
 
         let num_frames = config.num_frames;
         let page_size = config.page_size;
@@ -70,8 +70,9 @@ impl BufferPool {
             .map(|i| Arc::new(BufferFrame::new(FrameId::new(i), page_size)))
             .collect();
 
-        let file_manager = FileManager::new()
-            .map_err(|e| BufferError::Config { message: e.to_string() })?;
+        let file_manager = FileManager::new().map_err(|e| BufferError::Config {
+            message: e.to_string(),
+        })?;
 
         Ok(Self {
             config,
@@ -95,10 +96,10 @@ impl BufferPool {
         let path = path.as_ref();
         let options = OpenOptions::for_database();
         let file = self.file_manager.open(path, options).await?;
-        
+
         *self.data_file.write() = Some(file);
         *self.data_file_path.write() = Some(path.to_path_buf());
-        
+
         Ok(())
     }
 
@@ -176,7 +177,7 @@ impl BufferPool {
 
         // Get a free or evicted frame
         let frame = self.get_or_evict_frame().await?;
-        
+
         // Initialize the frame for the new page
         frame.set_page_id(page_id);
         frame.set_dirty(true);
@@ -222,7 +223,8 @@ impl BufferPool {
             }
         }
 
-        self.flush_count.fetch_add(flushed as u64, Ordering::Relaxed);
+        self.flush_count
+            .fetch_add(flushed as u64, Ordering::Relaxed);
         Ok(flushed)
     }
 
@@ -358,11 +360,7 @@ impl BufferPool {
         // In a real system, this would use a free page list
         let page_id = {
             let page_table = self.page_table.read();
-            let max_id = page_table
-                .keys()
-                .map(|p| p.as_u64())
-                .max()
-                .unwrap_or(0);
+            let max_id = page_table.keys().map(|p| p.as_u64()).max().unwrap_or(0);
             PageId::new(max_id + 1)
         };
 
@@ -428,8 +426,8 @@ impl BufferPool {
     /// Reads a page from disk into a frame.
     async fn read_page_from_disk(&self, page_id: PageId, frame: &BufferFrame) -> BufferResult<()> {
         let file = self.data_file.read();
-        let file = file.as_ref().ok_or_else(|| {
-            BufferError::Config { message: "data file not opened".to_string() }
+        let file = file.as_ref().ok_or_else(|| BufferError::Config {
+            message: "data file not opened".to_string(),
         })?;
 
         let offset = page_id.as_u64() * self.config.page_size as u64;
@@ -443,8 +441,8 @@ impl BufferPool {
     /// Writes a page from a frame to disk.
     async fn write_page_to_disk(&self, frame: &BufferFrame) -> BufferResult<()> {
         let file = self.data_file.read();
-        let file = file.as_ref().ok_or_else(|| {
-            BufferError::Config { message: "data file not opened".to_string() }
+        let file = file.as_ref().ok_or_else(|| BufferError::Config {
+            message: "data file not opened".to_string(),
         })?;
 
         let page_id = frame.page_id();
@@ -490,16 +488,16 @@ mod tests {
     async fn test_allocate_page() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let pool = create_test_pool(10);
         pool.open(&path).await.unwrap();
 
         let guard = pool.allocate_page(PageId::new(1)).await.unwrap();
         assert_eq!(guard.page_id(), PageId::new(1));
         assert!(pool.contains(PageId::new(1)));
-        
+
         drop(guard);
-        
+
         // Should still be in pool (but unpinned)
         assert!(pool.contains(PageId::new(1)));
     }
@@ -508,12 +506,12 @@ mod tests {
     async fn test_allocate_duplicate_page() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let pool = create_test_pool(10);
         pool.open(&path).await.unwrap();
 
         let _guard = pool.allocate_page(PageId::new(1)).await.unwrap();
-        
+
         // Try to allocate same page - should fail
         let result = pool.allocate_page(PageId::new(1)).await;
         assert!(result.is_err());
@@ -523,7 +521,7 @@ mod tests {
     async fn test_flush_page() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let pool = create_test_pool(10);
         pool.open(&path).await.unwrap();
 
@@ -545,7 +543,7 @@ mod tests {
     async fn test_fetch_page() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let pool = create_test_pool(10);
         pool.open(&path).await.unwrap();
 
@@ -559,7 +557,7 @@ mod tests {
         // Flush and evict
         pool.flush_page(PageId::new(0)).await.unwrap();
         pool.evict_page(PageId::new(0)).await.unwrap();
-        
+
         assert!(!pool.contains(PageId::new(0)));
 
         // Fetch the page back
@@ -572,7 +570,7 @@ mod tests {
     async fn test_cache_hit() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let pool = create_test_pool(10);
         pool.open(&path).await.unwrap();
 
@@ -594,7 +592,7 @@ mod tests {
     async fn test_stats() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let pool = create_test_pool(10);
         pool.open(&path).await.unwrap();
 
@@ -611,7 +609,7 @@ mod tests {
     async fn test_flush_all() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let pool = create_test_pool(10);
         pool.open(&path).await.unwrap();
 
@@ -632,7 +630,7 @@ mod tests {
     async fn test_shutdown() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let pool = create_test_pool(10);
         pool.open(&path).await.unwrap();
 

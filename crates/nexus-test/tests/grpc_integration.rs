@@ -81,7 +81,7 @@ async fn test_mock_ping() {
 
     let ping_result = client.ping().await;
     assert!(ping_result.is_ok());
-    
+
     let latency = ping_result.unwrap();
     assert!(latency < Duration::from_secs(1));
 }
@@ -91,8 +91,11 @@ async fn test_mock_ping() {
 async fn test_mock_server_info() {
     let client = Client::connect_default().expect("Failed to create mock client");
 
-    let info = client.server_info().await.expect("Failed to get server info");
-    
+    let info = client
+        .server_info()
+        .await
+        .expect("Failed to get server info");
+
     // In mock mode, server name should indicate mock
     assert!(info.server_name.contains("mock") || info.server_name.contains("NexusDB"));
     assert!(info.protocol_version > 0);

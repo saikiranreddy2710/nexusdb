@@ -22,18 +22,18 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
-pub mod lru;
-pub mod lru_k;
 pub mod arc;
 pub mod bloom;
+pub mod lru;
+pub mod lru_k;
 pub mod plan_cache;
 pub mod result_cache;
 pub mod stats;
 
-pub use lru::LruCache;
-pub use lru_k::LruKCache;
 pub use arc::ArcCache;
 pub use bloom::BloomFilter;
+pub use lru::LruCache;
+pub use lru_k::LruKCache;
 pub use plan_cache::PlanCache;
 pub use result_cache::ResultCache;
 pub use stats::CacheStats;

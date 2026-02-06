@@ -44,7 +44,11 @@ impl NexusDbService {
     }
 
     /// Executes SQL using a specific transaction/session, or a temporary session if no transaction.
-    fn execute_with_txn(&self, sql: &str, transaction_id: Option<u64>) -> Result<StatementResult, crate::database::DatabaseError> {
+    fn execute_with_txn(
+        &self,
+        sql: &str,
+        transaction_id: Option<u64>,
+    ) -> Result<StatementResult, crate::database::DatabaseError> {
         if let Some(txn_id) = transaction_id {
             // Use the existing session for this transaction
             let sessions = self.transaction_sessions.read().unwrap();
@@ -56,7 +60,7 @@ impl NexusDbService {
             }
             // Transaction not found, fall through to temporary session
         }
-        
+
         // Use a temporary session (autocommit)
         self.db.execute(sql)
     }
@@ -64,7 +68,7 @@ impl NexusDbService {
     /// Converts an ExecuteResult to a QueryResult proto.
     fn execute_result_to_query_result(&self, result: &ExecuteResult) -> QueryResult {
         let fields = result.schema.fields();
-        
+
         let proto_columns: Vec<ColumnInfo> = fields
             .iter()
             .map(|f| ColumnInfo {
@@ -75,7 +79,8 @@ impl NexusDbService {
             })
             .collect();
 
-        let proto_rows: Vec<Row> = result.rows()
+        let proto_rows: Vec<Row> = result
+            .rows()
             .into_iter()
             .map(|row| {
                 let values: Vec<Value> = row
@@ -261,29 +266,29 @@ impl NexusDb for NexusDbService {
         let req = request.into_inner();
 
         // Execute the query
-        let result = self.db.execute(&req.sql).map_err(|e| {
-            Status::internal(format!("Query execution failed: {}", e))
-        })?;
+        let result = self
+            .db
+            .execute(&req.sql)
+            .map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
 
         // Convert to a stream
         let rows: Vec<Row> = match result {
-            StatementResult::Query(exec_result) => {
-                exec_result.rows()
-                    .into_iter()
-                    .map(|row| {
-                        let values: Vec<Value> = row
-                            .iter()
-                            .map(|v| {
-                                use nexus_proto::proto::value::Value as ProtoValue;
-                                Value {
-                                    value: Some(ProtoValue::StringValue(v.to_string())),
-                                }
-                            })
-                            .collect();
-                        Row { values }
-                    })
-                    .collect()
-            }
+            StatementResult::Query(exec_result) => exec_result
+                .rows()
+                .into_iter()
+                .map(|row| {
+                    let values: Vec<Value> = row
+                        .iter()
+                        .map(|v| {
+                            use nexus_proto::proto::value::Value as ProtoValue;
+                            Value {
+                                value: Some(ProtoValue::StringValue(v.to_string())),
+                            }
+                        })
+                        .collect();
+                    Row { values }
+                })
+                .collect(),
             _ => vec![],
         };
 
@@ -349,7 +354,7 @@ impl NexusDb for NexusDbService {
     ) -> Result<Response<BeginTransactionResponse>, Status> {
         // Create a persistent session for this transaction
         let session_id = self.db.create_session();
-        
+
         // Begin the transaction in this session
         if let Some(session_arc) = self.db.get_session(session_id) {
             let mut session = session_arc.write().unwrap();
@@ -357,10 +362,10 @@ impl NexusDb for NexusDbService {
                 Ok(()) => {
                     // Generate a unique transaction ID and map it to this session
                     let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
-                    
+
                     let mut sessions = self.transaction_sessions.write().unwrap();
                     sessions.insert(txn_id, session_id);
-                    
+
                     Ok(Response::new(BeginTransactionResponse {
                         success: true,
                         error: None,
@@ -393,13 +398,13 @@ impl NexusDb for NexusDbService {
     ) -> Result<Response<CommitResponse>, Status> {
         let req = request.into_inner();
         let txn_id = req.transaction_id;
-        
+
         // Find the session for this transaction
         let session_id = {
             let sessions = self.transaction_sessions.read().unwrap();
             sessions.get(&txn_id).copied()
         };
-        
+
         if let Some(session_id) = session_id {
             if let Some(session_arc) = self.db.get_session(session_id) {
                 let mut session = session_arc.write().unwrap();
@@ -412,7 +417,7 @@ impl NexusDb for NexusDbService {
                             sessions.remove(&txn_id);
                         }
                         self.db.close_session(session_id);
-                        
+
                         Ok(Response::new(CommitResponse {
                             success: true,
                             error: None,
@@ -444,13 +449,13 @@ impl NexusDb for NexusDbService {
     ) -> Result<Response<RollbackResponse>, Status> {
         let req = request.into_inner();
         let txn_id = req.transaction_id;
-        
+
         // Find the session for this transaction
         let session_id = {
             let sessions = self.transaction_sessions.read().unwrap();
             sessions.get(&txn_id).copied()
         };
-        
+
         if let Some(session_id) = session_id {
             if let Some(session_arc) = self.db.get_session(session_id) {
                 let mut session = session_arc.write().unwrap();
@@ -463,7 +468,7 @@ impl NexusDb for NexusDbService {
                             sessions.remove(&txn_id);
                         }
                         self.db.close_session(session_id);
-                        
+
                         Ok(Response::new(RollbackResponse {
                             success: true,
                             error: None,

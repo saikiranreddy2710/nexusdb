@@ -83,7 +83,9 @@ impl MemoryNetwork {
 
     /// Removes a network partition.
     pub fn remove_partition(&self, from: NodeId, to: NodeId) {
-        self.partitions.write().retain(|&(f, t)| f != from || t != to);
+        self.partitions
+            .write()
+            .retain(|&(f, t)| f != from || t != to);
     }
 
     /// Removes all partitions involving a node.
@@ -100,7 +102,10 @@ impl MemoryNetwork {
 
     /// Checks if there's a partition from `from` to `to`.
     pub fn is_partitioned(&self, from: NodeId, to: NodeId) -> bool {
-        self.partitions.read().iter().any(|&(f, t)| f == from && t == to)
+        self.partitions
+            .read()
+            .iter()
+            .any(|&(f, t)| f == from && t == to)
     }
 
     /// Sends a message through the network.
@@ -111,10 +116,7 @@ impl MemoryNetwork {
             return Ok(());
         }
 
-        let sender = self
-            .nodes
-            .get(&to)
-            .ok_or(TransportError::UnknownNode(to))?;
+        let sender = self.nodes.get(&to).ok_or(TransportError::UnknownNode(to))?;
 
         let msg = IncomingMessage::new(from, message);
 

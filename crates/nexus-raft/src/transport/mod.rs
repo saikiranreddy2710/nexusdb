@@ -313,7 +313,10 @@ pub mod frame {
             data.put_u32(0);
 
             let result = decode(data.freeze());
-            assert!(matches!(result, Err(TransportError::DeserializationFailed(_))));
+            assert!(matches!(
+                result,
+                Err(TransportError::DeserializationFailed(_))
+            ));
         }
 
         #[test]
@@ -348,7 +351,10 @@ mod tests {
 
     #[test]
     fn test_incoming_message() {
-        let msg = IncomingMessage::new(1, RaftMessage::VoteResponse(crate::rpc::VoteResponse::grant(5)));
+        let msg = IncomingMessage::new(
+            1,
+            RaftMessage::VoteResponse(crate::rpc::VoteResponse::grant(5)),
+        );
         assert_eq!(msg.from, 1);
     }
 

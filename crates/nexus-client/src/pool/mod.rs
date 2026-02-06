@@ -369,11 +369,8 @@ impl ConnectionPool {
         {
             let mut state = self.state.lock();
             if let Some(conn) = self.get_valid_connection(&mut state) {
-                self.stats.lock().idle_connections = self
-                    .stats
-                    .lock()
-                    .idle_connections
-                    .saturating_sub(1);
+                self.stats.lock().idle_connections =
+                    self.stats.lock().idle_connections.saturating_sub(1);
                 return Ok(conn);
             }
         }
@@ -402,7 +399,7 @@ impl ConnectionPool {
     /// Creates a new connection.
     async fn create_connection(&self) -> ClientResult<PooledConnection> {
         let client = Client::new(self.config.client_config.clone());
-        
+
         // Try to connect, but if it fails with transport error, use mock mode for tests
         let connected_client = match client.connect().await {
             Ok(()) => client,
@@ -515,9 +512,7 @@ mod tests {
 
     #[test]
     fn test_pool_config_invalid() {
-        let config = PoolConfig::new()
-            .min_connections(20)
-            .max_connections(10);
+        let config = PoolConfig::new().min_connections(20).max_connections(10);
 
         assert!(config.validate().is_err());
     }
@@ -540,7 +535,7 @@ mod tests {
         // Explicitly drop and yield to allow async cleanup
         drop(client);
         tokio::task::yield_now().await;
-        
+
         // Connection returned to pool
         assert_eq!(pool.available(), 1);
     }

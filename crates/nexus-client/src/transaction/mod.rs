@@ -257,7 +257,11 @@ pub trait TransactionExt {
     /// If the closure returns Err, the transaction is rolled back.
     fn run_transaction<F, T, E>(&self, f: F) -> impl std::future::Future<Output = Result<T, E>>
     where
-        F: for<'a> FnOnce(&'a Transaction<'a>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'a>>,
+        F: for<'a> FnOnce(
+            &'a Transaction<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'a>,
+        >,
         T: Send,
         E: From<ClientError> + Send;
 }
@@ -265,7 +269,11 @@ pub trait TransactionExt {
 impl TransactionExt for Client {
     async fn run_transaction<F, T, E>(&self, f: F) -> Result<T, E>
     where
-        F: for<'a> FnOnce(&'a Transaction<'a>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'a>>,
+        F: for<'a> FnOnce(
+            &'a Transaction<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'a>,
+        >,
         T: Send,
         E: From<ClientError> + Send,
     {
@@ -360,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_transaction_commit() {
         use super::TransactionExt;
-        
+
         let client = mock_client();
 
         let result: Result<i32, ClientError> = client
@@ -379,14 +387,12 @@ mod tests {
     #[tokio::test]
     async fn test_run_transaction_rollback() {
         use super::TransactionExt;
-        
+
         let client = mock_client();
 
         let result: Result<i32, ClientError> = client
             .run_transaction(|_txn| {
-                Box::pin(async move {
-                    Err(ClientError::QueryFailed("test error".to_string()))
-                })
+                Box::pin(async move { Err(ClientError::QueryFailed("test error".to_string())) })
             })
             .await;
 

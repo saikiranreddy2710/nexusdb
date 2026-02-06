@@ -1,7 +1,7 @@
 //! # nexus-storage
-//! 
+//!
 //! SageTree storage engine for NexusDB.
-//! 
+//!
 //! This crate implements the novel SageTree storage structure that provides:
 //! - 10x less write amplification than LSM trees
 //! - Fractional cascading for efficient range queries

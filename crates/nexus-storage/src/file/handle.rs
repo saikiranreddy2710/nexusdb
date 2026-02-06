@@ -33,7 +33,9 @@ pub trait FileHandle: Send + Sync {
     async fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> IoResult<()> {
         let mut total_read = 0;
         while total_read < buf.len() {
-            let n = self.read_at(&mut buf[total_read..], offset + total_read as u64).await?;
+            let n = self
+                .read_at(&mut buf[total_read..], offset + total_read as u64)
+                .await?;
             if n == 0 {
                 return Err(IoError::short_read(buf.len(), total_read));
             }
@@ -53,7 +55,9 @@ pub trait FileHandle: Send + Sync {
     async fn write_all_at(&self, buf: &[u8], offset: u64) -> IoResult<()> {
         let mut total_written = 0;
         while total_written < buf.len() {
-            let n = self.write_at(&buf[total_written..], offset + total_written as u64).await?;
+            let n = self
+                .write_at(&buf[total_written..], offset + total_written as u64)
+                .await?;
             if n == 0 {
                 return Err(IoError::short_write(buf.len(), total_written));
             }
@@ -142,9 +146,13 @@ impl FileManager {
     }
 
     /// Opens a file with the specified options.
-    pub async fn open(&self, path: impl AsRef<Path>, options: OpenOptions) -> IoResult<Arc<StandardFile>> {
+    pub async fn open(
+        &self,
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> IoResult<Arc<StandardFile>> {
         let path = path.as_ref();
-        
+
         // For now, always use StandardFile
         // io_uring support can be added later
         let file = StandardFile::open(path, options).await?;
@@ -170,11 +178,9 @@ impl FileManager {
     pub async fn create(&self, path: impl AsRef<Path>) -> IoResult<Arc<StandardFile>> {
         self.open(
             path,
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true),
-        ).await
+            OpenOptions::new().read(true).write(true).create_new(true),
+        )
+        .await
     }
 
     /// Deletes a file.
@@ -196,7 +202,7 @@ impl FileManager {
         let meta = tokio::fs::metadata(path)
             .await
             .map_err(|e| IoError::from_io_with_path(e, path))?;
-        
+
         Ok(FileMetadata {
             size: meta.len(),
             is_file: meta.is_file(),
@@ -261,9 +267,9 @@ mod tests {
     async fn test_create_and_read_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        
+
         let manager = FileManager::new().unwrap();
-        
+
         // Create and write
         {
             let file = manager.create(&path).await.unwrap();
@@ -271,7 +277,7 @@ mod tests {
             file.write_all_at(data, 0).await.unwrap();
             file.sync().await.unwrap();
         }
-        
+
         // Read back
         {
             let file = manager.open_read(&path).await.unwrap();
@@ -285,13 +291,13 @@ mod tests {
     async fn test_file_metadata() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("meta.db");
-        
+
         let manager = FileManager::new().unwrap();
         let file = manager.create(&path).await.unwrap();
         file.write_all_at(&[0u8; 1024], 0).await.unwrap();
         file.sync().await.unwrap();
         drop(file);
-        
+
         let meta = manager.metadata(&path).await.unwrap();
         assert_eq!(meta.size, 1024);
         assert!(meta.is_file);
@@ -302,14 +308,14 @@ mod tests {
     async fn test_exists() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("exists.db");
-        
+
         let manager = FileManager::new().unwrap();
-        
+
         assert!(!manager.exists(&path).await);
-        
+
         let file = manager.create(&path).await.unwrap();
         drop(file);
-        
+
         assert!(manager.exists(&path).await);
     }
 
@@ -317,11 +323,11 @@ mod tests {
     async fn test_remove() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("remove.db");
-        
+
         let manager = FileManager::new().unwrap();
         let file = manager.create(&path).await.unwrap();
         drop(file);
-        
+
         assert!(manager.exists(&path).await);
         manager.remove(&path).await.unwrap();
         assert!(!manager.exists(&path).await);
@@ -332,13 +338,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let path1 = dir.path().join("old.db");
         let path2 = dir.path().join("new.db");
-        
+
         let manager = FileManager::new().unwrap();
         let file = manager.create(&path1).await.unwrap();
         drop(file);
-        
+
         manager.rename(&path1, &path2).await.unwrap();
-        
+
         assert!(!manager.exists(&path1).await);
         assert!(manager.exists(&path2).await);
     }

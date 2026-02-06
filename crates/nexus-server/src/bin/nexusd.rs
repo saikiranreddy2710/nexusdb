@@ -176,7 +176,10 @@ fn print_banner() {
     info!("║   ██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝███████║         ║");
     info!("║   ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝         ║");
     info!("║                                                       ║");
-    info!("║          NexusDB v{:<10} - NewSQL Database        ║", version);
+    info!(
+        "║          NexusDB v{:<10} - NewSQL Database        ║",
+        version
+    );
     info!("║                                                       ║");
     info!("╚═══════════════════════════════════════════════════════╝");
 }
@@ -188,10 +191,10 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         Database::open_memory().context("Failed to create in-memory database")?
     } else if let Some(ref dir) = config.data_dir {
         info!("Data directory: {}", dir.display());
-        
+
         // Ensure directory exists
         std::fs::create_dir_all(dir).context("Failed to create data directory")?;
-        
+
         // For now, use memory mode since file-based storage needs more setup
         warn!("File-based storage not yet fully implemented, using memory mode");
         Database::open_memory().context("Failed to create database")?
@@ -234,7 +237,7 @@ async fn run_server(config: ServerConfig) -> Result<()> {
 
     // Graceful shutdown
     info!("Shutting down gracefully...");
-    
+
     // Close all sessions
     let stats = db.stats();
     if stats.active_sessions > 0 {

@@ -268,9 +268,7 @@ impl Repl {
             // Use mock client for testing
             let client = Client::connect_default()?;
             self.client = Some(client);
-            println!(
-                "Connected to NexusDB (mock mode)"
-            );
+            println!("Connected to NexusDB (mock mode)");
             return Ok(());
         }
 
@@ -319,7 +317,7 @@ impl Repl {
                 // Fall back to mock mode if connection fails
                 eprintln!("Warning: Could not connect to server: {}", e);
                 eprintln!("Starting in mock mode...\n");
-                
+
                 let mock_client = Client::connect_default()?;
                 self.client = Some(mock_client);
                 Ok(())
@@ -331,11 +329,11 @@ impl Repl {
     pub async fn run(&mut self) -> Result<()> {
         loop {
             let prompt = self.get_prompt();
-            
+
             match self.editor.readline(&prompt) {
                 Ok(line) => {
                     let line = line.trim();
-                    
+
                     if line.is_empty() {
                         continue;
                     }
@@ -434,10 +432,7 @@ impl Repl {
 
     /// Executes SQL and prints the result.
     pub async fn execute_and_print(&mut self, sql: &str) -> Result<()> {
-        let client = self
-            .client
-            .as_ref()
-            .context("Not connected to database")?;
+        let client = self.client.as_ref().context("Not connected to database")?;
 
         let start = Instant::now();
 

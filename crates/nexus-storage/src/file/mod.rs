@@ -48,17 +48,17 @@
 //! }
 //! ```
 
+mod error;
 mod handle;
 mod options;
 mod std_io;
-mod error;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod uring;
 
+pub use error::{IoError, IoResult};
 pub use handle::{FileHandle, FileManager};
 pub use options::OpenOptions;
-pub use error::{IoError, IoResult};
 pub use std_io::StandardFile;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

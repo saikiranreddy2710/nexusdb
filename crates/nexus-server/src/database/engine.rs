@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use nexus_sql::storage::StorageEngine;
-use nexus_wal::{Wal, WalConfig, SyncPolicy};
+use nexus_wal::{SyncPolicy, Wal, WalConfig};
 
 use super::error::{DatabaseError, DatabaseResult};
 use super::result::StatementResult;
@@ -112,7 +112,7 @@ impl Database {
                     _ => SyncPolicy::EveryWrite,
                 };
                 let wal_config = WalConfig::new(&wal_dir).with_sync_policy(sync_policy);
-                
+
                 // Try to open existing WAL or create new one
                 let wal = if wal_dir.exists() {
                     match Wal::open(wal_config.clone()) {
@@ -134,7 +134,7 @@ impl Database {
                         DatabaseError::Internal(format!("Failed to create WAL: {}", e))
                     })?
                 };
-                
+
                 Some(Arc::new(wal))
             } else {
                 // WAL enabled but no data directory - log warning
@@ -159,25 +159,29 @@ impl Database {
     /// Replays the WAL to recover state after a crash.
     fn replay_wal(wal: &Wal, _storage: &StorageEngine) -> DatabaseResult<()> {
         use nexus_wal::record::RecordType;
-        
+
         let min_recovery_lsn = wal.min_recovery_lsn();
-        
+
         // Read all records from the minimum recovery LSN
-        let records = wal.iter_from(min_recovery_lsn).map_err(|e| {
-            DatabaseError::Internal(format!("Failed to read WAL: {}", e))
-        })?;
-        
+        let records = wal
+            .iter_from(min_recovery_lsn)
+            .map_err(|e| DatabaseError::Internal(format!("Failed to read WAL: {}", e)))?;
+
         if records.is_empty() {
             tracing::info!("No WAL records to replay");
             return Ok(());
         }
-        
-        tracing::info!("Replaying {} WAL records from LSN {:?}", records.len(), min_recovery_lsn);
-        
+
+        tracing::info!(
+            "Replaying {} WAL records from LSN {:?}",
+            records.len(),
+            min_recovery_lsn
+        );
+
         // Track committed and aborted transactions
         let mut committed_txns = std::collections::HashSet::new();
         let mut aborted_txns = std::collections::HashSet::new();
-        
+
         // First pass: identify committed and aborted transactions
         for record in &records {
             match record.header.record_type {
@@ -190,24 +194,24 @@ impl Database {
                 _ => {}
             }
         }
-        
+
         tracing::info!(
             "Found {} committed, {} aborted transactions",
             committed_txns.len(),
             aborted_txns.len()
         );
-        
+
         // TODO: Second pass - replay committed transactions' operations
         // This requires integration with the storage engine to re-apply
         // INSERT, UPDATE, DELETE operations. For now, we just log.
         //
         // In a full implementation:
         // - For each INSERT record from a committed txn: re-insert the row
-        // - For each UPDATE record from a committed txn: re-apply the update  
+        // - For each UPDATE record from a committed txn: re-apply the update
         // - For each DELETE record from a committed txn: re-delete the row
         //
         // We also need to handle the page_id/slot_id mapping to actual storage.
-        
+
         Ok(())
     }
 

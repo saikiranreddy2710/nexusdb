@@ -85,17 +85,17 @@ pub mod membership;
 pub mod lease;
 
 // Re-export key types for convenience
+pub use lease::{LeaseConfig, LeaseManager, ReadIndex, ReadIndexQueue, ReadStrategy};
 pub use log::RaftLog;
+pub use membership::{Configuration, ConfigurationManager, MembershipChange, QuorumTracker};
 pub use node::{RaftConfig, RaftNode, Role};
 pub use rpc::{
-    AppendEntries, AppendResponse, InstallSnapshot, LogEntry, NodeId, OutboundMessage,
-    RaftMessage, RequestVote, SnapshotResponse, Term, VoteResponse,
+    AppendEntries, AppendResponse, InstallSnapshot, LogEntry, NodeId, OutboundMessage, RaftMessage,
+    RequestVote, SnapshotResponse, Term, VoteResponse,
 };
 pub use state_machine::StateMachine;
-pub use transport::{Transport, TransportError};
 pub use storage::{FileStorage, PersistentLog, RaftState, Storage, StorageConfig, StorageError};
-pub use membership::{Configuration, ConfigurationManager, MembershipChange, QuorumTracker};
-pub use lease::{LeaseConfig, LeaseManager, ReadIndex, ReadIndexQueue, ReadStrategy};
+pub use transport::{Transport, TransportError};
 
 /// A log index (position in the Raft log).
 ///

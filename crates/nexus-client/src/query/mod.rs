@@ -71,10 +71,7 @@ impl<'a> QueryBuilder<'a> {
 
     /// Appends WHERE with equality condition.
     pub fn where_eq<T: Into<Value>>(self, column: &str, value: T) -> Self {
-        self.sql(" WHERE ")
-            .sql(column)
-            .sql(" = ")
-            .bind(value)
+        self.sql(" WHERE ").sql(column).sql(" = ").bind(value)
     }
 
     /// Appends AND condition.
@@ -146,10 +143,7 @@ impl<'a> QueryBuilder<'a> {
 
     /// Appends SET clause.
     pub fn set<T: Into<Value>>(self, column: &str, value: T) -> Self {
-        self.sql(" SET ")
-            .sql(column)
-            .sql(" = ")
-            .bind(value)
+        self.sql(" SET ").sql(column).sql(" = ").bind(value)
     }
 
     /// Appends additional SET assignment.
@@ -164,10 +158,7 @@ impl<'a> QueryBuilder<'a> {
 
     /// Appends JOIN clause.
     pub fn join(self, table: &str, condition: &str) -> Self {
-        self.sql(" JOIN ")
-            .sql(table)
-            .sql(" ON ")
-            .sql(condition)
+        self.sql(" JOIN ").sql(table).sql(" ON ").sql(condition)
     }
 
     /// Appends LEFT JOIN clause.
@@ -422,7 +413,10 @@ mod tests {
             .query()
             .insert_into("users")
             .columns(&["name", "email"])
-            .values(&[Value::String("Alice".to_string()), Value::String("alice@example.com".to_string())])
+            .values(&[
+                Value::String("Alice".to_string()),
+                Value::String("alice@example.com".to_string()),
+            ])
             .build();
 
         assert_eq!(
@@ -508,10 +502,7 @@ mod tests {
         assert_eq!(format_value(&Value::Integer(42)), "42");
         assert_eq!(format_value(&Value::Float(3.14)), "3.14");
         assert_eq!(format_value(&Value::String("hello".to_string())), "'hello'");
-        assert_eq!(
-            format_value(&Value::String("it's".to_string())),
-            "'it''s'"
-        );
+        assert_eq!(format_value(&Value::String("it's".to_string())), "'it''s'");
     }
 
     #[test]

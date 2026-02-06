@@ -364,7 +364,7 @@ impl Client {
     }
 
     /// Creates a new client with default configuration.
-    /// 
+    ///
     /// This creates a client in "mock" mode for testing purposes.
     /// For real connections, use `Client::new(config).connect().await`.
     pub fn connect_default() -> ClientResult<Self> {
@@ -680,7 +680,9 @@ impl Client {
 
             if !response.success {
                 return Err(ClientError::TransactionError(
-                    response.error.unwrap_or_else(|| "failed to begin transaction".to_string()),
+                    response
+                        .error
+                        .unwrap_or_else(|| "failed to begin transaction".to_string()),
                 ));
             }
 
@@ -740,7 +742,9 @@ impl Client {
 
             if !response.success {
                 return Err(ClientError::TransactionError(
-                    response.error.unwrap_or_else(|| "failed to commit".to_string()),
+                    response
+                        .error
+                        .unwrap_or_else(|| "failed to commit".to_string()),
                 ));
             }
         }
@@ -826,19 +830,15 @@ impl Client {
             ConnectionState::Disconnected | ConnectionState::Connecting => {
                 Err(ClientError::ConnectionFailed("not connected".to_string()))
             }
-            ConnectionState::Failed => {
-                Err(ClientError::ConnectionFailed("connection failed".to_string()))
-            }
+            ConnectionState::Failed => Err(ClientError::ConnectionFailed(
+                "connection failed".to_string(),
+            )),
             ConnectionState::Closed => Err(ClientError::ConnectionClosed),
         }
     }
 
     /// Internal query execution.
-    async fn execute_query_internal(
-        &self,
-        sql: &str,
-        _query_id: u64,
-    ) -> ClientResult<QueryResult> {
+    async fn execute_query_internal(&self, sql: &str, _query_id: u64) -> ClientResult<QueryResult> {
         // Get a clone of the gRPC client
         let client_opt = {
             let inner = self.inner.read();
@@ -871,7 +871,9 @@ impl Client {
 
         if !response.success {
             return Err(ClientError::QueryFailed(
-                response.error.unwrap_or_else(|| "unknown error".to_string()),
+                response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string()),
             ));
         }
 
@@ -882,12 +884,7 @@ impl Client {
                 let rows: Vec<Vec<Value>> = qr
                     .rows
                     .iter()
-                    .map(|row| {
-                        row.values
-                            .iter()
-                            .map(|v| proto_value_to_value(v))
-                            .collect()
-                    })
+                    .map(|row| row.values.iter().map(|v| proto_value_to_value(v)).collect())
                     .collect();
 
                 Ok(QueryResult {
@@ -925,7 +922,7 @@ fn proto_value_to_value(v: &nexus_proto::proto::Value) -> Value {
         Some(ProtoValue::BytesValue(b)) => Value::Bytes(b.clone()),
         Some(ProtoValue::TimestampValue(t)) => Value::Integer(*t), // Store as epoch ms
         Some(ProtoValue::DateValue(d)) => Value::Integer(*d as i64), // Days since epoch
-        Some(ProtoValue::TimeValue(t)) => Value::Integer(*t), // Microseconds
+        Some(ProtoValue::TimeValue(t)) => Value::Integer(*t),      // Microseconds
         Some(ProtoValue::DecimalValue(s)) => Value::String(s.clone()), // Keep as string
         None => Value::Null,
     }

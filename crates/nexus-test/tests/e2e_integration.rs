@@ -27,7 +27,9 @@ async fn start_server_and_connect() -> Option<(Client, tokio::task::JoinHandle<(
     let db = Database::open_memory().expect("Failed to create database");
     let db = Arc::new(db);
 
-    let addr = format!("127.0.0.1:{}", port).parse().expect("Invalid address");
+    let addr = format!("127.0.0.1:{}", port)
+        .parse()
+        .expect("Invalid address");
     let server = GrpcServer::new(db.clone(), addr);
 
     // Spawn server in background
@@ -45,7 +47,7 @@ async fn start_server_and_connect() -> Option<(Client, tokio::task::JoinHandle<(
         .connect_timeout(Duration::from_secs(5));
 
     let client = Client::new(config);
-    
+
     match timeout(Duration::from_secs(5), client.connect()).await {
         Ok(Ok(())) => Some((client, server_handle)),
         Ok(Err(e)) => {
@@ -104,7 +106,11 @@ async fn test_ping_latency() {
 
     // All latencies should be reasonable (< 1 second)
     for latency in &latencies {
-        assert!(*latency < Duration::from_secs(1), "Ping too slow: {:?}", latency);
+        assert!(
+            *latency < Duration::from_secs(1),
+            "Ping too slow: {:?}",
+            latency
+        );
     }
 
     client.disconnect().await.expect("Disconnect failed");
@@ -119,18 +125,27 @@ async fn test_server_info() {
         return;
     };
 
-    let info = client.server_info().await.expect("Failed to get server info");
+    let info = client
+        .server_info()
+        .await
+        .expect("Failed to get server info");
 
     // Verify server info fields
     assert!(!info.version.is_empty(), "Version should not be empty");
-    assert!(!info.server_name.is_empty(), "Server name should not be empty");
+    assert!(
+        !info.server_name.is_empty(),
+        "Server name should not be empty"
+    );
     assert!(info.protocol_version > 0, "Protocol version should be > 0");
     assert!(!info.features.is_empty(), "Features should not be empty");
 
     // Check for expected features
     let features: Vec<&str> = info.features.iter().map(|s| s.as_str()).collect();
-    assert!(features.contains(&"SQL") || features.contains(&"sql"), 
-            "Should support SQL: {:?}", features);
+    assert!(
+        features.contains(&"SQL") || features.contains(&"sql"),
+        "Should support SQL: {:?}",
+        features
+    );
 
     client.disconnect().await.expect("Disconnect failed");
     server_handle.abort();
@@ -169,8 +184,14 @@ async fn test_client_stats() {
 
     // Check stats
     let stats = client.stats();
-    assert!(stats.queries_executed >= 5, "Should have at least 5 queries");
-    assert!(stats.successful_connections >= 1, "Should have at least 1 connection");
+    assert!(
+        stats.queries_executed >= 5,
+        "Should have at least 5 queries"
+    );
+    assert!(
+        stats.successful_connections >= 1,
+        "Should have at least 1 connection"
+    );
 
     client.disconnect().await.expect("Disconnect failed");
     server_handle.abort();
@@ -212,14 +233,20 @@ async fn test_full_crud_workflow() {
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // INSERT multiple rows
-    let result = client.execute("INSERT INTO users VALUES (1, 'Alice', 30)").await;
+    let result = client
+        .execute("INSERT INTO users VALUES (1, 'Alice', 30)")
+        .await;
     assert!(result.is_ok(), "INSERT 1 failed: {:?}", result);
     assert_eq!(result.unwrap().rows_affected, 1);
 
-    let result = client.execute("INSERT INTO users VALUES (2, 'Bob', 25)").await;
+    let result = client
+        .execute("INSERT INTO users VALUES (2, 'Bob', 25)")
+        .await;
     assert!(result.is_ok(), "INSERT 2 failed: {:?}", result);
 
-    let result = client.execute("INSERT INTO users VALUES (3, 'Charlie', 35)").await;
+    let result = client
+        .execute("INSERT INTO users VALUES (3, 'Charlie', 35)")
+        .await;
     assert!(result.is_ok(), "INSERT 3 failed: {:?}", result);
 
     // SELECT all
@@ -232,10 +259,17 @@ async fn test_full_crud_workflow() {
     let result = client.execute("SELECT * FROM users WHERE id = 1").await;
     assert!(result.is_ok(), "SELECT WHERE failed: {:?}", result);
     let query_result = result.unwrap();
-    assert_eq!(query_result.row_count(), 1, "Expected 1 row for id = 1, got {}", query_result.row_count());
+    assert_eq!(
+        query_result.row_count(),
+        1,
+        "Expected 1 row for id = 1, got {}",
+        query_result.row_count()
+    );
 
     // UPDATE
-    let result = client.execute("UPDATE users SET age = 31 WHERE id = 1").await;
+    let result = client
+        .execute("UPDATE users SET age = 31 WHERE id = 1")
+        .await;
     assert!(result.is_ok(), "UPDATE failed: {:?}", result);
     assert_eq!(result.unwrap().rows_affected, 1);
 
@@ -268,15 +302,32 @@ async fn test_basic_select() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE scores (id INT PRIMARY KEY, name TEXT, score INT)").await;
+    let result = client
+        .execute("CREATE TABLE scores (id INT PRIMARY KEY, name TEXT, score INT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert test data
-    client.execute("INSERT INTO scores VALUES (1, 'Alice', 10)").await.ok();
-    client.execute("INSERT INTO scores VALUES (2, 'Bob', 20)").await.ok();
-    client.execute("INSERT INTO scores VALUES (3, 'Charlie', 30)").await.ok();
-    client.execute("INSERT INTO scores VALUES (4, 'Diana', 40)").await.ok();
-    client.execute("INSERT INTO scores VALUES (5, 'Eve', 50)").await.ok();
+    client
+        .execute("INSERT INTO scores VALUES (1, 'Alice', 10)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO scores VALUES (2, 'Bob', 20)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO scores VALUES (3, 'Charlie', 30)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO scores VALUES (4, 'Diana', 40)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO scores VALUES (5, 'Eve', 50)")
+        .await
+        .ok();
 
     // SELECT all columns
     let result = client.execute("SELECT * FROM scores").await;
@@ -309,15 +360,32 @@ async fn test_order_by_and_limit() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT, price INT)").await;
+    let result = client
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT, price INT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert data in random order
-    client.execute("INSERT INTO items VALUES (3, 'Widget', 30)").await.ok();
-    client.execute("INSERT INTO items VALUES (1, 'Gadget', 50)").await.ok();
-    client.execute("INSERT INTO items VALUES (5, 'Doodad', 10)").await.ok();
-    client.execute("INSERT INTO items VALUES (2, 'Thingamajig', 40)").await.ok();
-    client.execute("INSERT INTO items VALUES (4, 'Whatchamacallit', 20)").await.ok();
+    client
+        .execute("INSERT INTO items VALUES (3, 'Widget', 30)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO items VALUES (1, 'Gadget', 50)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO items VALUES (5, 'Doodad', 10)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO items VALUES (2, 'Thingamajig', 40)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO items VALUES (4, 'Whatchamacallit', 20)")
+        .await
+        .ok();
 
     // SELECT all - should return 5 rows
     let result = client.execute("SELECT * FROM items").await;
@@ -331,7 +399,9 @@ async fn test_order_by_and_limit() {
     assert_eq!(query_result.row_count(), 3, "LIMIT 3 should return 3 rows");
 
     // ORDER BY (with columns in SELECT list)
-    let result = client.execute("SELECT id, name, price FROM items ORDER BY id").await;
+    let result = client
+        .execute("SELECT id, name, price FROM items ORDER BY id")
+        .await;
     assert!(result.is_ok(), "ORDER BY id failed: {:?}", result);
     let query_result = result.unwrap();
     assert_eq!(query_result.row_count(), 5);
@@ -352,19 +422,38 @@ async fn test_multiple_tables() {
     };
 
     // Create two tables
-    let result = client.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)").await;
+    let result = client
+        .execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)")
+        .await;
     assert!(result.is_ok(), "CREATE departments failed: {:?}", result);
 
-    let result = client.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)").await;
+    let result = client
+        .execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)")
+        .await;
     assert!(result.is_ok(), "CREATE employees failed: {:?}", result);
 
     // Insert data
-    client.execute("INSERT INTO departments VALUES (1, 'Engineering')").await.ok();
-    client.execute("INSERT INTO departments VALUES (2, 'Sales')").await.ok();
+    client
+        .execute("INSERT INTO departments VALUES (1, 'Engineering')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO departments VALUES (2, 'Sales')")
+        .await
+        .ok();
 
-    client.execute("INSERT INTO employees VALUES (1, 'Alice', 1)").await.ok();
-    client.execute("INSERT INTO employees VALUES (2, 'Bob', 1)").await.ok();
-    client.execute("INSERT INTO employees VALUES (3, 'Charlie', 2)").await.ok();
+    client
+        .execute("INSERT INTO employees VALUES (1, 'Alice', 1)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (2, 'Bob', 1)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (3, 'Charlie', 2)")
+        .await
+        .ok();
 
     // Query each table independently
     let result = client.execute("SELECT * FROM departments").await;
@@ -376,7 +465,9 @@ async fn test_multiple_tables() {
     assert_eq!(result.unwrap().row_count(), 3);
 
     // Filtered query using = (avoid > which may have issues)
-    let result = client.execute("SELECT * FROM employees WHERE dept_id = 1").await;
+    let result = client
+        .execute("SELECT * FROM employees WHERE dept_id = 1")
+        .await;
     assert!(result.is_ok(), "SELECT filtered failed: {:?}", result);
     assert_eq!(result.unwrap().row_count(), 2);
 
@@ -397,12 +488,23 @@ async fn test_if_exists_clauses() {
     };
 
     // CREATE TABLE IF NOT EXISTS (first time)
-    let result = client.execute("CREATE TABLE IF NOT EXISTS test (id INT PRIMARY KEY)").await;
-    assert!(result.is_ok(), "CREATE IF NOT EXISTS (first) failed: {:?}", result);
+    let result = client
+        .execute("CREATE TABLE IF NOT EXISTS test (id INT PRIMARY KEY)")
+        .await;
+    assert!(
+        result.is_ok(),
+        "CREATE IF NOT EXISTS (first) failed: {:?}",
+        result
+    );
 
     // CREATE TABLE IF NOT EXISTS (second time - should not error)
-    let result = client.execute("CREATE TABLE IF NOT EXISTS test (id INT PRIMARY KEY)").await;
-    assert!(result.is_ok(), "CREATE IF NOT EXISTS (second) should not fail");
+    let result = client
+        .execute("CREATE TABLE IF NOT EXISTS test (id INT PRIMARY KEY)")
+        .await;
+    assert!(
+        result.is_ok(),
+        "CREATE IF NOT EXISTS (second) should not fail"
+    );
 
     // DROP TABLE IF EXISTS
     let result = client.execute("DROP TABLE IF EXISTS test").await;
@@ -410,7 +512,10 @@ async fn test_if_exists_clauses() {
 
     // DROP TABLE IF EXISTS (table doesn't exist - should not error)
     let result = client.execute("DROP TABLE IF EXISTS test").await;
-    assert!(result.is_ok(), "DROP IF EXISTS (non-existent) should not fail");
+    assert!(
+        result.is_ok(),
+        "DROP IF EXISTS (non-existent) should not fail"
+    );
 
     client.disconnect().await.expect("Disconnect failed");
     server_handle.abort();
@@ -429,21 +534,46 @@ async fn test_inner_join() {
     };
 
     // Setup tables
-    let result = client.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)").await;
+    let result = client
+        .execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)")
+        .await;
     assert!(result.is_ok(), "CREATE departments failed: {:?}", result);
 
-    let result = client.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)").await;
+    let result = client
+        .execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)")
+        .await;
     assert!(result.is_ok(), "CREATE employees failed: {:?}", result);
 
     // Insert data
-    client.execute("INSERT INTO departments VALUES (1, 'Engineering')").await.ok();
-    client.execute("INSERT INTO departments VALUES (2, 'Sales')").await.ok();
-    client.execute("INSERT INTO departments VALUES (3, 'Marketing')").await.ok();
+    client
+        .execute("INSERT INTO departments VALUES (1, 'Engineering')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO departments VALUES (2, 'Sales')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO departments VALUES (3, 'Marketing')")
+        .await
+        .ok();
 
-    client.execute("INSERT INTO employees VALUES (1, 'Alice', 1)").await.ok();
-    client.execute("INSERT INTO employees VALUES (2, 'Bob', 1)").await.ok();
-    client.execute("INSERT INTO employees VALUES (3, 'Charlie', 2)").await.ok();
-    client.execute("INSERT INTO employees VALUES (4, 'Diana', 4)").await.ok(); // Non-existent dept
+    client
+        .execute("INSERT INTO employees VALUES (1, 'Alice', 1)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (2, 'Bob', 1)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (3, 'Charlie', 2)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (4, 'Diana', 4)")
+        .await
+        .ok(); // Non-existent dept
 
     // INNER JOIN - should only return rows with matching dept_id
     let result = client.execute(
@@ -452,7 +582,11 @@ async fn test_inner_join() {
     assert!(result.is_ok(), "INNER JOIN failed: {:?}", result);
     let query_result = result.unwrap();
     // Alice, Bob (dept 1), Charlie (dept 2) - Diana has no matching dept
-    assert_eq!(query_result.row_count(), 3, "INNER JOIN should return 3 rows");
+    assert_eq!(
+        query_result.row_count(),
+        3,
+        "INNER JOIN should return 3 rows"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE employees").await;
@@ -471,20 +605,42 @@ async fn test_left_join() {
     };
 
     // Setup tables
-    let result = client.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)").await;
+    let result = client
+        .execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)")
+        .await;
     assert!(result.is_ok(), "CREATE departments failed: {:?}", result);
 
-    let result = client.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)").await;
+    let result = client
+        .execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)")
+        .await;
     assert!(result.is_ok(), "CREATE employees failed: {:?}", result);
 
     // Insert data
-    client.execute("INSERT INTO departments VALUES (1, 'Engineering')").await.ok();
-    client.execute("INSERT INTO departments VALUES (2, 'Sales')").await.ok();
+    client
+        .execute("INSERT INTO departments VALUES (1, 'Engineering')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO departments VALUES (2, 'Sales')")
+        .await
+        .ok();
 
-    client.execute("INSERT INTO employees VALUES (1, 'Alice', 1)").await.ok();
-    client.execute("INSERT INTO employees VALUES (2, 'Bob', 1)").await.ok();
-    client.execute("INSERT INTO employees VALUES (3, 'Charlie', 2)").await.ok();
-    client.execute("INSERT INTO employees VALUES (4, 'Diana', 99)").await.ok(); // Non-existent dept
+    client
+        .execute("INSERT INTO employees VALUES (1, 'Alice', 1)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (2, 'Bob', 1)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (3, 'Charlie', 2)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (4, 'Diana', 99)")
+        .await
+        .ok(); // Non-existent dept
 
     // LEFT JOIN - should return all employees, with NULL for Diana's department
     let result = client.execute(
@@ -493,7 +649,11 @@ async fn test_left_join() {
     assert!(result.is_ok(), "LEFT JOIN failed: {:?}", result);
     let query_result = result.unwrap();
     // All 4 employees should be returned
-    assert_eq!(query_result.row_count(), 4, "LEFT JOIN should return 4 rows (all employees)");
+    assert_eq!(
+        query_result.row_count(),
+        4,
+        "LEFT JOIN should return 4 rows (all employees)"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE employees").await;
@@ -512,19 +672,38 @@ async fn test_right_join() {
     };
 
     // Setup tables
-    let result = client.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)").await;
+    let result = client
+        .execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)")
+        .await;
     assert!(result.is_ok(), "CREATE departments failed: {:?}", result);
 
-    let result = client.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)").await;
+    let result = client
+        .execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)")
+        .await;
     assert!(result.is_ok(), "CREATE employees failed: {:?}", result);
 
     // Insert data
-    client.execute("INSERT INTO departments VALUES (1, 'Engineering')").await.ok();
-    client.execute("INSERT INTO departments VALUES (2, 'Sales')").await.ok();
-    client.execute("INSERT INTO departments VALUES (3, 'Marketing')").await.ok(); // No employees
+    client
+        .execute("INSERT INTO departments VALUES (1, 'Engineering')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO departments VALUES (2, 'Sales')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO departments VALUES (3, 'Marketing')")
+        .await
+        .ok(); // No employees
 
-    client.execute("INSERT INTO employees VALUES (1, 'Alice', 1)").await.ok();
-    client.execute("INSERT INTO employees VALUES (2, 'Bob', 2)").await.ok();
+    client
+        .execute("INSERT INTO employees VALUES (1, 'Alice', 1)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (2, 'Bob', 2)")
+        .await
+        .ok();
 
     // RIGHT JOIN - should return all departments, with NULL for Marketing's employees
     let result = client.execute(
@@ -533,7 +712,11 @@ async fn test_right_join() {
     assert!(result.is_ok(), "RIGHT JOIN failed: {:?}", result);
     let query_result = result.unwrap();
     // All 3 departments should be returned (Alice, Bob, and NULL for Marketing)
-    assert_eq!(query_result.row_count(), 3, "RIGHT JOIN should return 3 rows (all departments)");
+    assert_eq!(
+        query_result.row_count(),
+        3,
+        "RIGHT JOIN should return 3 rows (all departments)"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE employees").await;
@@ -552,27 +735,50 @@ async fn test_cross_join() {
     };
 
     // Setup small tables to avoid explosion
-    let result = client.execute("CREATE TABLE colors (id INT PRIMARY KEY, name TEXT)").await;
+    let result = client
+        .execute("CREATE TABLE colors (id INT PRIMARY KEY, name TEXT)")
+        .await;
     assert!(result.is_ok(), "CREATE colors failed: {:?}", result);
 
-    let result = client.execute("CREATE TABLE sizes (id INT PRIMARY KEY, name TEXT)").await;
+    let result = client
+        .execute("CREATE TABLE sizes (id INT PRIMARY KEY, name TEXT)")
+        .await;
     assert!(result.is_ok(), "CREATE sizes failed: {:?}", result);
 
     // Insert data - small sets
-    client.execute("INSERT INTO colors VALUES (1, 'Red')").await.ok();
-    client.execute("INSERT INTO colors VALUES (2, 'Blue')").await.ok();
+    client
+        .execute("INSERT INTO colors VALUES (1, 'Red')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO colors VALUES (2, 'Blue')")
+        .await
+        .ok();
 
-    client.execute("INSERT INTO sizes VALUES (1, 'Small')").await.ok();
-    client.execute("INSERT INTO sizes VALUES (2, 'Medium')").await.ok();
-    client.execute("INSERT INTO sizes VALUES (3, 'Large')").await.ok();
+    client
+        .execute("INSERT INTO sizes VALUES (1, 'Small')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sizes VALUES (2, 'Medium')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sizes VALUES (3, 'Large')")
+        .await
+        .ok();
 
     // CROSS JOIN - cartesian product: 2 colors * 3 sizes = 6 rows
-    let result = client.execute(
-        "SELECT colors.name, sizes.name FROM colors CROSS JOIN sizes"
-    ).await;
+    let result = client
+        .execute("SELECT colors.name, sizes.name FROM colors CROSS JOIN sizes")
+        .await;
     assert!(result.is_ok(), "CROSS JOIN failed: {:?}", result);
     let query_result = result.unwrap();
-    assert_eq!(query_result.row_count(), 6, "CROSS JOIN should return 6 rows (2 * 3)");
+    assert_eq!(
+        query_result.row_count(),
+        6,
+        "CROSS JOIN should return 6 rows (2 * 3)"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE colors").await;
@@ -591,20 +797,42 @@ async fn test_full_outer_join() {
     };
 
     // Setup tables
-    let result = client.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)").await;
+    let result = client
+        .execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)")
+        .await;
     assert!(result.is_ok(), "CREATE departments failed: {:?}", result);
 
-    let result = client.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)").await;
+    let result = client
+        .execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT)")
+        .await;
     assert!(result.is_ok(), "CREATE employees failed: {:?}", result);
 
     // Insert data
-    client.execute("INSERT INTO departments VALUES (1, 'Engineering')").await.ok();
-    client.execute("INSERT INTO departments VALUES (2, 'Sales')").await.ok();
-    client.execute("INSERT INTO departments VALUES (3, 'Marketing')").await.ok(); // No employees
+    client
+        .execute("INSERT INTO departments VALUES (1, 'Engineering')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO departments VALUES (2, 'Sales')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO departments VALUES (3, 'Marketing')")
+        .await
+        .ok(); // No employees
 
-    client.execute("INSERT INTO employees VALUES (1, 'Alice', 1)").await.ok();
-    client.execute("INSERT INTO employees VALUES (2, 'Bob', 2)").await.ok();
-    client.execute("INSERT INTO employees VALUES (3, 'Charlie', 99)").await.ok(); // No matching dept
+    client
+        .execute("INSERT INTO employees VALUES (1, 'Alice', 1)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (2, 'Bob', 2)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO employees VALUES (3, 'Charlie', 99)")
+        .await
+        .ok(); // No matching dept
 
     // FULL OUTER JOIN - should return all rows from both tables
     let result = client.execute(
@@ -613,7 +841,11 @@ async fn test_full_outer_join() {
     assert!(result.is_ok(), "FULL OUTER JOIN failed: {:?}", result);
     let query_result = result.unwrap();
     // Alice (dept 1), Bob (dept 2), Charlie (NULL dept), Marketing (NULL employee) = 4 rows
-    assert_eq!(query_result.row_count(), 4, "FULL OUTER JOIN should return 4 rows");
+    assert_eq!(
+        query_result.row_count(),
+        4,
+        "FULL OUTER JOIN should return 4 rows"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE employees").await;
@@ -636,22 +868,45 @@ async fn test_group_by_count() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT, amount INT)").await;
+    let result = client
+        .execute("CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT, amount INT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert test data
-    client.execute("INSERT INTO orders VALUES (1, 'Alice', 100)").await.ok();
-    client.execute("INSERT INTO orders VALUES (2, 'Alice', 200)").await.ok();
-    client.execute("INSERT INTO orders VALUES (3, 'Bob', 150)").await.ok();
-    client.execute("INSERT INTO orders VALUES (4, 'Alice', 50)").await.ok();
-    client.execute("INSERT INTO orders VALUES (5, 'Charlie', 300)").await.ok();
+    client
+        .execute("INSERT INTO orders VALUES (1, 'Alice', 100)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (2, 'Alice', 200)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (3, 'Bob', 150)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (4, 'Alice', 50)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (5, 'Charlie', 300)")
+        .await
+        .ok();
 
     // GROUP BY with COUNT
-    let result = client.execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer").await;
+    let result = client
+        .execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer")
+        .await;
     assert!(result.is_ok(), "GROUP BY COUNT failed: {:?}", result);
     let query_result = result.unwrap();
     // 3 distinct customers: Alice (3), Bob (1), Charlie (1)
-    assert_eq!(query_result.row_count(), 3, "GROUP BY should return 3 groups");
+    assert_eq!(
+        query_result.row_count(),
+        3,
+        "GROUP BY should return 3 groups"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE orders").await;
@@ -669,21 +924,41 @@ async fn test_group_by_sum() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE sales (id INT PRIMARY KEY, product TEXT, amount INT)").await;
+    let result = client
+        .execute("CREATE TABLE sales (id INT PRIMARY KEY, product TEXT, amount INT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert test data
-    client.execute("INSERT INTO sales VALUES (1, 'Widget', 100)").await.ok();
-    client.execute("INSERT INTO sales VALUES (2, 'Widget', 200)").await.ok();
-    client.execute("INSERT INTO sales VALUES (3, 'Gadget', 150)").await.ok();
-    client.execute("INSERT INTO sales VALUES (4, 'Widget', 50)").await.ok();
+    client
+        .execute("INSERT INTO sales VALUES (1, 'Widget', 100)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sales VALUES (2, 'Widget', 200)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sales VALUES (3, 'Gadget', 150)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sales VALUES (4, 'Widget', 50)")
+        .await
+        .ok();
 
     // GROUP BY with SUM
-    let result = client.execute("SELECT product, SUM(amount) FROM sales GROUP BY product").await;
+    let result = client
+        .execute("SELECT product, SUM(amount) FROM sales GROUP BY product")
+        .await;
     assert!(result.is_ok(), "GROUP BY SUM failed: {:?}", result);
     let query_result = result.unwrap();
     // 2 distinct products: Widget (350), Gadget (150)
-    assert_eq!(query_result.row_count(), 2, "GROUP BY should return 2 groups");
+    assert_eq!(
+        query_result.row_count(),
+        2,
+        "GROUP BY should return 2 groups"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE sales").await;
@@ -701,22 +976,45 @@ async fn test_group_by_avg() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE scores (id INT PRIMARY KEY, team TEXT, score INT)").await;
+    let result = client
+        .execute("CREATE TABLE scores (id INT PRIMARY KEY, team TEXT, score INT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert test data
-    client.execute("INSERT INTO scores VALUES (1, 'Red', 10)").await.ok();
-    client.execute("INSERT INTO scores VALUES (2, 'Red', 20)").await.ok();
-    client.execute("INSERT INTO scores VALUES (3, 'Blue', 15)").await.ok();
-    client.execute("INSERT INTO scores VALUES (4, 'Red', 30)").await.ok();
-    client.execute("INSERT INTO scores VALUES (5, 'Blue', 25)").await.ok();
+    client
+        .execute("INSERT INTO scores VALUES (1, 'Red', 10)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO scores VALUES (2, 'Red', 20)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO scores VALUES (3, 'Blue', 15)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO scores VALUES (4, 'Red', 30)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO scores VALUES (5, 'Blue', 25)")
+        .await
+        .ok();
 
     // GROUP BY with AVG
-    let result = client.execute("SELECT team, AVG(score) FROM scores GROUP BY team").await;
+    let result = client
+        .execute("SELECT team, AVG(score) FROM scores GROUP BY team")
+        .await;
     assert!(result.is_ok(), "GROUP BY AVG failed: {:?}", result);
     let query_result = result.unwrap();
     // 2 teams: Red (avg 20), Blue (avg 20)
-    assert_eq!(query_result.row_count(), 2, "GROUP BY should return 2 groups");
+    assert_eq!(
+        query_result.row_count(),
+        2,
+        "GROUP BY should return 2 groups"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE scores").await;
@@ -734,27 +1032,56 @@ async fn test_group_by_min_max() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE prices (id INT PRIMARY KEY, category TEXT, price INT)").await;
+    let result = client
+        .execute("CREATE TABLE prices (id INT PRIMARY KEY, category TEXT, price INT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert test data
-    client.execute("INSERT INTO prices VALUES (1, 'Electronics', 500)").await.ok();
-    client.execute("INSERT INTO prices VALUES (2, 'Electronics', 300)").await.ok();
-    client.execute("INSERT INTO prices VALUES (3, 'Clothing', 50)").await.ok();
-    client.execute("INSERT INTO prices VALUES (4, 'Electronics', 800)").await.ok();
-    client.execute("INSERT INTO prices VALUES (5, 'Clothing', 100)").await.ok();
+    client
+        .execute("INSERT INTO prices VALUES (1, 'Electronics', 500)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO prices VALUES (2, 'Electronics', 300)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO prices VALUES (3, 'Clothing', 50)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO prices VALUES (4, 'Electronics', 800)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO prices VALUES (5, 'Clothing', 100)")
+        .await
+        .ok();
 
     // GROUP BY with MIN
-    let result = client.execute("SELECT category, MIN(price) FROM prices GROUP BY category").await;
+    let result = client
+        .execute("SELECT category, MIN(price) FROM prices GROUP BY category")
+        .await;
     assert!(result.is_ok(), "GROUP BY MIN failed: {:?}", result);
     let query_result = result.unwrap();
-    assert_eq!(query_result.row_count(), 2, "GROUP BY MIN should return 2 groups");
+    assert_eq!(
+        query_result.row_count(),
+        2,
+        "GROUP BY MIN should return 2 groups"
+    );
 
     // GROUP BY with MAX
-    let result = client.execute("SELECT category, MAX(price) FROM prices GROUP BY category").await;
+    let result = client
+        .execute("SELECT category, MAX(price) FROM prices GROUP BY category")
+        .await;
     assert!(result.is_ok(), "GROUP BY MAX failed: {:?}", result);
     let query_result = result.unwrap();
-    assert_eq!(query_result.row_count(), 2, "GROUP BY MAX should return 2 groups");
+    assert_eq!(
+        query_result.row_count(),
+        2,
+        "GROUP BY MAX should return 2 groups"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE prices").await;
@@ -772,15 +1099,32 @@ async fn test_count_star_no_group_by() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)").await;
+    let result = client
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert test data
-    client.execute("INSERT INTO items VALUES (1, 'A')").await.ok();
-    client.execute("INSERT INTO items VALUES (2, 'B')").await.ok();
-    client.execute("INSERT INTO items VALUES (3, 'C')").await.ok();
-    client.execute("INSERT INTO items VALUES (4, 'D')").await.ok();
-    client.execute("INSERT INTO items VALUES (5, 'E')").await.ok();
+    client
+        .execute("INSERT INTO items VALUES (1, 'A')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO items VALUES (2, 'B')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO items VALUES (3, 'C')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO items VALUES (4, 'D')")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO items VALUES (5, 'E')")
+        .await
+        .ok();
 
     // COUNT(*) without GROUP BY
     let result = client.execute("SELECT COUNT(*) FROM items").await;
@@ -805,22 +1149,45 @@ async fn test_having_clause() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE sales (id INT PRIMARY KEY, product TEXT, amount INT)").await;
+    let result = client
+        .execute("CREATE TABLE sales (id INT PRIMARY KEY, product TEXT, amount INT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert test data
-    client.execute("INSERT INTO sales VALUES (1, 'Widget', 100)").await.ok();
-    client.execute("INSERT INTO sales VALUES (2, 'Widget', 200)").await.ok();
-    client.execute("INSERT INTO sales VALUES (3, 'Gadget', 150)").await.ok();
-    client.execute("INSERT INTO sales VALUES (4, 'Widget', 50)").await.ok();
-    client.execute("INSERT INTO sales VALUES (5, 'Gadget', 50)").await.ok();
+    client
+        .execute("INSERT INTO sales VALUES (1, 'Widget', 100)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sales VALUES (2, 'Widget', 200)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sales VALUES (3, 'Gadget', 150)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sales VALUES (4, 'Widget', 50)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO sales VALUES (5, 'Gadget', 50)")
+        .await
+        .ok();
 
     // GROUP BY with HAVING - only products with total > 200
-    let result = client.execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 200").await;
+    let result = client
+        .execute("SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 200")
+        .await;
     assert!(result.is_ok(), "HAVING clause failed: {:?}", result);
     let query_result = result.unwrap();
     // Widget: 350, Gadget: 200 -> only Widget should be returned
-    assert_eq!(query_result.row_count(), 1, "HAVING should filter to 1 group");
+    assert_eq!(
+        query_result.row_count(),
+        1,
+        "HAVING should filter to 1 group"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE sales").await;
@@ -838,23 +1205,49 @@ async fn test_having_with_count() {
     };
 
     // Setup
-    let result = client.execute("CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT, amount INT)").await;
+    let result = client
+        .execute("CREATE TABLE orders (id INT PRIMARY KEY, customer TEXT, amount INT)")
+        .await;
     assert!(result.is_ok(), "CREATE TABLE failed: {:?}", result);
 
     // Insert test data - Alice: 3 orders, Bob: 1 order, Charlie: 2 orders
-    client.execute("INSERT INTO orders VALUES (1, 'Alice', 100)").await.ok();
-    client.execute("INSERT INTO orders VALUES (2, 'Bob', 200)").await.ok();
-    client.execute("INSERT INTO orders VALUES (3, 'Alice', 150)").await.ok();
-    client.execute("INSERT INTO orders VALUES (4, 'Charlie', 75)").await.ok();
-    client.execute("INSERT INTO orders VALUES (5, 'Alice', 50)").await.ok();
-    client.execute("INSERT INTO orders VALUES (6, 'Charlie', 125)").await.ok();
+    client
+        .execute("INSERT INTO orders VALUES (1, 'Alice', 100)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (2, 'Bob', 200)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (3, 'Alice', 150)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (4, 'Charlie', 75)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (5, 'Alice', 50)")
+        .await
+        .ok();
+    client
+        .execute("INSERT INTO orders VALUES (6, 'Charlie', 125)")
+        .await
+        .ok();
 
     // GROUP BY with HAVING COUNT(*) >= 2
-    let result = client.execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) >= 2").await;
+    let result = client
+        .execute("SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) >= 2")
+        .await;
     assert!(result.is_ok(), "HAVING COUNT failed: {:?}", result);
     let query_result = result.unwrap();
     // Alice: 3, Charlie: 2 -> 2 groups should be returned (Bob filtered out)
-    assert_eq!(query_result.row_count(), 2, "HAVING should filter to 2 groups");
+    assert_eq!(
+        query_result.row_count(),
+        2,
+        "HAVING should filter to 2 groups"
+    );
 
     // Cleanup
     let _ = client.execute("DROP TABLE orders").await;
