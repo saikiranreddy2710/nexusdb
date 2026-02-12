@@ -18,6 +18,7 @@ mod aligned;
 mod arena;
 mod numa;
 mod pool;
+pub mod simd;
 
 pub use aligned::{
     allocate_aligned, AlignedBuffer, AlignedVec, CacheLineAligned, CACHE_LINE_SIZE, IO_ALIGNMENT,
@@ -26,3 +27,4 @@ pub use aligned::{
 pub use arena::{Arena, ArenaChunk, ScopedArena};
 pub use numa::{current_numa_node, numa_available, NumaAllocator, NumaNode, NumaStats};
 pub use pool::{MemoryPool, PooledBuffer, ThreadLocalPoolCache};
+pub use simd::{fast_crc32, simd_bloom_probe, simd_compare, simd_equal, simd_zero};
