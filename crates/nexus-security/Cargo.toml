@@ -1,0 +1,45 @@
+[package]
+name = "nexus-security"
+description = "Zero Trust security layer for NexusDB: TLS, authentication, authorization, encryption, audit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Cryptography
+ring = "0.17"
+base64 = "0.22"
+
+# Password hashing
+argon2 = "0.5"
+
+# JWT tokens
+jsonwebtoken = "9"
+
+# Random
+rand = { workspace = true }
+
+# CRC for checksums
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
