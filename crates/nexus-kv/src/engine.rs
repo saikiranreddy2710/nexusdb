@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::cache::table_cache::TableCache;
 use crate::compaction::leveled::LeveledCompaction;
 use crate::compaction::CompactionStrategy;
 use crate::config::LsmConfig;
@@ -59,6 +60,8 @@ pub struct LsmEngine {
     versions: Arc<VersionSet>,
     /// Compaction strategy.
     compaction_strategy: Arc<dyn CompactionStrategy>,
+    /// Cache of open SSTableReader handles (avoids re-opening files).
+    table_cache: Arc<TableCache>,
 
     /// Next memtable ID.
     next_memtable_id: AtomicU64,
@@ -99,6 +102,9 @@ impl LsmEngine {
         let compaction_strategy =
             Arc::new(LeveledCompaction::new((*config).clone()));
 
+        // Table cache: keep up to 1024 SSTable readers open
+        let table_cache = Arc::new(TableCache::new(data_dir.join("sst"), 1024));
+
         let initial_memtable = Arc::new(MemTable::new(
             1,
             config.memtable_size,
@@ -119,6 +125,7 @@ impl LsmEngine {
             immutable_memtables: RwLock::new(VecDeque::new()),
             versions,
             compaction_strategy,
+            table_cache,
             next_memtable_id: AtomicU64::new(2),
             is_running: AtomicBool::new(true),
             write_mutex: Mutex::new(()),
@@ -204,27 +211,27 @@ impl LsmEngine {
             }
         }
 
-        // 3. Check SSTables
+        // 3. Check SSTables via table cache (file bytes cached in memory)
         let version = self.versions.current();
         let candidates = version.files_for_key(key);
 
         for (_level, file_info) in candidates {
-            let file_path = self.sst_path(file_info.id);
-            if !file_path.exists() {
-                continue;
-            }
-            let file = fs::File::open(&file_path)?;
-            let mut reader = SSTableReader::open(file, file_path)?;
+            // Table cache provides in-memory file data (avoids disk I/O on hit).
+            // We create a lightweight reader each time (parses footer/index/bloom
+            // from memory in microseconds).
+            let mut reader = match self.table_cache.open_reader(file_info.id) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
 
             if let Some(raw_value) = reader.get(key)? {
-                // Decode the type prefix: 0x01 = Put, 0x00 = Delete
                 if raw_value.is_empty() {
-                    continue; // Malformed entry, skip
+                    continue;
                 }
                 match raw_value[0] {
                     0x00 => return Ok(None), // Deletion tombstone
                     0x01 => return Ok(Some(Bytes::copy_from_slice(&raw_value[1..]))),
-                    _ => continue, // Unknown type, skip
+                    _ => continue,
                 }
             }
         }
@@ -632,8 +639,9 @@ impl LsmEngine {
 
         self.versions.apply_edit(&edit)?;
 
-        // Delete old SSTable files (log failures but don't abort compaction)
+        // Evict deleted files from table cache, then delete from disk
         for file_info in job.input_files.iter().chain(job.output_files.iter()) {
+            self.table_cache.evict(file_info.id);
             let path = self.sst_path(file_info.id);
             if path.exists() {
                 if let Err(e) = fs::remove_file(&path) {

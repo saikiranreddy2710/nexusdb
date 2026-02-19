@@ -36,3 +36,4 @@ lz4_flex = { version = "0.11", optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rand = { workspace = true }
+criterion = { workspace = true }

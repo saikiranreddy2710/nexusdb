@@ -44,6 +44,7 @@
 //! - **Manifest**: Version tracking for atomic state transitions
 //! - **Iterator**: Merge iterator across all levels for range scans
 
+pub mod cache;
 pub mod compaction;
 pub mod config;
 pub mod engine;
@@ -53,6 +54,7 @@ pub mod manifest;
 pub mod memtable;
 pub mod sstable;
 
+pub use cache::{BlockCache, TableCache};
 pub use config::{CompactionStrategy, CompressionType, LsmConfig};
 pub use engine::LsmEngine;
 pub use error::{KvError, KvResult};
