@@ -1,13 +1,18 @@
 //! High-performance caching utilities for NexusDB.
 //!
-//! This crate provides various caching implementations optimized for
-//! database workloads:
+//! This crate provides caching implementations from basic to research-grade:
 //!
-//! - **LRU Cache**: Classic Least Recently Used cache with O(1) operations
-//! - **LRU-K Cache**: Advanced eviction based on K-th recent access
-//! - **ARC Cache**: Adaptive Replacement Cache that balances recency and frequency
-//! - **Query Plan Cache**: Cache for parsed and optimized query plans
-//! - **Bloom Filter**: Probabilistic data structure for fast negative lookups
+//! - **LRU Cache**: Classic Least Recently Used with O(1) operations
+//! - **LRU-K Cache**: Eviction based on K-th recent access (scan-resistant)
+//! - **ARC Cache**: Adaptive Replacement Cache (recency + frequency)
+//! - **W-TinyLFU Cache**: Best-in-class eviction (Caffeine-style)
+//! - **Tiered Cache**: Multi-tier hot/warm/cold with automatic promotion
+//! - **Query Plan Cache**: Compiled query plan reuse
+//! - **Result Cache**: Query result caching with table invalidation
+//! - **Semantic Cache**: AI agent query normalization + fingerprinting
+//! - **Predictive Prefetch**: Markov chain access pattern prediction
+//! - **LLM KV Cache**: Tensor-aware cache for RAG/LLM inference
+//! - **Bloom Filter**: Probabilistic fast negative lookups
 //!
 //! # Example
 //!
@@ -22,21 +27,31 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
-pub mod lru;
-pub mod lru_k;
 pub mod arc;
 pub mod bloom;
+pub mod kv_cache;
+pub mod lru;
+pub mod lru_k;
 pub mod plan_cache;
+pub mod prefetch;
 pub mod result_cache;
+pub mod semantic;
 pub mod stats;
+pub mod tiered;
+pub mod w_tinylfu;
 
-pub use lru::LruCache;
-pub use lru_k::LruKCache;
 pub use arc::ArcCache;
 pub use bloom::BloomFilter;
+pub use kv_cache::LlmKvCache;
+pub use lru::LruCache;
+pub use lru_k::LruKCache;
 pub use plan_cache::PlanCache;
+pub use prefetch::MarkovPrefetcher;
 pub use result_cache::ResultCache;
+pub use semantic::{normalize_sql, structural_fingerprint, SemanticKey};
 pub use stats::CacheStats;
+pub use tiered::TieredCache;
+pub use w_tinylfu::WTinyLfuCache;
 
 /// Default capacity for caches when not specified.
 pub const DEFAULT_CAPACITY: usize = 1024;

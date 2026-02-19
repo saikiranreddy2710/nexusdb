@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_cache::plan_cache::{PlanCache, PlanCacheConfig};
+use nexus_cache::result_cache::{ResultCache, ResultCacheConfig, ResultCacheKey};
 use nexus_common::types::TxnId;
 use nexus_mvcc::IsolationLevel;
 use nexus_sql::executor::{Row, Value};
@@ -103,6 +104,9 @@ pub struct Session {
     statement_count: u64,
     /// Query plan cache for prepared statements and repeated queries.
     plan_cache: PlanCache<PhysicalPlan>,
+    /// Query result cache — caches SELECT results with table dependency tracking.
+    /// Invalidated automatically on INSERT/UPDATE/DELETE/DDL.
+    result_cache: ResultCache<ExecuteResult>,
 }
 
 impl Session {
@@ -118,6 +122,7 @@ impl Session {
             created_at: Instant::now(),
             statement_count: 0,
             plan_cache: PlanCache::new(PlanCacheConfig::with_capacity(100)),
+            result_cache: ResultCache::new(ResultCacheConfig::default()),
         }
     }
 
@@ -263,20 +268,43 @@ impl Session {
                 Ok(StatementResult::transaction("ROLLBACK"))
             }
 
-            // DDL - invalidate plan cache when schema changes
+            // DDL - invalidate both plan and result caches when schema changes
             Statement::CreateTable(create) => {
-                self.plan_cache.clear(); // Invalidate all plans on DDL
+                self.plan_cache.clear();
+                self.result_cache.clear();
                 self.execute_create_table(create)
             }
             Statement::DropTable(drop) => {
-                self.plan_cache.clear(); // Invalidate all plans on DDL
+                self.plan_cache.clear();
+                self.result_cache.clear();
                 self.execute_drop_table(drop)
             }
 
-            // DML
-            Statement::Insert(insert) => self.execute_insert(insert),
-            Statement::Update(update) => self.execute_update(update),
-            Statement::Delete(delete) => self.execute_delete(delete),
+            // DML - invalidate result cache for affected tables
+            Statement::Insert(insert) => {
+                let table = insert.table.table.clone();
+                let result = self.execute_insert(insert);
+                if result.is_ok() {
+                    self.result_cache.invalidate_table(&table);
+                }
+                result
+            }
+            Statement::Update(update) => {
+                let table = update.table.table.clone();
+                let result = self.execute_update(update);
+                if result.is_ok() {
+                    self.result_cache.invalidate_table(&table);
+                }
+                result
+            }
+            Statement::Delete(delete) => {
+                let table = delete.table.table.clone();
+                let result = self.execute_delete(delete);
+                if result.is_ok() {
+                    self.result_cache.invalidate_table(&table);
+                }
+                result
+            }
 
             // Query - use plan cache
             Statement::Select(_) => self.execute_query(statement, sql, start),
@@ -530,15 +558,22 @@ impl Session {
 
     /// Executes a SELECT query.
     ///
-    /// Uses plan caching to avoid repeated parsing, planning, and optimization
-    /// for the same SQL queries.
+    /// Uses two levels of caching:
+    /// 1. Result cache: returns cached results for identical queries (fastest)
+    /// 2. Plan cache: reuses compiled plans for repeated queries
     fn execute_query(
         &self,
         statement: &Statement,
         sql: &str,
         start: Instant,
     ) -> DatabaseResult<StatementResult> {
-        // Try to get cached physical plan
+        // Level 1: Check result cache (returns full result without execution)
+        let cache_key = ResultCacheKey::from_sql(sql);
+        if let Some(cached_result) = self.result_cache.get(&cache_key) {
+            return Ok(StatementResult::Query((*cached_result).clone()));
+        }
+
+        // Level 2: Try to get cached physical plan
         let physical_plan = if let Some(cached_plan) = self.plan_cache.get(sql) {
             // Cache hit - use the cached plan
             (*cached_plan).clone()
@@ -594,6 +629,12 @@ impl Session {
 
         let elapsed = start.elapsed();
         let execute_result = ExecuteResult::from_batches(result.schema, result.batches, elapsed);
+
+        // Cache the result with table dependencies for automatic invalidation.
+        // Extract table names from the query's table registrations.
+        let tables: Vec<String> = self.storage.list_tables();
+        self.result_cache
+            .insert(cache_key, execute_result.clone(), tables);
 
         Ok(StatementResult::Query(execute_result))
     }
