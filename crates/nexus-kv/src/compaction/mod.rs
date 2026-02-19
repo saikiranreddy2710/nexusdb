@@ -15,6 +15,7 @@
 //!   SSTable with the most overlap with the next level and merge them.
 
 pub mod leveled;
+pub mod scheduler;
 
 use crate::sstable::SSTableInfo;
 

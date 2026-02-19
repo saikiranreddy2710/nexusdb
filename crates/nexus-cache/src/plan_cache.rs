@@ -157,40 +157,32 @@ impl<P: Clone> PlanCache<P> {
         self.cache.write().clear();
     }
 
-    /// Invalidates plans that match a predicate.
+    /// Invalidates plans whose SQL key matches the predicate.
     ///
-    /// Useful when a table schema changes and related plans need to be
-    /// invalidated.
-    ///
-    /// Note: Due to LruCache API limitations, this currently clears the entire
-    /// cache if any key matches the predicate. A future improvement would be
-    /// to add iteration support to LruCache for selective invalidation.
+    /// The predicate receives the normalized SQL string for each cached plan.
+    /// Plans where `predicate(sql)` returns `true` are removed.
     pub fn invalidate_where<F>(&self, predicate: F)
     where
         F: Fn(&str) -> bool,
     {
-        // For now, just clear if the predicate matches any pattern
-        // A more sophisticated implementation would iterate and selectively remove
         let mut cache = self.cache.write();
+        let keys_to_remove: Vec<String> = cache
+            .keys()
+            .into_iter()
+            .filter(|k| predicate(k))
+            .collect();
 
-        // Since we can't iterate over the LruCache, we use a simple heuristic:
-        // If the predicate would match an empty string (catch-all), clear everything
-        if predicate("") {
-            cache.clear();
+        for key in keys_to_remove {
+            cache.remove(&key);
         }
-        // Otherwise, we'd need to track keys separately or add iteration to LruCache
     }
 
-    /// Invalidates all plans that reference the given table.
+    /// Invalidates all plans whose SQL references the given table name.
     ///
-    /// Note: Due to LruCache API limitations (no key iteration support), this
-    /// currently clears the entire cache. A future improvement would add key
-    /// tracking or iteration support for selective invalidation.
-    pub fn invalidate_table(&self, _table_name: &str) {
-        // Since LruCache doesn't support iteration over keys, we cannot
-        // selectively remove entries matching the table name. Clear the
-        // entire cache as a safe fallback.
-        self.cache.write().clear();
+    /// Uses case-insensitive substring matching on the normalized SQL.
+    pub fn invalidate_table(&self, table_name: &str) {
+        let table_lower = table_name.to_lowercase();
+        self.invalidate_where(|sql| sql.contains(&table_lower));
     }
 
     /// Returns the number of cached plans.

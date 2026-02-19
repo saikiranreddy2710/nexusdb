@@ -34,6 +34,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::table_cache::TableCache;
 use crate::compaction::leveled::LeveledCompaction;
+use crate::compaction::scheduler::{CompactionCallback, CompactionScheduler};
 use crate::compaction::CompactionStrategy;
 use crate::config::LsmConfig;
 use crate::error::{KvError, KvResult};
@@ -62,6 +63,8 @@ pub struct LsmEngine {
     compaction_strategy: Arc<dyn CompactionStrategy>,
     /// Cache of open SSTableReader handles (avoids re-opening files).
     table_cache: Arc<TableCache>,
+    /// Background compaction scheduler.
+    compaction_scheduler: Mutex<Option<CompactionScheduler>>,
 
     /// Next memtable ID.
     next_memtable_id: AtomicU64,
@@ -118,7 +121,7 @@ impl LsmEngine {
             "LSM engine opened"
         );
 
-        Ok(Self {
+        let engine = Self {
             config,
             data_dir,
             active_memtable: RwLock::new(initial_memtable),
@@ -126,10 +129,13 @@ impl LsmEngine {
             versions,
             compaction_strategy,
             table_cache,
+            compaction_scheduler: Mutex::new(None),
             next_memtable_id: AtomicU64::new(2),
             is_running: AtomicBool::new(true),
             write_mutex: Mutex::new(()),
-        })
+        };
+
+        Ok(engine)
     }
 
     /// Insert a key-value pair.
@@ -303,13 +309,19 @@ impl LsmEngine {
 
     /// Shut down the engine gracefully.
     ///
-    /// Returns an error if the final flush fails (potential data loss).
+    /// Stops background compaction, flushes remaining data, and returns
+    /// an error if the final flush fails (potential data loss).
     pub fn shutdown(&self) -> KvResult<()> {
         if !self.is_running.swap(false, Ordering::SeqCst) {
             return Ok(()); // Already shut down
         }
 
         info!("shutting down LSM engine");
+
+        // Stop background compaction first
+        if let Some(mut scheduler) = self.compaction_scheduler.lock().take() {
+            scheduler.shutdown();
+        }
 
         // Flush any remaining data — propagate errors to caller
         self.flush().map_err(|e| {
@@ -541,7 +553,31 @@ impl LsmEngine {
             "memtable flushed to L0"
         );
 
+        // Notify background compaction that there's a new L0 file
+        self.notify_compaction();
+
         Ok(())
+    }
+
+    /// Notify the background compaction scheduler that work may be available.
+    fn notify_compaction(&self) {
+        if let Some(ref scheduler) = *self.compaction_scheduler.lock() {
+            scheduler.notify();
+        }
+    }
+
+    /// Start the background compaction scheduler.
+    ///
+    /// Must be called after creating the engine with `open()`.
+    /// The engine itself is passed as the compaction callback via an `Arc`.
+    pub fn start_compaction(self: &Arc<Self>) {
+        let engine = self.clone();
+        let scheduler = CompactionScheduler::start(
+            engine,
+            std::time::Duration::from_secs(5),
+        );
+        *self.compaction_scheduler.lock() = Some(scheduler);
+        info!("background compaction scheduler started");
     }
 
     /// Execute a compaction job.
@@ -714,8 +750,23 @@ impl LsmEngine {
     }
 }
 
+/// Implement CompactionCallback so the engine can be used with the
+/// background compaction scheduler.
+impl CompactionCallback for LsmEngine {
+    fn try_compact(&self) -> Result<bool, String> {
+        if !self.is_running.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.maybe_compact().map_err(|e| e.to_string())
+    }
+}
+
 impl Drop for LsmEngine {
     fn drop(&mut self) {
+        // Stop compaction scheduler first
+        if let Some(mut scheduler) = self.compaction_scheduler.lock().take() {
+            scheduler.shutdown();
+        }
         if self.is_running.load(Ordering::Relaxed) {
             let _ = self.shutdown();
         }

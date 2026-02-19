@@ -280,20 +280,41 @@ impl<R: Clone> ResultCache<R> {
         self.cache.read().stats().clone()
     }
 
-    /// Removes stale entries (expired based on TTL).
+    /// Removes all entries that have exceeded their TTL.
     ///
-    /// Note: Due to LruCache API limitations, this is currently a no-op.
-    /// Expired entries are checked and removed lazily on get().
-    /// A production implementation would add iteration support to LruCache
-    /// for periodic background eviction.
+    /// Call this periodically (e.g., every 30 seconds) to prevent stale
+    /// entries from consuming memory. Also called lazily on `get()`.
     pub fn evict_expired(&self) {
-        // For now, this is a no-op since we check TTL on get()
-        // Expired entries are lazily evicted when accessed
-        // A future improvement would be to add iteration support to LruCache
-        // for periodic background scanning and eviction
-        //
-        // Skip if TTL is disabled (default_ttl_secs == 0)
-        let _ = self.config.default_ttl_secs;
+        if self.config.default_ttl_secs == 0 {
+            return; // TTL disabled
+        }
+
+        let ttl = self.config.default_ttl_secs;
+        let mut cache = self.cache.write();
+
+        // Collect expired keys using LruCache::keys() iteration
+        let expired_keys: Vec<ResultCacheKey> = cache
+            .keys()
+            .into_iter()
+            .filter(|key| {
+                cache.contains(key)
+                    && cache
+                        .get(key)
+                        .map(|entry| entry.age().as_secs() > ttl)
+                        .unwrap_or(false)
+            })
+            .collect();
+
+        for key in &expired_keys {
+            if let Some(entry) = cache.remove(key) {
+                let tables = entry.tables;
+                // Need to drop cache lock before modifying table_index
+                // to avoid deadlock. Collect tables and remove after.
+                drop(cache);
+                self.remove_from_table_index(key, &tables);
+                cache = self.cache.write();
+            }
+        }
     }
 
     /// Removes a key from the table index.

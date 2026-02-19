@@ -218,6 +218,52 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
         self.stats.reset();
     }
 
+    /// Returns a vector of all keys in the cache (most recently used first).
+    ///
+    /// This enables selective invalidation in higher-level caches like
+    /// PlanCache and ResultCache.
+    pub fn keys(&self) -> Vec<K> {
+        let mut keys = Vec::with_capacity(self.map.len());
+        let mut current = self.head;
+        while let Some(node_ptr) = current {
+            // SAFETY: node_ptr is valid because it's in our linked list
+            unsafe {
+                keys.push((*node_ptr.as_ptr()).key.clone());
+                current = (*node_ptr.as_ptr()).next;
+            }
+        }
+        keys
+    }
+
+    /// Removes all entries where the predicate returns `false`.
+    ///
+    /// Iterates all entries and removes those that don't satisfy the
+    /// predicate. The predicate receives `(&K, &V)` for each entry.
+    pub fn retain<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        let keys_to_remove: Vec<K> = {
+            let mut to_remove = Vec::new();
+            let mut current = self.head;
+            while let Some(node_ptr) = current {
+                // SAFETY: node_ptr is valid because it's in our linked list
+                unsafe {
+                    let node = &*node_ptr.as_ptr();
+                    if !predicate(&node.key, &node.value) {
+                        to_remove.push(node.key.clone());
+                    }
+                    current = node.next;
+                }
+            }
+            to_remove
+        };
+
+        for key in keys_to_remove {
+            self.remove(&key);
+        }
+    }
+
     /// Moves a node to the front of the list.
     fn move_to_front(&mut self, node_ptr: NonNull<Node<K, V>>) {
         // If already at front, nothing to do
