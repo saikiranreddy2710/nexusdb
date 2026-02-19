@@ -137,25 +137,25 @@ crates/
                           └──────────┬───────────┘
                                      │
               ┌──────────────────────▼──────────────────────┐
-              │                SQL Engine                    │
+              │                SQL Engine                   │
               │  Parser → Optimizer → Physical Planner      │
-              │                  → Executor                  │
+              │                  → Executor                 │
               └──────┬──────────────┬──────────────┬────────┘
                      │              │              │
-              ┌──────▼──────┐ ┌────▼────┐ ┌───────▼───────┐
-              │  Cache Layer │ │  Txn    │ │     Raft      │
-              │  Plan/Result │ │ Manager │ │   Consensus   │
-              │  W-TinyLFU   │ │ 2PL/SSI │ │  (distributed)│
-              └──────┬──────┘ └────┬────┘ └───────────────┘
+              ┌──────▼───── ─┐ ┌────▼────┐ ┌───────▼────── ─┐
+              │  Cache Layer │ │  Txn    │ │     Raft       │
+              │  Plan/Result │ │ Manager │ │   Consensus    │
+              │  W-TinyLFU   │ │ 2PL/SSI │ │  (distributed) │
+              └──────┬────── ┘ └────┬────┘ └────────────── ─┘
                      │             │
-              ┌──────▼─────────────▼─────────────┐
+              ┌──────▼─────────────▼───────────── ┐
               │         Storage Engines           │
               │  SageTree (B-tree) · LSM-KV       │
               │  Buffer Pool · Block/Table Cache  │
               └──────────────┬────────────────────┘
                              │
               ┌──────────────▼────────────────────┐
-              │           OS Layer                 │
+              │           OS Layer                │
               │  io_uring · NUMA · SIMD · WAL     │
               └───────────────────────────────────┘
 ```
