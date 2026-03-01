@@ -9,6 +9,11 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use nexus_server::database::Database;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::sync::Arc;
+
+fn db_memory() -> Arc<Database> {
+    Arc::new(Database::open_memory().expect("open"))
+}
 
 /// Benchmark full CRUD cycle.
 fn bench_crud_cycle(c: &mut Criterion) {
@@ -16,7 +21,7 @@ fn bench_crud_cycle(c: &mut Criterion) {
 
     group.bench_function("create_insert_select_drop", |b| {
         b.iter(|| {
-            let db = Database::open_memory().expect("Failed to create database");
+            let db = db_memory();
 
             // CREATE
             db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
@@ -62,7 +67,7 @@ fn bench_data_sizes(c: &mut Criterion) {
             size,
             |b, &size| {
                 b.iter(|| {
-                    let db = Database::open_memory().expect("Failed to create database");
+                    let db = db_memory();
                     db.execute("CREATE TABLE t (id INT PRIMARY KEY, data TEXT)")
                         .expect("CREATE failed");
 
@@ -89,8 +94,8 @@ fn bench_mixed_workload(c: &mut Criterion) {
     let mut group = c.benchmark_group("database/mixed_workload");
 
     // Setup: pre-populated database
-    fn setup_db(rows: usize) -> Database {
-        let db = Database::open_memory().expect("Failed to create database");
+    fn setup_db(rows: usize) -> Arc<Database> {
+        let db = db_memory();
         db.execute(
             "CREATE TABLE orders (id INT PRIMARY KEY, product TEXT, quantity INT, price INT)",
         )
@@ -167,7 +172,7 @@ fn bench_query_complexity(c: &mut Criterion) {
     let mut group = c.benchmark_group("database/query_complexity");
 
     // Setup database with test data
-    let db = Database::open_memory().expect("Failed to create database");
+    let db = db_memory();
     db.execute(
         "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, category INT, price INT, stock INT)",
     )
@@ -236,7 +241,7 @@ fn bench_table_operations(c: &mut Criterion) {
     // CREATE TABLE
     group.bench_function("create_table", |b| {
         b.iter_with_setup(
-            || Database::open_memory().expect("Failed to create database"),
+            || db_memory(),
             |db| {
                 let result =
                     db.execute("CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b INT, c BOOLEAN)");
@@ -249,7 +254,7 @@ fn bench_table_operations(c: &mut Criterion) {
     group.bench_function("drop_table", |b| {
         b.iter_with_setup(
             || {
-                let db = Database::open_memory().expect("Failed to create database");
+                let db = db_memory();
                 db.execute("CREATE TABLE t (id INT PRIMARY KEY)")
                     .expect("CREATE failed");
                 db
@@ -263,7 +268,7 @@ fn bench_table_operations(c: &mut Criterion) {
 
     // CREATE IF NOT EXISTS (table exists)
     group.bench_function("create_if_not_exists", |b| {
-        let db = Database::open_memory().expect("Failed to create database");
+        let db = db_memory();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY)")
             .expect("CREATE failed");
 
@@ -282,7 +287,7 @@ fn bench_database_init(c: &mut Criterion) {
 
     group.bench_function("open_memory", |b| {
         b.iter(|| {
-            let db = Database::open_memory();
+            let db = Arc::new(Database::open_memory().expect("open"));
             black_box(db)
         });
     });

@@ -68,7 +68,7 @@ mod error;
 mod result;
 mod session;
 
-pub use engine::{Database, DatabaseConfig, DatabaseStats};
+pub use engine::{Database, DatabaseConfig, DatabaseStats, DEFAULT_DATABASE_NAME};
 pub use error::{DatabaseError, DatabaseResult};
 pub use result::{ExecuteResult, StatementResult};
 pub use session::{Session, SessionConfig, SessionId, SessionState};

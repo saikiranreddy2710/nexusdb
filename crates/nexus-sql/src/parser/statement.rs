@@ -44,6 +44,12 @@ pub enum Statement {
     ShowDatabases,
     /// DESCRIBE/DESC table statement.
     DescribeTable(String),
+    /// CREATE DATABASE statement.
+    CreateDatabase { name: String, if_not_exists: bool },
+    /// DROP DATABASE statement.
+    DropDatabase { name: String, if_exists: bool },
+    /// USE database statement (switch current database).
+    UseDatabase(String),
 }
 
 impl Statement {
@@ -153,6 +159,32 @@ impl Statement {
                 }
             }
             sql_ast::Statement::ShowTables { .. } => Ok(Statement::ShowTables),
+            sql_ast::Statement::CreateDatabase {
+                db_name,
+                if_not_exists,
+                ..
+            } => {
+                let name = object_name_to_single_ident(&db_name)?;
+                Ok(Statement::CreateDatabase {
+                    name,
+                    if_not_exists,
+                })
+            }
+            sql_ast::Statement::Drop {
+                object_type: sql_ast::ObjectType::Schema,
+                if_exists,
+                names,
+                ..
+            } if names.len() == 1 => {
+                let name = object_name_to_single_ident(&names[0])?;
+                Ok(Statement::DropDatabase {
+                    name,
+                    if_exists,
+                })
+            }
+            sql_ast::Statement::Use { db_name } => {
+                Ok(Statement::UseDatabase(db_name.value.clone()))
+            }
             // Handle DESCRIBE table
             sql_ast::Statement::ExplainTable {
                 table_name,
@@ -198,6 +230,8 @@ impl Statement {
                 | Statement::AlterTable(_)
                 | Statement::CreateIndex(_)
                 | Statement::DropIndex(_)
+                | Statement::CreateDatabase { .. }
+                | Statement::DropDatabase { .. }
         )
     }
 
@@ -480,6 +514,14 @@ fn table_ref_from_object_name(name: &sql_ast::ObjectName) -> TableRef {
         2 => TableRef::with_schema(&parts[0], &parts[1]),
         _ => TableRef::new(name.to_string()),
     }
+}
+
+/// Converts an ObjectName to a single identifier string (e.g. for database name).
+fn object_name_to_single_ident(name: &sql_ast::ObjectName) -> ParseResult<String> {
+    name.0
+        .first()
+        .map(|i| i.value.clone())
+        .ok_or_else(|| ParseError::Syntax("expected database name".to_string()))
 }
 
 /// Common Table Expression (WITH clause).

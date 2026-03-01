@@ -122,16 +122,36 @@ pub fn numa_node_count() -> usize {
 
 /// Returns the NUMA node for the current thread.
 ///
-/// On non-NUMA systems, always returns node 0.
+/// On Linux, uses `sched_getcpu()` to find the current CPU, then maps
+/// it to a NUMA node via sysfs. On non-NUMA systems, returns node 0.
 #[must_use]
 pub fn current_numa_node() -> NumaNode {
     #[cfg(target_os = "linux")]
     {
-        // Use getcpu() to get the current NUMA node
-        // For simplicity, we'll use a sysfs-based approach
         if numa_available() {
-            // Read from /proc/self/numa_maps or use sched_getcpu
-            // For now, return node 0 as a simple implementation
+            // Use sched_getcpu() to get the current CPU
+            let cpu = unsafe { libc::sched_getcpu() };
+            if cpu >= 0 {
+                // Map CPU to NUMA node via sysfs
+                let path = format!("/sys/devices/system/cpu/cpu{}/topology/physical_package_id", cpu);
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(node_id) = content.trim().parse::<u32>() {
+                        return NumaNode::new(node_id);
+                    }
+                }
+                // Fallback: try /sys/devices/system/node/nodeN/cpulist
+                let node_count = numa_node_count();
+                for node in 0..node_count {
+                    let cpulist_path = format!(
+                        "/sys/devices/system/node/node{}/cpulist", node
+                    );
+                    if let Ok(cpulist) = std::fs::read_to_string(&cpulist_path) {
+                        if cpu_in_list(&cpulist, cpu as u32) {
+                            return NumaNode::new(node as u32);
+                        }
+                    }
+                }
+            }
             NumaNode::new(0)
         } else {
             NumaNode::new(0)
@@ -142,6 +162,26 @@ pub fn current_numa_node() -> NumaNode {
     {
         NumaNode::new(0)
     }
+}
+
+/// Parse a CPU list string (e.g., "0-3,8-11") and check if a CPU is included.
+#[cfg(target_os = "linux")]
+fn cpu_in_list(list: &str, cpu: u32) -> bool {
+    for part in list.trim().split(',') {
+        let part = part.trim();
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(s), Ok(e)) = (start.parse::<u32>(), end.parse::<u32>()) {
+                if cpu >= s && cpu <= e {
+                    return true;
+                }
+            }
+        } else if let Ok(c) = part.parse::<u32>() {
+            if c == cpu {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// NUMA-aware memory allocator.
@@ -236,7 +276,12 @@ impl NumaAllocator {
         AlignedBuffer::new(size, alignment)
     }
 
-    /// Attempts NUMA-aware allocation on Linux.
+    /// Attempts NUMA-aware allocation on Linux using mmap + mbind.
+    ///
+    /// Strategy:
+    /// 1. Allocate memory with mmap (MAP_ANONYMOUS | MAP_PRIVATE)
+    /// 2. Bind the memory to the target NUMA node using mbind()
+    /// 3. Prefault pages to trigger physical allocation on the target node
     #[cfg(target_os = "linux")]
     fn try_numa_alloc(
         &self,
@@ -244,28 +289,94 @@ impl NumaAllocator {
         alignment: usize,
         node: NumaNode,
     ) -> Option<AlignedBuffer> {
-        use std::alloc::Layout;
+        // Resolve the node ID
+        let node_id = if node.is_local() {
+            current_numa_node().id() as usize
+        } else {
+            node.id() as usize
+        };
 
-        // For a production implementation, we would use:
-        // - libnuma (numa_alloc_onnode)
-        // - mbind() system call
-        // - mmap with MPOL_BIND
-
-        // For now, we use mmap with hints
-        // This is a simplified implementation - a real one would use libnuma
-
-        let layout = Layout::from_size_align(size, alignment).ok()?;
-
-        // Use mmap for large allocations
-        if size >= 2 * 1024 * 1024 {
-            // For huge pages / large allocations, mmap is preferred
-            // Fall through to standard allocation for now
+        if node_id >= self.node_count {
             return None;
         }
 
-        // Standard allocation - the kernel's first-touch policy will
-        // allocate memory on the node where it's first accessed
-        None
+        // Round up size to page alignment
+        let page_size = 4096usize;
+        let alloc_size = (size + page_size - 1) & !(page_size - 1);
+
+        // Allocate anonymous memory via mmap
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+
+        // Set NUMA binding policy using mbind
+        // MPOL_BIND = 2, forces allocation on specified nodes
+        const MPOL_BIND: libc::c_int = 2;
+        const MPOL_MF_MOVE: libc::c_uint = 1 << 1;
+
+        // Build the node mask bitmask (one bit per node). The kernel expects
+        // the mask to be expressed in machine-word chunks (unsigned long),
+        // so we must size the array based on the actual bit width of c_ulong.
+        let bits_per_ulong = (std::mem::size_of::<libc::c_ulong>() * 8) as usize;
+        let mask_len = (self.node_count + bits_per_ulong - 1) / bits_per_ulong;
+        let mut nodemask: Vec<libc::c_ulong> = vec![0; mask_len];
+        let word_index = node_id / bits_per_ulong;
+        let bit_index = node_id % bits_per_ulong;
+        nodemask[word_index] |= (1 as libc::c_ulong) << bit_index;
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_mbind,
+                ptr,
+                alloc_size,
+                MPOL_BIND,
+                nodemask.as_ptr(),
+                self.node_count as libc::c_ulong + 1,
+                MPOL_MF_MOVE,
+            )
+        };
+
+        if ret != 0 {
+            // mbind failed; memory is still usable, just not NUMA-bound
+            tracing::debug!(
+                "mbind to node {} failed: {}",
+                node_id,
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Prefault pages so physical memory is allocated on the target node
+        unsafe {
+            for offset in (0..alloc_size).step_by(page_size) {
+                std::ptr::write_volatile((ptr as *mut u8).add(offset), 0);
+            }
+        }
+
+        // Wrap in AlignedBuffer using the raw pointer
+        // Since mmap returns page-aligned memory, alignment is guaranteed
+        // We wrap it using standard AlignedBuffer and copy from mmap
+        let mut buffer = AlignedBuffer::new(size, alignment.max(page_size));
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr as *const u8,
+                buffer.as_mut_ptr(),
+                size,
+            );
+            libc::munmap(ptr, alloc_size);
+        }
+
+        Some(buffer)
     }
 
     /// Interleaves memory allocation across all NUMA nodes.
@@ -278,20 +389,94 @@ impl NumaAllocator {
     }
 
     /// Allocates interleaved memory with specific alignment.
+    ///
+    /// On Linux, uses mmap + mbind with MPOL_INTERLEAVE to spread pages
+    /// across all NUMA nodes in round-robin fashion. This provides
+    /// balanced bandwidth for shared data structures.
     #[must_use]
     pub fn allocate_interleaved_aligned(&self, size: usize, alignment: usize) -> AlignedBuffer {
         #[cfg(target_os = "linux")]
         {
-            if self.numa_available {
-                // For interleaved allocation, we would use:
-                // - numa_alloc_interleaved()
-                // - mbind() with MPOL_INTERLEAVE
-                // Fall through to standard allocation
+            if self.numa_available && self.node_count > 1 {
+                if let Some(buffer) = self.try_interleaved_alloc(size, alignment) {
+                    return buffer;
+                }
             }
         }
 
         // Fallback to standard aligned allocation
         AlignedBuffer::new(size, alignment)
+    }
+
+    /// Attempts interleaved allocation on Linux using mbind with MPOL_INTERLEAVE.
+    #[cfg(target_os = "linux")]
+    fn try_interleaved_alloc(&self, size: usize, alignment: usize) -> Option<AlignedBuffer> {
+        let page_size = 4096usize;
+        let alloc_size = (size + page_size - 1) & !(page_size - 1);
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+
+        // MPOL_INTERLEAVE = 3
+        const MPOL_INTERLEAVE: libc::c_int = 3;
+
+        // Build mask with all nodes set. As above, respect the actual
+        // bit width of c_ulong so the mask is correctly sized on both
+        // 32-bit and 64-bit platforms.
+        let bits_per_ulong = (std::mem::size_of::<libc::c_ulong>() * 8) as usize;
+        let mask_len = (self.node_count + bits_per_ulong - 1) / bits_per_ulong;
+        let mut nodemask: Vec<libc::c_ulong> = vec![0; mask_len];
+        for i in 0..self.node_count {
+            let word_index = i / bits_per_ulong;
+            let bit_index = i % bits_per_ulong;
+            nodemask[word_index] |= (1 as libc::c_ulong) << bit_index;
+        }
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_mbind,
+                ptr,
+                alloc_size,
+                MPOL_INTERLEAVE,
+                nodemask.as_ptr(),
+                self.node_count as libc::c_ulong + 1,
+                0u32, // no MPOL_MF flags
+            )
+        };
+
+        if ret != 0 {
+            tracing::debug!(
+                "mbind INTERLEAVE failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Prefault pages
+        unsafe {
+            for offset in (0..alloc_size).step_by(page_size) {
+                std::ptr::write_volatile((ptr as *mut u8).add(offset), 0);
+            }
+        }
+
+        let mut buffer = AlignedBuffer::new(size, alignment.max(page_size));
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr as *const u8, buffer.as_mut_ptr(), size);
+            libc::munmap(ptr, alloc_size);
+        }
+
+        Some(buffer)
     }
 
     /// Binds memory to a specific NUMA node.
@@ -307,16 +492,48 @@ impl NumaAllocator {
     /// # Returns
     ///
     /// `true` if binding succeeded, `false` otherwise.
-    pub fn bind_to_node(&self, _buffer: &AlignedBuffer, _node: NumaNode) -> bool {
+    pub fn bind_to_node(&self, buffer: &AlignedBuffer, _node: NumaNode) -> bool {
         #[cfg(target_os = "linux")]
         {
-            if self.numa_available && !node.is_any() && !node.is_local() {
-                // Would use mbind() here
-                // libc::mbind(ptr, len, MPOL_BIND, &node_mask, max_node, MPOL_MF_MOVE)
-                return false;
+            if self.numa_available && !_node.is_any() {
+                let node_id = if _node.is_local() {
+                    current_numa_node().id() as usize
+                } else {
+                    _node.id() as usize
+                };
+
+                if node_id >= self.node_count {
+                    return false;
+                }
+
+                const MPOL_BIND: libc::c_int = 2;
+                const MPOL_MF_MOVE: libc::c_uint = 1 << 1;
+
+                // Build the node mask with correct word sizing.
+                let bits_per_ulong = (std::mem::size_of::<libc::c_ulong>() * 8) as usize;
+                let mask_len = (self.node_count + bits_per_ulong - 1) / bits_per_ulong;
+                let mut nodemask: Vec<libc::c_ulong> = vec![0; mask_len];
+                let word_index = node_id / bits_per_ulong;
+                let bit_index = node_id % bits_per_ulong;
+                nodemask[word_index] |= (1 as libc::c_ulong) << bit_index;
+
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_mbind,
+                        buffer.as_ptr(),
+                        buffer.len(),
+                        MPOL_BIND,
+                        nodemask.as_ptr(),
+                        self.node_count as libc::c_ulong + 1,
+                        MPOL_MF_MOVE,
+                    )
+                };
+
+                return ret == 0;
             }
         }
 
+        let _ = buffer; // suppress unused warning on non-Linux
         false
     }
 

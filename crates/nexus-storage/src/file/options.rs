@@ -177,6 +177,55 @@ impl OpenOptions {
         self.direct_io
     }
 
+    /// Returns true if create is enabled.
+    #[inline]
+    pub fn is_create(&self) -> bool {
+        self.create
+    }
+
+    /// Returns true if create_new is enabled.
+    #[inline]
+    pub fn is_create_new(&self) -> bool {
+        self.create_new
+    }
+
+    /// Returns true if truncate is enabled.
+    #[inline]
+    pub fn is_truncate(&self) -> bool {
+        self.truncate
+    }
+
+    /// Returns true if append is enabled.
+    #[inline]
+    pub fn is_append(&self) -> bool {
+        self.append
+    }
+
+    /// Returns true if sync is enabled.
+    #[inline]
+    pub fn is_sync(&self) -> bool {
+        self.sync
+    }
+
+    /// Returns true if dsync is enabled.
+    #[inline]
+    pub fn is_dsync(&self) -> bool {
+        self.dsync
+    }
+
+    /// Returns the preallocate size if set.
+    #[inline]
+    pub fn preallocate_size(&self) -> Option<u64> {
+        self.preallocate
+    }
+
+    /// Returns the mode if set.
+    #[inline]
+    #[cfg(unix)]
+    pub fn get_mode(&self) -> Option<u32> {
+        self.mode
+    }
+
     /// Converts to std::fs::OpenOptions.
     ///
     /// Note: This does not include direct I/O flags, which must

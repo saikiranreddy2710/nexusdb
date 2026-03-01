@@ -181,18 +181,21 @@ impl Command {
         r#"NexusDB CLI Commands
 ======================
 
+Backslash commands (all available):
+
 General:
   \q, \quit       Exit the CLI
-  \?, \help       Show this help
+  \?, \h, \help   Show this help
   \v, \version    Show version information
   \clear, \cls    Clear screen
 
 Connection:
   \c, \conninfo   Show connection information
-  \s, \status     Show server status
+  \s, \status     Show server status (uptime, connections, features)
 
 Schema:
-  \d [NAME]       Describe table or index
+  \d NAME         Describe table (columns, types, nullable, primary key)
+  \d              Show hint (use \dt or \d <name>)
   \dt, \tables    List all tables
   \l, \list       List all databases
 
@@ -203,10 +206,24 @@ Transaction:
 
 Display:
   \t, \timing     Toggle timing display
-  \f FORMAT       Set output format (table, json, csv, raw)
+  \f FORMAT       Set output format: table, json, csv, raw
 
 Files:
-  \i FILE         Execute commands from file
+  \i FILE         Execute SQL from file (one statement per line)
+
+SQL supported:
+  DDL: CREATE TABLE, DROP TABLE, DESCRIBE
+  DML: INSERT (VALUES), UPDATE, DELETE, SELECT
+  INSERT (working):
+    - VALUES       INSERT INTO t (a,b) VALUES (1,'x'), (2,'y');
+  INSERT (not yet supported):
+    - SELECT       INSERT INTO t SELECT * FROM other;
+    - DEFAULT      INSERT INTO t DEFAULT VALUES;
+  Other: SHOW TABLES, SHOW DATABASES, BEGIN, COMMIT, ROLLBACK
+
+Distributed:
+  Connect to any node (host:port). Use \s for server status.
+  Clustered mode: set enable_raft and raft_peers in server config file.
 
 Type SQL statements followed by a semicolon to execute them.
 "#

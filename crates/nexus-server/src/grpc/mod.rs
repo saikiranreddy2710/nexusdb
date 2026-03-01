@@ -17,7 +17,7 @@ use nexus_proto::proto::{
     Row, RowBatch, ServerInfoRequest, ServerInfoResponse, Value,
 };
 
-use crate::database::{Database, ExecuteResult, SessionId, StatementResult};
+use crate::database::{Database, ExecuteResult, SessionId, StatementResult, DEFAULT_DATABASE_NAME};
 
 /// NexusDB gRPC service implementation.
 pub struct NexusDbService {
@@ -43,8 +43,13 @@ impl NexusDbService {
         }
     }
 
-    /// Executes SQL using a specific transaction/session, or a temporary session if no transaction.
-    fn execute_with_txn(&self, sql: &str, transaction_id: Option<u64>) -> Result<StatementResult, crate::database::DatabaseError> {
+    /// Executes SQL using a specific transaction/session, or a temporary session on the given database.
+    fn execute_with_txn(
+        &self,
+        sql: &str,
+        transaction_id: Option<u64>,
+        database_name: &str,
+    ) -> Result<StatementResult, crate::database::DatabaseError> {
         if let Some(txn_id) = transaction_id {
             // Use the existing session for this transaction
             let sessions = self.transaction_sessions.read().unwrap();
@@ -56,9 +61,16 @@ impl NexusDbService {
             }
             // Transaction not found, fall through to temporary session
         }
-        
-        // Use a temporary session (autocommit)
-        self.db.execute(sql)
+
+        // Use a temporary session (autocommit) on the requested database
+        let session_id = self.db.create_session(database_name);
+        let result = {
+            let session_arc = self.db.get_session(session_id).unwrap();
+            let mut session = session_arc.write().unwrap();
+            session.execute(sql)
+        };
+        self.db.close_session(session_id);
+        result
     }
 
     /// Converts an ExecuteResult to a QueryResult proto.
@@ -214,9 +226,13 @@ impl NexusDb for NexusDbService {
     ) -> Result<Response<ExecuteResponse>, Status> {
         let req = request.into_inner();
         let start = Instant::now();
+        let database = req
+            .database
+            .as_deref()
+            .unwrap_or(DEFAULT_DATABASE_NAME);
 
-        // Execute the SQL using the transaction session if provided
-        match self.execute_with_txn(&req.sql, req.transaction_id) {
+        // Execute the SQL using the transaction session if provided, or temp session on database
+        match self.execute_with_txn(&req.sql, req.transaction_id, database) {
             Ok(result) => {
                 let elapsed = start.elapsed();
                 let stats = ExecutionStats {
@@ -259,9 +275,18 @@ impl NexusDb for NexusDbService {
         request: Request<ExecuteRequest>,
     ) -> Result<Response<Self::ExecuteStreamStream>, Status> {
         let req = request.into_inner();
+        let database = req.database.as_deref().unwrap_or(DEFAULT_DATABASE_NAME);
 
-        // Execute the query
-        let result = self.db.execute(&req.sql).map_err(|e| {
+        // Execute the query on the requested database
+        let session_id = self.db.create_session(database);
+        let result = {
+            let session_arc = self.db.get_session(session_id).unwrap();
+            let mut session = session_arc.write().unwrap();
+            session.execute(&req.sql)
+        };
+        self.db.close_session(session_id);
+
+        let result = result.map_err(|e| {
             Status::internal(format!("Query execution failed: {}", e))
         })?;
 
@@ -347,8 +372,8 @@ impl NexusDb for NexusDbService {
         &self,
         _request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
-        // Create a persistent session for this transaction
-        let session_id = self.db.create_session();
+        // Create a persistent session for this transaction (default database)
+        let session_id = self.db.create_session(DEFAULT_DATABASE_NAME);
         
         // Begin the transaction in this session
         if let Some(session_arc) = self.db.get_session(session_id) {
@@ -412,16 +437,27 @@ impl NexusDb for NexusDbService {
                             sessions.remove(&txn_id);
                         }
                         self.db.close_session(session_id);
-                        
+
                         Ok(Response::new(CommitResponse {
                             success: true,
                             error: None,
                         }))
                     }
-                    Err(e) => Ok(Response::new(CommitResponse {
-                        success: false,
-                        error: Some(e.to_string()),
-                    })),
+                    Err(e) => {
+                        // On commit failure, the session/transaction is no longer usable.
+                        // Clean it up to avoid leaking sessions.
+                        drop(session);
+                        {
+                            let mut sessions = self.transaction_sessions.write().unwrap();
+                            sessions.remove(&txn_id);
+                        }
+                        self.db.close_session(session_id);
+
+                        Ok(Response::new(CommitResponse {
+                            success: false,
+                            error: Some(e.to_string()),
+                        }))
+                    }
                 }
             } else {
                 Ok(Response::new(CommitResponse {
@@ -463,16 +499,26 @@ impl NexusDb for NexusDbService {
                             sessions.remove(&txn_id);
                         }
                         self.db.close_session(session_id);
-                        
+
                         Ok(Response::new(RollbackResponse {
                             success: true,
                             error: None,
                         }))
                     }
-                    Err(e) => Ok(Response::new(RollbackResponse {
-                        success: false,
-                        error: Some(e.to_string()),
-                    })),
+                    Err(e) => {
+                        // On rollback failure, also tear down the session to avoid leaks.
+                        drop(session);
+                        {
+                            let mut sessions = self.transaction_sessions.write().unwrap();
+                            sessions.remove(&txn_id);
+                        }
+                        self.db.close_session(session_id);
+
+                        Ok(Response::new(RollbackResponse {
+                            success: false,
+                            error: Some(e.to_string()),
+                        }))
+                    }
                 }
             } else {
                 Ok(Response::new(RollbackResponse {

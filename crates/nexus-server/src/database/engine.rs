@@ -79,13 +79,16 @@ pub struct DatabaseStats {
     pub uptime: Duration,
 }
 
+/// Default database name when none is specified.
+pub const DEFAULT_DATABASE_NAME: &str = "nexusdb";
+
 /// The main database engine.
 pub struct Database {
     /// Configuration.
     config: DatabaseConfig,
-    /// Storage engine.
-    storage: Arc<StorageEngine>,
-    /// Write-ahead log (if enabled).
+    /// Per-database storage engines. Key is database name.
+    databases: RwLock<HashMap<String, Arc<StorageEngine>>>,
+    /// Write-ahead log (if enabled). Used for default database when data_dir is set.
     wal: Option<Arc<Wal>>,
     /// Active sessions.
     sessions: RwLock<HashMap<SessionId, Arc<RwLock<Session>>>>,
@@ -145,9 +148,12 @@ impl Database {
             None
         };
 
+        let mut databases = HashMap::new();
+        databases.insert(DEFAULT_DATABASE_NAME.to_string(), storage);
+
         Ok(Self {
             config,
-            storage,
+            databases: RwLock::new(databases),
             wal,
             sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
@@ -223,9 +229,62 @@ impl Database {
         ))
     }
 
-    /// Returns the storage engine.
-    pub fn storage(&self) -> &Arc<StorageEngine> {
-        &self.storage
+    /// Returns the default database's storage engine (for backward compatibility).
+    pub fn storage(&self) -> Arc<StorageEngine> {
+        self.get_or_create_storage(DEFAULT_DATABASE_NAME)
+    }
+
+    /// Returns storage for the given database name, creating it if it does not exist.
+    pub fn get_or_create_storage(&self, name: &str) -> Arc<StorageEngine> {
+        let mut dbs = self.databases.write().unwrap();
+        if let Some(storage) = dbs.get(name) {
+            return Arc::clone(storage);
+        }
+        let storage = Arc::new(StorageEngine::new());
+        dbs.insert(name.to_string(), Arc::clone(&storage));
+        storage
+    }
+
+    /// Creates a new database. No-op if it already exists (unless if_not_exists is false).
+    pub fn create_database(&self, name: &str, if_not_exists: bool) -> DatabaseResult<()> {
+        let mut dbs = self.databases.write().unwrap();
+        if dbs.contains_key(name) {
+            return if if_not_exists {
+                Ok(())
+            } else {
+                Err(DatabaseError::ExecutionError(format!(
+                    "database \"{}\" already exists",
+                    name
+                )))
+            };
+        }
+        dbs.insert(name.to_string(), Arc::new(StorageEngine::new()));
+        Ok(())
+    }
+
+    /// Drops a database. Returns error if it does not exist (unless if_exists is true).
+    pub fn drop_database(&self, name: &str, if_exists: bool) -> DatabaseResult<()> {
+        if name == DEFAULT_DATABASE_NAME {
+            return Err(DatabaseError::ExecutionError(
+                "cannot drop the default database".to_string(),
+            ));
+        }
+        let mut dbs = self.databases.write().unwrap();
+        if dbs.remove(name).is_none() && !if_exists {
+            return Err(DatabaseError::ExecutionError(format!(
+                "database \"{}\" does not exist",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Lists all database names.
+    pub fn list_databases(&self) -> Vec<String> {
+        let dbs = self.databases.read().unwrap();
+        let mut names: Vec<String> = dbs.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Returns the WAL if enabled.
@@ -242,15 +301,20 @@ impl Database {
     // Session Management
     // =========================================================================
 
-    /// Creates a new session.
-    pub fn create_session(&self) -> SessionId {
-        self.create_session_with_config(self.config.session_config.clone())
+    /// Creates a new session attached to the given database name.
+    /// Uses default database name if not specified.
+    pub fn create_session(self: &Arc<Self>, database_name: &str) -> SessionId {
+        self.create_session_with_config(database_name, self.config.session_config.clone())
     }
 
     /// Creates a session with custom configuration.
-    pub fn create_session_with_config(&self, config: SessionConfig) -> SessionId {
+    pub fn create_session_with_config(
+        self: &Arc<Self>,
+        database_name: &str,
+        config: SessionConfig,
+    ) -> SessionId {
         let id = SessionId::new(self.next_session_id.fetch_add(1, Ordering::SeqCst));
-        let session = Session::new(id, self.storage.clone(), config);
+        let session = Session::new(id, self.clone(), database_name.to_string(), config);
 
         let mut sessions = self.sessions.write().unwrap();
         sessions.insert(id, Arc::new(RwLock::new(session)));
@@ -288,12 +352,12 @@ impl Database {
     // Quick Execute API
     // =========================================================================
 
-    /// Executes SQL using a temporary session.
+    /// Executes SQL using a temporary session on the default database.
     ///
     /// This is a convenience method for simple queries. For complex
     /// transactions, create a session explicitly.
-    pub fn execute(&self, sql: &str) -> DatabaseResult<StatementResult> {
-        let session_id = self.create_session();
+    pub fn execute(self: &Arc<Self>, sql: &str) -> DatabaseResult<StatementResult> {
+        let session_id = self.create_session(DEFAULT_DATABASE_NAME);
         let result = {
             let session_arc = self.get_session(session_id).unwrap();
             let mut session = session_arc.write().unwrap();
@@ -304,8 +368,8 @@ impl Database {
     }
 
     /// Executes multiple SQL statements using a temporary session.
-    pub fn execute_batch(&self, sql: &str) -> DatabaseResult<Vec<StatementResult>> {
-        let session_id = self.create_session();
+    pub fn execute_batch(self: &Arc<Self>, sql: &str) -> DatabaseResult<Vec<StatementResult>> {
+        let session_id = self.create_session(DEFAULT_DATABASE_NAME);
         let result = {
             let session_arc = self.get_session(session_id).unwrap();
             let mut session = session_arc.write().unwrap();
@@ -319,11 +383,11 @@ impl Database {
     ///
     /// If the closure returns an error, the transaction is rolled back.
     /// Otherwise, it is committed.
-    pub fn transaction<F, T>(&self, f: F) -> DatabaseResult<T>
+    pub fn transaction<F, T>(self: &Arc<Self>, f: F) -> DatabaseResult<T>
     where
         F: FnOnce(&mut Session) -> DatabaseResult<T>,
     {
-        let session_id = self.create_session();
+        let session_id = self.create_session(DEFAULT_DATABASE_NAME);
         let result = {
             let session_arc = self.get_session(session_id).unwrap();
             let mut session = session_arc.write().unwrap();
@@ -351,7 +415,7 @@ impl Database {
 
     /// Returns database statistics.
     pub fn stats(&self) -> DatabaseStats {
-        let storage_stats = self.storage.stats();
+        let storage_stats = self.storage().stats();
 
         DatabaseStats {
             active_sessions: self.active_session_count(),
@@ -374,7 +438,7 @@ impl Database {
 
     /// Consolidates all delta chains in storage.
     pub fn consolidate(&self) {
-        self.storage.consolidate_all();
+        self.storage().consolidate_all();
     }
 
     /// Closes the database.
@@ -400,7 +464,7 @@ impl Database {
         }
 
         // Consolidate storage
-        self.storage.consolidate_all();
+        self.storage().consolidate_all();
     }
 }
 
@@ -412,17 +476,20 @@ impl Drop for Database {
 
 /// A convenience wrapper for using a session within a database.
 #[allow(dead_code)]
-pub struct DatabaseSession<'a> {
-    db: &'a Database,
+pub struct DatabaseSession {
+    db: Arc<Database>,
     session_id: SessionId,
 }
 
 #[allow(dead_code)]
-impl<'a> DatabaseSession<'a> {
-    /// Creates a new database session.
-    pub fn new(db: &'a Database) -> Self {
-        let session_id = db.create_session();
-        Self { db, session_id }
+impl DatabaseSession {
+    /// Creates a new database session on the default database.
+    pub fn new(db: &Arc<Database>) -> Self {
+        let session_id = db.create_session(DEFAULT_DATABASE_NAME);
+        Self {
+            db: Arc::clone(db),
+            session_id,
+        }
     }
 
     /// Executes a SQL statement.
@@ -459,7 +526,7 @@ impl<'a> DatabaseSession<'a> {
     }
 }
 
-impl<'a> Drop for DatabaseSession<'a> {
+impl Drop for DatabaseSession {
     fn drop(&mut self) {
         self.db.close_session(self.session_id);
     }
@@ -479,7 +546,7 @@ mod tests {
 
     #[test]
     fn test_database_execute() {
-        let db = Database::open_memory().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
 
         // Create table
         db.execute("CREATE TABLE test (id INT PRIMARY KEY, value TEXT)")
@@ -503,9 +570,9 @@ mod tests {
 
     #[test]
     fn test_database_session() {
-        let db = Database::open_memory().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
 
-        let session_id = db.create_session();
+        let session_id = db.create_session(DEFAULT_DATABASE_NAME);
         assert_eq!(db.active_session_count(), 1);
 
         db.close_session(session_id);
@@ -514,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_database_session_wrapper() {
-        let db = Database::open_memory().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
 
         {
             let session = DatabaseSession::new(&db);
@@ -535,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_database_transaction() {
-        let db = Database::open_memory().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
 
         db.execute("CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
             .unwrap();
@@ -567,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_database_batch() {
-        let db = Database::open_memory().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
 
         let results = db
             .execute_batch(
@@ -585,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_database_stats() {
-        let db = Database::open_memory().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
 
         db.execute("CREATE TABLE test (id INT PRIMARY KEY)")
             .unwrap();
@@ -599,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_database_multiple_sessions() {
-        let db = Database::open_memory().unwrap();
+        let db = Arc::new(Database::open_memory().unwrap());
 
         db.execute("CREATE TABLE shared (id INT PRIMARY KEY, value INT)")
             .unwrap();

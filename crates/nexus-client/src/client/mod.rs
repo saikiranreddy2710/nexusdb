@@ -861,6 +861,7 @@ impl Client {
             transaction_id: None,
             max_rows: 0, // Unlimited
             timeout_ms: self.config.query_timeout.as_millis() as u32,
+            database: self.config.database.clone(),
         });
 
         let response = client

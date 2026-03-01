@@ -12,6 +12,10 @@ use nexus_sql::optimizer::{Optimizer, OptimizerConfig};
 use nexus_sql::parser::Parser;
 use std::sync::Arc;
 
+fn db_memory() -> Arc<Database> {
+    Arc::new(Database::open_memory().expect("open"))
+}
+
 /// Simple SELECT queries of varying complexity.
 fn simple_queries() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -123,8 +127,7 @@ fn bench_optimize(c: &mut Criterion) {
     let mut group = c.benchmark_group("sql/optimize");
 
     // We need a database to build logical plans
-    let db = Database::open_memory().expect("Failed to create database");
-    let db = Arc::new(db);
+    let db = db_memory();
 
     // Create a test table
     db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
@@ -163,8 +166,7 @@ fn bench_optimize(c: &mut Criterion) {
 fn bench_execute(c: &mut Criterion) {
     let mut group = c.benchmark_group("sql/execute");
 
-    let db = Database::open_memory().expect("Failed to create database");
-    let db = Arc::new(db);
+    let db = db_memory();
 
     // Create table and insert test data
     db.execute("CREATE TABLE bench (id INT PRIMARY KEY, name TEXT, value INT)")
@@ -226,7 +228,7 @@ fn bench_insert(c: &mut Criterion) {
     group.bench_function("single_insert", |b| {
         b.iter_with_setup(
             || {
-                let db = Database::open_memory().expect("Failed to create database");
+                let db = db_memory();
                 db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
                     .expect("Failed to create table");
                 (db, 0)
@@ -243,7 +245,7 @@ fn bench_insert(c: &mut Criterion) {
     for count in [100, 500, 1000].iter() {
         group.bench_with_input(BenchmarkId::new("batch", count), count, |b, &count| {
             b.iter(|| {
-                let db = Database::open_memory().expect("Failed to create database");
+                let db = db_memory();
                 db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
                     .expect("Failed to create table");
 
@@ -259,6 +261,140 @@ fn bench_insert(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark INSERT with different column datatypes (INT, BIGINT, TEXT, BOOLEAN, FLOAT).
+fn bench_insert_datatypes(c: &mut Criterion) {
+    use criterion::Throughput;
+
+    let mut group = c.benchmark_group("sql/insert_datatypes");
+    let row_count = 500u64;
+    group.sample_size(20);
+
+    // INT + TEXT (baseline)
+    group.bench_with_input(
+        BenchmarkId::new("int_text", row_count),
+        &row_count,
+        |b, &n| {
+            b.iter(|| {
+                let db = db_memory();
+                db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+                    .expect("create");
+                for i in 0..n as i64 {
+                    db.execute(&format!("INSERT INTO t VALUES ({}, 'row_{}')", i, i))
+                        .expect("insert");
+                }
+                black_box(n)
+            });
+        },
+    );
+    group.throughput(Throughput::Elements(row_count));
+
+    // INT + BIGINT + TEXT
+    group.bench_with_input(
+        BenchmarkId::new("int_bigint_text", row_count),
+        &row_count,
+        |b, &n| {
+            b.iter(|| {
+                let db = db_memory();
+                db.execute(
+                    "CREATE TABLE t (id INT PRIMARY KEY, big_id BIGINT, name TEXT)",
+                )
+                .expect("create");
+                for i in 0..n as i64 {
+                    db.execute(&format!(
+                        "INSERT INTO t VALUES ({}, {}, 'row_{}')",
+                        i,
+                        i * 1000,
+                        i
+                    ))
+                    .expect("insert");
+                }
+                black_box(n)
+            });
+        },
+    );
+    group.throughput(Throughput::Elements(row_count));
+
+    // INT + BOOLEAN + TEXT
+    group.bench_with_input(
+        BenchmarkId::new("int_bool_text", row_count),
+        &row_count,
+        |b, &n| {
+            b.iter(|| {
+                let db = db_memory();
+                db.execute(
+                    "CREATE TABLE t (id INT PRIMARY KEY, active BOOLEAN, name TEXT)",
+                )
+                .expect("create");
+                for i in 0..n as i64 {
+                    let active = i % 2 == 0;
+                    db.execute(&format!(
+                        "INSERT INTO t VALUES ({}, {}, 'row_{}')",
+                        i, active, i
+                    ))
+                    .expect("insert");
+                }
+                black_box(n)
+            });
+        },
+    );
+    group.throughput(Throughput::Elements(row_count));
+
+    // INT + FLOAT/DOUBLE + TEXT
+    group.bench_with_input(
+        BenchmarkId::new("int_float_text", row_count),
+        &row_count,
+        |b, &n| {
+            b.iter(|| {
+                let db = db_memory();
+                db.execute(
+                    "CREATE TABLE t (id INT PRIMARY KEY, score DOUBLE, name TEXT)",
+                )
+                .expect("create");
+                for i in 0..n as i64 {
+                    let score = (i as f64) * 1.5;
+                    db.execute(&format!(
+                        "INSERT INTO t VALUES ({}, {}, 'row_{}')",
+                        i, score, i
+                    ))
+                    .expect("insert");
+                }
+                black_box(n)
+            });
+        },
+    );
+    group.throughput(Throughput::Elements(row_count));
+
+    // Mixed: INT, BIGINT, BOOLEAN, DOUBLE, TEXT
+    group.bench_with_input(
+        BenchmarkId::new("mixed_all", row_count),
+        &row_count,
+        |b, &n| {
+            b.iter(|| {
+                let db = db_memory();
+                db.execute(
+                    "CREATE TABLE t (id INT PRIMARY KEY, big BIGINT, flag BOOLEAN, val DOUBLE, name TEXT)",
+                )
+                .expect("create");
+                for i in 0..n as i64 {
+                    db.execute(&format!(
+                        "INSERT INTO t VALUES ({}, {}, {}, {}, 'row_{}')",
+                        i,
+                        i * 1000,
+                        i % 2 == 0,
+                        (i as f64) * 0.5,
+                        i
+                    ))
+                    .expect("insert");
+                }
+                black_box(n)
+            });
+        },
+    );
+    group.throughput(Throughput::Elements(row_count));
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse,
@@ -266,5 +402,6 @@ criterion_group!(
     bench_optimize,
     bench_execute,
     bench_insert,
+    bench_insert_datatypes,
 );
 criterion_main!(benches);

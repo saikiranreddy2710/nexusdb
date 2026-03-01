@@ -49,6 +49,9 @@ message ExecuteRequest {
     
     // Query timeout in milliseconds (0 = use server default)
     uint32 timeout_ms = 5;
+    
+    // Database name to use (default: nexusdb). Enables multiple clients to different databases.
+    optional string database = 6;
 }
 
 message ExecuteResponse {

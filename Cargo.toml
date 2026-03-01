@@ -17,6 +17,7 @@ members = [
     "crates/nexus-test",
     "crates/nexus-bench",
     "crates/nexus-cache",
+    "crates/nexus-kv",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ nexus-server = { path = "crates/nexus-server" }
 nexus-client = { path = "crates/nexus-client" }
 nexus-proto = { path = "crates/nexus-proto" }
 nexus-cache = { path = "crates/nexus-cache" }
+nexus-kv = { path = "crates/nexus-kv" }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

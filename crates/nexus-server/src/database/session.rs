@@ -20,6 +20,7 @@ use nexus_sql::parser::{
 use nexus_sql::physical::{ExecutionContext, PhysicalPlan, PhysicalPlanner};
 use nexus_sql::storage::{StorageEngine, TableInfo};
 
+use super::engine::Database;
 use super::error::{DatabaseError, DatabaseResult};
 use super::result::{ExecuteResult, StatementResult};
 
@@ -93,8 +94,10 @@ pub struct Session {
     config: SessionConfig,
     /// Current transaction ID (if in transaction).
     current_txn: Option<TxnId>,
-    /// Storage engine.
-    storage: Arc<StorageEngine>,
+    /// Reference to the database engine (for multi-database).
+    database: Arc<Database>,
+    /// Current database name for this session.
+    current_database: String,
     /// Session variables.
     variables: HashMap<String, String>,
     /// When the session was created.
@@ -106,19 +109,40 @@ pub struct Session {
 }
 
 impl Session {
-    /// Creates a new session.
-    pub fn new(id: SessionId, storage: Arc<StorageEngine>, config: SessionConfig) -> Self {
+    /// Creates a new session attached to the given database.
+    pub fn new(
+        id: SessionId,
+        database: Arc<Database>,
+        current_database: String,
+        config: SessionConfig,
+    ) -> Self {
         Self {
             id,
             state: SessionState::Idle,
             config,
             current_txn: None,
-            storage,
+            database,
+            current_database,
             variables: HashMap::new(),
             created_at: Instant::now(),
             statement_count: 0,
             plan_cache: PlanCache::new(PlanCacheConfig::with_capacity(100)),
         }
+    }
+
+    /// Returns the storage engine for the current database.
+    fn storage(&self) -> Arc<StorageEngine> {
+        self.database.get_or_create_storage(&self.current_database)
+    }
+
+    /// Switches the session to the given database.
+    pub fn set_current_database(&mut self, name: &str) {
+        self.current_database = name.to_string();
+    }
+
+    /// Returns the current database name.
+    pub fn current_database(&self) -> &str {
+        &self.current_database
     }
 
     /// Returns the session ID.
@@ -141,9 +165,9 @@ impl Session {
         self.current_txn
     }
 
-    /// Returns the storage engine.
-    pub fn storage(&self) -> &Arc<StorageEngine> {
-        &self.storage
+    /// Returns the storage engine for the current database (for tests that need direct access).
+    pub fn storage_ref(&self) -> Arc<StorageEngine> {
+        self.storage()
     }
 
     /// Returns session uptime.
@@ -286,6 +310,20 @@ impl Session {
             Statement::ShowDatabases => self.execute_show_databases(),
             Statement::DescribeTable(table_name) => self.execute_describe_table(table_name),
 
+            // Multi-database
+            Statement::CreateDatabase { name, if_not_exists } => {
+                self.database.create_database(name, *if_not_exists)?;
+                Ok(StatementResult::ddl("CREATE DATABASE"))
+            }
+            Statement::DropDatabase { name, if_exists } => {
+                self.database.drop_database(name, *if_exists)?;
+                Ok(StatementResult::ddl("DROP DATABASE"))
+            }
+            Statement::UseDatabase(name) => {
+                self.set_current_database(name);
+                Ok(StatementResult::transaction("USE"))
+            }
+
             _ => Err(DatabaseError::NotImplemented(
                 "statement type not yet supported".to_string(),
             )),
@@ -300,7 +338,7 @@ impl Session {
         let name = &create.name.table;
 
         // Check if table exists
-        if self.storage.table_exists(name) {
+        if self.storage().table_exists(name) {
             if create.if_not_exists {
                 return Ok(StatementResult::ddl("CREATE TABLE"));
             }
@@ -344,7 +382,7 @@ impl Session {
             info = info.with_primary_key(primary_key);
         }
 
-        self.storage.create_table(info)?;
+        self.storage().create_table(info)?;
 
         Ok(StatementResult::ddl("CREATE TABLE"))
     }
@@ -356,7 +394,7 @@ impl Session {
     ) -> DatabaseResult<StatementResult> {
         for table_ref in &drop.names {
             let name = &table_ref.table;
-            if !self.storage.table_exists(name) {
+            if !self.storage().table_exists(name) {
                 if drop.if_exists {
                     continue;
                 }
@@ -364,7 +402,7 @@ impl Session {
                     nexus_sql::storage::StorageError::TableNotFound(name.clone()),
                 ));
             }
-            self.storage.drop_table(name)?;
+            self.storage().drop_table(name)?;
         }
         Ok(StatementResult::ddl("DROP TABLE"))
     }
@@ -375,7 +413,7 @@ impl Session {
         insert: &nexus_sql::parser::InsertStatement,
     ) -> DatabaseResult<StatementResult> {
         let table_name = &insert.table.table;
-        let table_info = self.storage.get_table_info(table_name).ok_or_else(|| {
+        let table_info = self.storage().get_table_info(table_name).ok_or_else(|| {
             DatabaseError::StorageError(nexus_sql::storage::StorageError::TableNotFound(
                 table_name.clone(),
             ))
@@ -429,7 +467,7 @@ impl Session {
             rows.push(Row::new(row_values));
         }
 
-        let count = self.storage.execute_insert(table_name, rows)?;
+        let count = self.storage().execute_insert(table_name, rows)?;
         Ok(StatementResult::Insert {
             rows_affected: count,
         })
@@ -441,14 +479,14 @@ impl Session {
         update: &nexus_sql::parser::UpdateStatement,
     ) -> DatabaseResult<StatementResult> {
         let table_name = &update.table.table;
-        let table_info = self.storage.get_table_info(table_name).ok_or_else(|| {
+        let table_info = self.storage().get_table_info(table_name).ok_or_else(|| {
             DatabaseError::StorageError(nexus_sql::storage::StorageError::TableNotFound(
                 table_name.clone(),
             ))
         })?;
 
         // Get all rows (we'll filter later)
-        let batches = self.storage.execute_scan(table_name)?;
+        let batches = self.storage().execute_scan(table_name)?;
         let all_rows: Vec<Row> = batches.iter().flat_map(|b| b.rows()).collect();
 
         let mut updated_count = 0u64;
@@ -471,7 +509,7 @@ impl Session {
             }
 
             // Update the row
-            if self.storage.execute_update(table_name, new_row)? {
+            if self.storage().execute_update(table_name, new_row)? {
                 updated_count += 1;
             }
         }
@@ -487,14 +525,14 @@ impl Session {
         delete: &nexus_sql::parser::DeleteStatement,
     ) -> DatabaseResult<StatementResult> {
         let table_name = &delete.table.table;
-        let table_info = self.storage.get_table_info(table_name).ok_or_else(|| {
+        let table_info = self.storage().get_table_info(table_name).ok_or_else(|| {
             DatabaseError::StorageError(nexus_sql::storage::StorageError::TableNotFound(
                 table_name.clone(),
             ))
         })?;
 
         // Get all rows
-        let batches = self.storage.execute_scan(table_name)?;
+        let batches = self.storage().execute_scan(table_name)?;
         let all_rows: Vec<Row> = batches.iter().flat_map(|b| b.rows()).collect();
 
         let pk_col_names = table_info.primary_key_columns();
@@ -518,7 +556,7 @@ impl Session {
                 .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
                 .collect();
 
-            if self.storage.execute_delete(table_name, &key_values)? {
+            if self.storage().execute_delete(table_name, &key_values)? {
                 deleted_count += 1;
             }
         }
@@ -547,8 +585,8 @@ impl Session {
 
             // Build a catalog from current storage
             let mut catalog = MemoryCatalog::new();
-            for table_name in self.storage.list_tables() {
-                if let Some(table_info) = self.storage.get_table_info(&table_name) {
+            for table_name in self.storage().list_tables() {
+                if let Some(table_info) = self.storage().get_table_info(&table_name) {
                     catalog.add_table(nexus_sql::logical::TableMeta::new(
                         table_name.clone(),
                         (*table_info.schema).clone(),
@@ -584,8 +622,8 @@ impl Session {
         let mut executor = nexus_sql::executor::QueryExecutor::new(ctx);
 
         // Register tables with data
-        for table_name in self.storage.list_tables() {
-            if let Ok(batches) = self.storage.execute_scan(&table_name) {
+        for table_name in self.storage().list_tables() {
+            if let Ok(batches) = self.storage().execute_scan(&table_name) {
                 executor.register_table(table_name, batches);
             }
         }
@@ -607,7 +645,7 @@ impl Session {
         use nexus_sql::logical::{Field, Schema};
         use nexus_sql::parser::DataType;
 
-        let table_names = self.storage.list_tables();
+        let table_names = self.storage().list_tables();
         let mut sorted_names = table_names;
         sorted_names.sort();
 
@@ -641,12 +679,16 @@ impl Session {
         use nexus_sql::logical::{Field, Schema};
         use nexus_sql::parser::DataType;
 
-        // Currently we only have a single default database
+        let names = self.database.list_databases();
         let schema = Arc::new(Schema::new(vec![
             Field::not_null("database_name", DataType::Text),
         ]));
 
-        let rows = vec![Row::new(vec![Value::String("nexusdb".to_string())])];
+        let rows: Vec<Row> = names
+            .into_iter()
+            .map(|name| Row::new(vec![Value::String(name)]))
+            .collect();
+        let total_rows = rows.len();
 
         let batch = nexus_sql::executor::RecordBatch::from_rows(schema.clone(), &rows)
             .map_err(|e| DatabaseError::ExecutionError(e))?;
@@ -654,7 +696,7 @@ impl Session {
         let result = ExecuteResult {
             schema,
             batches: vec![batch],
-            total_rows: 1,
+            total_rows,
             execution_time: std::time::Duration::from_millis(0),
         };
 
@@ -666,7 +708,7 @@ impl Session {
         use nexus_sql::logical::{Field, Schema};
         use nexus_sql::parser::DataType;
 
-        let table_info = self.storage.get_table_info(table_name).ok_or_else(|| {
+        let table_info = self.storage().get_table_info(table_name).ok_or_else(|| {
             DatabaseError::StorageError(nexus_sql::storage::StorageError::TableNotFound(
                 table_name.to_string(),
             ))
@@ -842,10 +884,16 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::engine::Database;
 
     fn create_session() -> Session {
-        let storage = Arc::new(StorageEngine::new());
-        Session::new(SessionId::new(1), storage, SessionConfig::default())
+        let db = Arc::new(Database::open_memory().expect("open"));
+        Session::new(
+            SessionId::new(1),
+            db,
+            "nexusdb".to_string(),
+            SessionConfig::default(),
+        )
     }
 
     #[test]
@@ -857,7 +905,7 @@ mod tests {
             .unwrap();
         assert!(matches!(result, StatementResult::Ddl { .. }));
 
-        assert!(session.storage.table_exists("users"));
+        assert!(session.storage_ref().table_exists("users"));
     }
 
     #[test]

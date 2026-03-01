@@ -1,0 +1,50 @@
+[package]
+name = "nexus-kv"
+description = "LSM-tree based Key-Value storage engine for NexusDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+compression = ["lz4_flex"]
+
+[dependencies]
+nexus-common = { workspace = true }
+nexus-cache = { path = "../nexus-cache" }
+
+# Core data types
+bytes = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+crossbeam-epoch = { workspace = true }
+crossbeam-utils = { workspace = true }
+
+# Checksums
+crc32fast = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Random number generation (skip list height)
+rand = { workspace = true }
+
+# Optional compression
+lz4_flex = { version = "0.11", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+
+# [[bench]]
+# name = "kv_bench"
+# harness = false

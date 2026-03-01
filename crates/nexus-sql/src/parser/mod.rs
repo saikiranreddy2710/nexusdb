@@ -275,6 +275,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_create_database() {
+        let sql = "CREATE DATABASE IF NOT EXISTS app1";
+        let stmt = Parser::parse_one(sql).unwrap();
+        match &stmt {
+            Statement::CreateDatabase { name, if_not_exists } => {
+                assert_eq!(name, "app1");
+                assert!(*if_not_exists);
+            }
+            _ => panic!("Expected CREATE DATABASE statement, got {:?}", stmt),
+        }
+    }
+
+    #[test]
     fn test_parse_empty_query() {
         let result = Parser::parse("");
         assert!(matches!(result, Err(ParseError::EmptyQuery)));
