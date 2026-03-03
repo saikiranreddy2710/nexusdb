@@ -578,24 +578,125 @@ pub struct GrpcServer {
     db: Arc<Database>,
     /// Server address.
     addr: std::net::SocketAddr,
+    /// TLS configuration (None = plaintext).
+    tls_config: Option<TlsConfig>,
+}
+
+/// TLS configuration for the gRPC server.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// Server certificate (PEM).
+    pub server_cert: Vec<u8>,
+    /// Server private key (PEM).
+    pub server_key: Vec<u8>,
+    /// CA certificate for client verification (PEM). If set, enables mTLS.
+    pub client_ca_cert: Option<Vec<u8>>,
 }
 
 impl GrpcServer {
     /// Creates a new gRPC server builder.
     pub fn new(db: Arc<Database>, addr: std::net::SocketAddr) -> Self {
-        Self { db, addr }
+        Self {
+            db,
+            addr,
+            tls_config: None,
+        }
+    }
+
+    /// Configures TLS from PEM-encoded certificate and key bytes.
+    pub fn with_tls(mut self, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Self {
+        self.tls_config = Some(TlsConfig {
+            server_cert: cert_pem,
+            server_key: key_pem,
+            client_ca_cert: None,
+        });
+        self
+    }
+
+    /// Configures mutual TLS (mTLS) with a CA certificate for client verification.
+    pub fn with_mtls(
+        mut self,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        ca_cert_pem: Vec<u8>,
+    ) -> Self {
+        self.tls_config = Some(TlsConfig {
+            server_cert: cert_pem,
+            server_key: key_pem,
+            client_ca_cert: Some(ca_cert_pem),
+        });
+        self
+    }
+
+    /// Configures TLS from file paths. Returns an error if the files cannot be read.
+    pub fn with_tls_files(
+        self,
+        cert_path: &std::path::Path,
+        key_path: &std::path::Path,
+        ca_cert_path: Option<&std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let cert_pem = std::fs::read(cert_path)?;
+        let key_pem = std::fs::read(key_path)?;
+        let ca_cert_pem = if let Some(ca_path) = ca_cert_path {
+            Some(std::fs::read(ca_path)?)
+        } else {
+            None
+        };
+
+        Ok(if let Some(ca) = ca_cert_pem {
+            self.with_mtls(cert_pem, key_pem, ca)
+        } else {
+            self.with_tls(cert_pem, key_pem)
+        })
     }
 
     /// Starts the gRPC server.
+    ///
+    /// If TLS is configured, the server will use TLS 1.2+ (tonic/rustls default).
+    /// If mTLS is configured (CA cert provided), clients must present a valid
+    /// certificate signed by the CA.
     pub async fn serve(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let service = NexusDbService::new(self.db);
 
-        tracing::info!("NexusDB gRPC server listening on {}", self.addr);
+        match self.tls_config {
+            Some(tls) => {
+                use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
-        tonic::transport::Server::builder()
-            .add_service(nexus_proto::NexusDbServer::new(service))
-            .serve(self.addr)
-            .await?;
+                let identity = Identity::from_pem(&tls.server_cert, &tls.server_key);
+                let mut tls_config = ServerTlsConfig::new().identity(identity);
+
+                if let Some(ca_cert) = &tls.client_ca_cert {
+                    let ca = Certificate::from_pem(ca_cert);
+                    tls_config = tls_config.client_ca_root(ca);
+                    tracing::info!(
+                        "NexusDB gRPC server listening on {} (mTLS enabled)",
+                        self.addr
+                    );
+                } else {
+                    tracing::info!(
+                        "NexusDB gRPC server listening on {} (TLS enabled)",
+                        self.addr
+                    );
+                }
+
+                tonic::transport::Server::builder()
+                    .tls_config(tls_config)?
+                    .add_service(nexus_proto::NexusDbServer::new(service))
+                    .serve(self.addr)
+                    .await?;
+            }
+            None => {
+                tracing::info!(
+                    "NexusDB gRPC server listening on {} (plaintext)",
+                    self.addr
+                );
+
+                tonic::transport::Server::builder()
+                    .add_service(nexus_proto::NexusDbServer::new(service))
+                    .serve(self.addr)
+                    .await?;
+            }
+        }
 
         Ok(())
     }

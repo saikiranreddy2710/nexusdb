@@ -80,7 +80,7 @@ chrono = { version = "0.4", features = ["serde"] }
 humantime = "2.1"
 
 # Networking (for later phases)
-tonic = "0.10"
+tonic = { version = "0.10", features = ["tls"] }
 tonic-build = "0.10"
 prost = "0.12"
 futures-core = "0.3"

@@ -50,13 +50,18 @@ pub struct ServerConfig {
     #[serde(default = "default_slow_query_threshold")]
     pub slow_query_threshold_ms: u64,
 
-    /// TLS certificate file path.
+    /// TLS certificate file path (PEM format).
     #[serde(default)]
     pub tls_cert: Option<PathBuf>,
 
-    /// TLS key file path.
+    /// TLS private key file path (PEM format).
     #[serde(default)]
     pub tls_key: Option<PathBuf>,
+
+    /// TLS CA certificate for client verification (mTLS). When set, clients
+    /// must present a certificate signed by this CA.
+    #[serde(default)]
+    pub tls_ca_cert: Option<PathBuf>,
 
     /// Enable Raft consensus for distributed mode.
     #[serde(default)]
@@ -114,6 +119,7 @@ impl Default for ServerConfig {
             slow_query_threshold_ms: default_slow_query_threshold(),
             tls_cert: None,
             tls_key: None,
+            tls_ca_cert: None,
             enable_raft: false,
             node_id: default_node_id(),
             raft_peers: Vec::new(),
