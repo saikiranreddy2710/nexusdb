@@ -18,6 +18,7 @@ members = [
     "crates/nexus-bench",
     "crates/nexus-cache",
     "crates/nexus-kv",
+    "crates/nexus-security",
 ]
 
 [workspace.package]

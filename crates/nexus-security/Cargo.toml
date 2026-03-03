@@ -1,0 +1,26 @@
+[package]
+name = "nexus-security"
+description = "Zero Trust security layer for NexusDB: authentication, authorization, and audit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+
+# Password hashing
+sha2 = "0.10"
+hmac = "0.12"
+# CRC for audit chain
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
