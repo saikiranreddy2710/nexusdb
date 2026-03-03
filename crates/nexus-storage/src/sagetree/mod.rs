@@ -86,6 +86,7 @@ mod cursor;
 mod delta;
 mod error;
 mod node;
+pub mod pager;
 mod tree;
 
 // Re-export main types
@@ -100,4 +101,5 @@ pub use node::{
     InternalEntry, InternalNode, LeafEntry, LeafNode, Node, NodeFlags, NodeHeader, NodeType,
     VersionInfo, NODE_HEADER_SIZE, NODE_MAGIC, VERSION_INFO_SIZE,
 };
+pub use pager::{FilePager, MemoryPager, Pager};
 pub use tree::{PageAllocator, SageTree, TreeStats};

@@ -7,7 +7,6 @@
 //!
 //! This module provides the main tree structure and operations.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
@@ -19,8 +18,9 @@ use super::cursor::{CursorEntry, Direction, KeyRange, LeafCursor};
 use super::delta::DeltaNode;
 use super::error::{SageTreeError, SageTreeResult};
 use super::node::{InternalNode, LeafNode, NodeFlags};
+use super::pager::{MemoryPager, Pager};
 
-/// Page allocator for the tree.
+/// Page allocator for the tree (delegates to the Pager).
 #[derive(Debug)]
 pub struct PageAllocator {
     /// Next page ID to allocate.
@@ -48,13 +48,11 @@ impl PageAllocator {
 
     /// Allocates a new page ID.
     pub fn allocate(&self) -> PageId {
-        // Try to reuse a free page first
         if let Ok(mut free) = self.free_pages.write() {
             if let Some(page_id) = free.pop() {
                 return page_id;
             }
         }
-        // Allocate new page
         PageId::new(self.next_page_id.fetch_add(1, AtomicOrdering::SeqCst))
     }
 
@@ -96,25 +94,24 @@ pub struct TreeStats {
     pub merges: usize,
 }
 
-/// An in-memory SageTree implementation.
+/// SageTree: a B-tree variant with delta chains and MVCC support.
 ///
-/// This is a simplified implementation that stores all nodes in memory.
-/// A production implementation would integrate with the BufferPool for
-/// disk-based storage.
+/// Storage is abstracted through the [`Pager`] trait, allowing the tree
+/// to operate against in-memory HashMaps (default) or a disk-backed file.
+///
+/// Use [`SageTree::new()`] for a purely in-memory tree, or
+/// [`SageTree::with_pager()`] to supply a custom [`Pager`] (e.g.
+/// [`FilePager`](super::pager::FilePager) for disk persistence).
 #[derive(Debug)]
 pub struct SageTree {
     /// Configuration.
     config: SageTreeConfig,
-    /// Page allocator.
-    allocator: PageAllocator,
+    /// Page-level storage backend.
+    pager: Box<dyn Pager>,
     /// Root page ID.
     root: RwLock<Option<PageId>>,
     /// Height of the tree (0 = single leaf, increases as tree grows).
     height: AtomicU64,
-    /// Node storage (page_id -> node with delta chain).
-    nodes: RwLock<HashMap<PageId, DeltaNode>>,
-    /// Internal nodes (page_id -> internal node).
-    internal_nodes: RwLock<HashMap<PageId, InternalNode>>,
     /// Statistics.
     stats: RwLock<TreeStats>,
     /// Bloom filter for fast negative lookups.
@@ -122,27 +119,33 @@ pub struct SageTree {
 }
 
 impl SageTree {
-    /// Creates a new empty SageTree with default configuration.
+    /// Creates a new empty SageTree with default configuration (in-memory).
     pub fn new() -> Self {
         Self::with_config(SageTreeConfig::default())
     }
 
-    /// Creates a new empty SageTree with the given configuration.
+    /// Creates a new empty SageTree with the given configuration (in-memory).
     pub fn with_config(config: SageTreeConfig) -> Self {
-        // Create a bloom filter sized for expected items
-        // Using 1% false positive rate for 100K expected items initially
+        Self::with_pager(config, Box::new(MemoryPager::new()))
+    }
+
+    /// Creates a new SageTree backed by the given [`Pager`].
+    pub fn with_pager(config: SageTreeConfig, pager: Box<dyn Pager>) -> Self {
         let bloom_filter = BloomFilter::with_rate(100_000, 0.01);
 
         Self {
             config,
-            allocator: PageAllocator::new(),
+            pager,
             root: RwLock::new(None),
             height: AtomicU64::new(0),
-            nodes: RwLock::new(HashMap::new()),
-            internal_nodes: RwLock::new(HashMap::new()),
             stats: RwLock::new(TreeStats::default()),
             bloom_filter: RwLock::new(bloom_filter),
         }
+    }
+
+    /// Flush the underlying pager to disk.
+    pub fn flush(&self) -> SageTreeResult<()> {
+        self.pager.flush()
     }
 
     /// Returns the configuration.
@@ -183,11 +186,9 @@ impl SageTree {
         {
             let bloom = self.bloom_filter.read().unwrap();
             if !bloom.contains(key) {
-                // Key is definitely not in the tree
                 return Ok(None);
             }
         }
-        // Bloom filter says key might exist, so we need to check the tree
 
         let root = self.root.read().unwrap();
         let root_id = match *root {
@@ -196,14 +197,8 @@ impl SageTree {
         };
         drop(root);
 
-        // Traverse to leaf
         let leaf_id = self.find_leaf(root_id, key)?;
-
-        // Get from delta node
-        let nodes = self.nodes.read().unwrap();
-        let node = nodes
-            .get(&leaf_id)
-            .ok_or(SageTreeError::PageNotFound(leaf_id))?;
+        let node = self.pager.get_leaf(leaf_id)?;
 
         Ok(node.get(key).cloned())
     }
@@ -225,24 +220,19 @@ impl SageTree {
         self.ensure_root()?;
 
         let root = self.root.read().unwrap().unwrap();
-        drop(self.root.read());
 
         // Find the leaf node
         let leaf_id = self.find_leaf(root, &key)?;
 
         // Insert into the delta node
         {
-            let mut nodes = self.nodes.write().unwrap();
-            let node = nodes
-                .get_mut(&leaf_id)
-                .ok_or(SageTreeError::PageNotFound(leaf_id))?;
-
+            let mut node = self.pager.get_leaf(leaf_id)?;
             node.insert(txn_id, lsn, key.clone(), value)?;
 
-            // Check if consolidation is needed
             if node.needs_consolidation() {
                 node.consolidate();
             }
+            self.pager.put_leaf(leaf_id, &node)?;
         }
 
         // Add key to bloom filter for fast negative lookups
@@ -288,17 +278,13 @@ impl SageTree {
 
         // Update in the delta node
         {
-            let mut nodes = self.nodes.write().unwrap();
-            let node = nodes
-                .get_mut(&leaf_id)
-                .ok_or(SageTreeError::PageNotFound(leaf_id))?;
-
+            let mut node = self.pager.get_leaf(leaf_id)?;
             node.update(txn_id, lsn, key, value)?;
 
-            // Check if consolidation is needed
             if node.needs_consolidation() {
                 node.consolidate();
             }
+            self.pager.put_leaf(leaf_id, &node)?;
         }
 
         Ok(())
@@ -318,22 +304,16 @@ impl SageTree {
         };
         drop(root);
 
-        // Find the leaf node
         let leaf_id = self.find_leaf(root_id, &key)?;
 
-        // Delete from the delta node
         {
-            let mut nodes = self.nodes.write().unwrap();
-            let node = nodes
-                .get_mut(&leaf_id)
-                .ok_or(SageTreeError::PageNotFound(leaf_id))?;
-
+            let mut node = self.pager.get_leaf(leaf_id)?;
             node.delete(txn_id, lsn, key)?;
 
-            // Check if consolidation is needed
             if node.needs_consolidation() {
                 node.consolidate();
             }
+            self.pager.put_leaf(leaf_id, &node)?;
         }
 
         // Update stats
@@ -395,17 +375,15 @@ impl SageTree {
                 break;
             }
 
-            let nodes = self.nodes.read().unwrap();
-            let node = match nodes.get(&leaf_id) {
-                Some(n) => n,
-                None => break,
+            let node = match self.pager.get_leaf(leaf_id) {
+                Ok(n) => n,
+                Err(_) => break,
             };
 
             // Create a consolidated view of the leaf
             let mut consolidated = node.base.clone();
             consolidated = node.chain.apply_to_leaf(consolidated);
 
-            // Create cursor over this leaf
             let mut cursor = LeafCursor::new(&consolidated, range.clone(), Direction::Forward);
             cursor.seek_first();
 
@@ -415,14 +393,11 @@ impl SageTree {
                 }
             }
 
-            // Move to next leaf
             current_leaf_id = if consolidated.header.next_page.is_valid() {
                 Some(consolidated.header.next_page)
             } else {
                 None
             };
-
-            drop(nodes);
 
             // Check if we've passed the range end
             if let Some(last) = results.last() {
@@ -459,10 +434,7 @@ impl SageTree {
         // Find rightmost leaf
         let leaf_id = self.find_rightmost_leaf(root_id)?;
 
-        let nodes = self.nodes.read().unwrap();
-        let node = nodes
-            .get(&leaf_id)
-            .ok_or(SageTreeError::PageNotFound(leaf_id))?;
+        let node = self.pager.get_leaf(leaf_id)?;
 
         // Consolidate and get last entry
         let mut consolidated = node.base.clone();
@@ -483,14 +455,11 @@ impl SageTree {
     fn ensure_root(&self) -> SageTreeResult<()> {
         let mut root = self.root.write().unwrap();
         if root.is_none() {
-            // Create initial leaf node
-            let page_id = self.allocator.allocate();
+            let page_id = self.pager.allocate_page();
             let leaf = LeafNode::new(page_id);
             let delta_node = DeltaNode::new(leaf, self.config.max_delta_chain_length);
 
-            let mut nodes = self.nodes.write().unwrap();
-            nodes.insert(page_id, delta_node);
-
+            self.pager.put_leaf(page_id, &delta_node)?;
             *root = Some(page_id);
 
             let mut stats = self.stats.write().unwrap();
@@ -502,21 +471,13 @@ impl SageTree {
     /// Finds the leaf node containing (or that would contain) a key.
     fn find_leaf(&self, root_id: PageId, key: &Key) -> SageTreeResult<PageId> {
         let height = self.height();
-
         if height == 0 {
-            // Root is a leaf
             return Ok(root_id);
         }
 
-        // Traverse internal nodes
         let mut current_id = root_id;
-        let internal_nodes = self.internal_nodes.read().unwrap();
-
         for _ in 0..height {
-            let node = internal_nodes
-                .get(&current_id)
-                .ok_or(SageTreeError::PageNotFound(current_id))?;
-
+            let node = self.pager.get_internal(current_id)?;
             current_id = node.find_child_binary(key);
         }
 
@@ -526,19 +487,13 @@ impl SageTree {
     /// Finds the leftmost leaf node.
     fn find_leftmost_leaf(&self, root_id: PageId) -> SageTreeResult<PageId> {
         let height = self.height();
-
         if height == 0 {
             return Ok(root_id);
         }
 
         let mut current_id = root_id;
-        let internal_nodes = self.internal_nodes.read().unwrap();
-
         for _ in 0..height {
-            let node = internal_nodes
-                .get(&current_id)
-                .ok_or(SageTreeError::PageNotFound(current_id))?;
-
+            let node = self.pager.get_internal(current_id)?;
             current_id = node.leftmost_child;
         }
 
@@ -548,19 +503,13 @@ impl SageTree {
     /// Finds the rightmost leaf node.
     fn find_rightmost_leaf(&self, root_id: PageId) -> SageTreeResult<PageId> {
         let height = self.height();
-
         if height == 0 {
             return Ok(root_id);
         }
 
         let mut current_id = root_id;
-        let internal_nodes = self.internal_nodes.read().unwrap();
-
         for _ in 0..height {
-            let node = internal_nodes
-                .get(&current_id)
-                .ok_or(SageTreeError::PageNotFound(current_id))?;
-
+            let node = self.pager.get_internal(current_id)?;
             current_id = node
                 .entries
                 .last()
@@ -574,15 +523,9 @@ impl SageTree {
     /// Checks if a leaf node needs splitting and performs the split if needed.
     fn maybe_split_leaf(&self, leaf_id: PageId) -> SageTreeResult<()> {
         let needs_split = {
-            let nodes = self.nodes.read().unwrap();
-            let node = nodes
-                .get(&leaf_id)
-                .ok_or(SageTreeError::PageNotFound(leaf_id))?;
-
-            // Consolidate first to get accurate count
+            let node = self.pager.get_leaf(leaf_id)?;
             let mut consolidated = node.base.clone();
             consolidated = node.chain.apply_to_leaf(consolidated);
-
             consolidated.len() > self.config.max_leaf_keys()
         };
 
@@ -596,16 +539,12 @@ impl SageTree {
     /// Splits a leaf node.
     fn split_leaf(&self, leaf_id: PageId) -> SageTreeResult<()> {
         let (new_leaf_id, separator_key) = {
-            let mut nodes = self.nodes.write().unwrap();
-            let node = nodes
-                .get_mut(&leaf_id)
-                .ok_or(SageTreeError::PageNotFound(leaf_id))?;
+            let mut node = self.pager.get_leaf(leaf_id)?;
 
             // Consolidate before splitting
             node.consolidate();
 
-            // Allocate new page
-            let new_page_id = self.allocator.allocate();
+            let new_page_id = self.pager.allocate_page();
 
             // Split the base leaf
             let right_leaf = node.base.split(new_page_id);
@@ -614,9 +553,11 @@ impl SageTree {
                 .ok_or_else(|| SageTreeError::structure_error("split produced empty right node"))?
                 .clone();
 
-            // Create new delta node for right leaf
             let right_node = DeltaNode::new(right_leaf, self.config.max_delta_chain_length);
-            nodes.insert(new_page_id, right_node);
+
+            // Persist both halves
+            self.pager.put_leaf(leaf_id, &node)?;
+            self.pager.put_leaf(new_page_id, &right_node)?;
 
             (new_page_id, separator)
         };
@@ -645,16 +586,13 @@ impl SageTree {
 
         if root_id == left_child {
             // Need to create new root
-            let new_root_id = self.allocator.allocate();
+            let new_root_id = self.pager.allocate_page();
             let mut new_root = InternalNode::new(new_root_id, 1);
             new_root.leftmost_child = left_child;
             new_root.insert(key, right_child);
             new_root.header.flags.set(NodeFlags::IS_ROOT);
 
-            {
-                let mut internal_nodes = self.internal_nodes.write().unwrap();
-                internal_nodes.insert(new_root_id, new_root);
-            }
+            self.pager.put_internal(new_root_id, &new_root)?;
 
             {
                 let mut root = self.root.write().unwrap();
@@ -669,19 +607,14 @@ impl SageTree {
                 stats.height = self.height();
             }
         } else {
-            // Find parent and insert
-            // For simplicity, we search from root
-            // A production implementation would maintain parent pointers
             let parent_id = self.find_parent(root_id, left_child)?;
 
             let needs_split = {
-                let mut internal_nodes = self.internal_nodes.write().unwrap();
-                let parent = internal_nodes
-                    .get_mut(&parent_id)
-                    .ok_or(SageTreeError::PageNotFound(parent_id))?;
-
+                let mut parent = self.pager.get_internal(parent_id)?;
                 parent.insert(key.clone(), right_child);
-                parent.key_count() > self.config.max_internal_keys()
+                let over = parent.key_count() > self.config.max_internal_keys();
+                self.pager.put_internal(parent_id, &parent)?;
+                over
             };
 
             if needs_split {
@@ -692,75 +625,67 @@ impl SageTree {
         Ok(())
     }
 
-    /// Finds the parent of a node.
+    /// Finds the parent of a node by searching from the root.
     fn find_parent(&self, root_id: PageId, child_id: PageId) -> SageTreeResult<PageId> {
         let height = self.height();
         if height == 0 {
             return Err(SageTreeError::structure_error("leaf has no parent"));
         }
 
-        let internal_nodes = self.internal_nodes.read().unwrap();
+        self.find_parent_recursive(root_id, child_id, height)
+            .ok_or_else(|| SageTreeError::structure_error("parent not found"))
+    }
 
-        fn find_recursive(
-            internal_nodes: &HashMap<PageId, InternalNode>,
-            current: PageId,
-            target: PageId,
-            remaining_levels: usize,
-        ) -> Option<PageId> {
-            if remaining_levels == 0 {
-                return None;
-            }
-
-            let node = internal_nodes.get(&current)?;
-
-            // Check if any child is the target
-            if node.leftmost_child == target {
-                return Some(current);
-            }
-            for entry in &node.entries {
-                if entry.child == target {
-                    return Some(current);
-                }
-            }
-
-            // Recurse into children
-            if remaining_levels > 1 {
-                if let Some(result) = find_recursive(
-                    internal_nodes,
-                    node.leftmost_child,
-                    target,
-                    remaining_levels - 1,
-                ) {
-                    return Some(result);
-                }
-                for entry in &node.entries {
-                    if let Some(result) =
-                        find_recursive(internal_nodes, entry.child, target, remaining_levels - 1)
-                    {
-                        return Some(result);
-                    }
-                }
-            }
-
-            None
+    fn find_parent_recursive(
+        &self,
+        current: PageId,
+        target: PageId,
+        remaining: usize,
+    ) -> Option<PageId> {
+        if remaining == 0 {
+            return None;
         }
 
-        find_recursive(&internal_nodes, root_id, child_id, height)
-            .ok_or_else(|| SageTreeError::structure_error("parent not found"))
+        let node = self.pager.get_internal(current).ok()?;
+
+        // Check if any child is the target
+        if node.leftmost_child == target {
+            return Some(current);
+        }
+        for entry in &node.entries {
+            if entry.child == target {
+                return Some(current);
+            }
+        }
+
+        // Recurse into children
+        if remaining > 1 {
+            if let Some(result) =
+                self.find_parent_recursive(node.leftmost_child, target, remaining - 1)
+            {
+                return Some(result);
+            }
+            for entry in &node.entries {
+                if let Some(result) = self.find_parent_recursive(entry.child, target, remaining - 1)
+                {
+                    return Some(result);
+                }
+            }
+        }
+
+        None
     }
 
     /// Splits an internal node.
     fn split_internal(&self, node_id: PageId) -> SageTreeResult<()> {
         let (new_node_id, separator_key) = {
-            let mut internal_nodes = self.internal_nodes.write().unwrap();
-            let node = internal_nodes
-                .get_mut(&node_id)
-                .ok_or(SageTreeError::PageNotFound(node_id))?;
+            let mut node = self.pager.get_internal(node_id)?;
 
-            let new_page_id = self.allocator.allocate();
+            let new_page_id = self.pager.allocate_page();
             let (separator, right_node) = node.split(new_page_id);
 
-            internal_nodes.insert(new_page_id, right_node);
+            self.pager.put_internal(node_id, &node)?;
+            self.pager.put_internal(new_page_id, &right_node)?;
 
             (new_page_id, separator)
         };
@@ -783,17 +708,65 @@ impl SageTree {
     // =========================================================================
 
     /// Consolidates all delta chains in the tree.
+    ///
+    /// Note: This only works efficiently with the MemoryPager. For the
+    /// FilePager, consolidation happens on `put_leaf()` automatically.
     pub fn consolidate_all(&self) {
-        let mut nodes = self.nodes.write().unwrap();
-        for node in nodes.values_mut() {
-            node.consolidate();
+        // Collect all leaf pages by scanning from leftmost leaf
+        let root = self.root.read().unwrap();
+        let root_id = match *root {
+            Some(id) => id,
+            None => return,
+        };
+        drop(root);
+
+        if let Ok(start) = self.find_leftmost_leaf(root_id) {
+            let mut current = Some(start);
+            while let Some(leaf_id) = current {
+                if let Ok(mut node) = self.pager.get_leaf(leaf_id) {
+                    let next = if node.base.header.next_page.is_valid() {
+                        Some(node.base.header.next_page)
+                    } else {
+                        None
+                    };
+                    if !node.chain.is_empty() {
+                        node.consolidate();
+                        let _ = self.pager.put_leaf(leaf_id, &node);
+                    }
+                    current = next;
+                } else {
+                    break;
+                }
+            }
         }
     }
 
     /// Returns the number of pending delta records across all nodes.
     pub fn pending_deltas(&self) -> usize {
-        let nodes = self.nodes.read().unwrap();
-        nodes.values().map(|n| n.chain.len()).sum()
+        let root = self.root.read().unwrap();
+        let root_id = match *root {
+            Some(id) => id,
+            None => return 0,
+        };
+        drop(root);
+
+        let mut count = 0;
+        if let Ok(start) = self.find_leftmost_leaf(root_id) {
+            let mut current = Some(start);
+            while let Some(leaf_id) = current {
+                if let Ok(node) = self.pager.get_leaf(leaf_id) {
+                    count += node.chain.len();
+                    current = if node.base.header.next_page.is_valid() {
+                        Some(node.base.header.next_page)
+                    } else {
+                        None
+                    };
+                } else {
+                    break;
+                }
+            }
+        }
+        count
     }
 
     /// Clears all entries from the tree.
@@ -801,14 +774,6 @@ impl SageTree {
         {
             let mut root = self.root.write().unwrap();
             *root = None;
-        }
-        {
-            let mut nodes = self.nodes.write().unwrap();
-            nodes.clear();
-        }
-        {
-            let mut internal_nodes = self.internal_nodes.write().unwrap();
-            internal_nodes.clear();
         }
         self.height.store(0, AtomicOrdering::SeqCst);
         {
