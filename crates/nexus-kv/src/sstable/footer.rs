@@ -115,10 +115,7 @@ mod tests {
 
     #[test]
     fn test_footer_roundtrip() {
-        let footer = Footer::new(
-            BlockHandle::new(100, 200),
-            BlockHandle::new(300, 400),
-        );
+        let footer = Footer::new(BlockHandle::new(100, 200), BlockHandle::new(300, 400));
 
         let encoded = footer.encode();
         assert_eq!(encoded.len(), FOOTER_SIZE);

@@ -210,11 +210,7 @@ impl<W: Write> SSTableWriter<W> {
 
     /// Flush the current data block to the file.
     fn flush_data_block(&mut self) -> KvResult<()> {
-        let last_key = self
-            .largest_key
-            .as_ref()
-            .cloned()
-            .unwrap_or_default();
+        let last_key = self.largest_key.as_ref().cloned().unwrap_or_default();
 
         // Build the block
         let mut new_builder = BlockBuilder::new(self.options.block_restart_interval);
@@ -272,8 +268,8 @@ impl<W: Write> SSTableWriter<W> {
         let num_bits = self.filter_keys.len() * self.options.bloom_bits_per_key;
         let num_bytes = (num_bits + 7) / 8;
         let num_bytes = num_bytes.max(8); // Minimum 8 bytes
-        let num_hashes = ((num_bytes as f64 * 8.0 / self.filter_keys.len() as f64) * 0.6931)
-            .ceil() as usize;
+        let num_hashes =
+            ((num_bytes as f64 * 8.0 / self.filter_keys.len() as f64) * 0.6931).ceil() as usize;
         let num_hashes = num_hashes.clamp(1, 30);
 
         let mut filter = vec![0u8; num_bytes];

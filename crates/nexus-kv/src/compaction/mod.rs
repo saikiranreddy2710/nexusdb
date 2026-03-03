@@ -105,7 +105,8 @@ impl LevelInfo {
 
     /// Sort files by smallest key (for non-L0 levels).
     pub fn sort_by_key(&mut self) {
-        self.files.sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
+        self.files
+            .sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
     }
 
     /// Find files that overlap with the given key range.

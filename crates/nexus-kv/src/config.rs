@@ -195,7 +195,7 @@ impl LsmConfig {
         cfg.max_levels = 4;
         cfg.level_size_multiplier = 4;
         cfg.l1_max_bytes = 16 * 1024; // 16 KB
-        cfg.max_background_compactions = 1;
+        cfg.max_background_compactions = 0;
         cfg.compaction_rate_limit = 0;
         cfg.enable_bloom_filter = true;
         cfg.bloom_bits_per_key = 10;

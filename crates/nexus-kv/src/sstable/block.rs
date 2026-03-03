@@ -275,12 +275,9 @@ impl BlockReader {
 
         // Read num_restarts from the last 4 bytes
         let len = data.len();
-        let num_restarts = u32::from_le_bytes([
-            data[len - 4],
-            data[len - 3],
-            data[len - 2],
-            data[len - 1],
-        ]) as usize;
+        let num_restarts =
+            u32::from_le_bytes([data[len - 4], data[len - 3], data[len - 2], data[len - 1]])
+                as usize;
 
         if num_restarts == 0 {
             return Err(KvError::CorruptedBlock {
@@ -379,11 +376,7 @@ impl BlockReader {
 
     /// Decode an entry at the given offset.
     /// Returns `(full_key, value_offset, value_len)`.
-    fn decode_entry_at(
-        &self,
-        offset: usize,
-        prev_key: &[u8],
-    ) -> Option<(Vec<u8>, usize, usize)> {
+    fn decode_entry_at(&self, offset: usize, prev_key: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
         if offset >= self.restarts_offset {
             return None;
         }
@@ -446,7 +439,8 @@ impl<'a> BlockIterator<'a> {
     /// Get the current value.
     pub fn value(&self) -> &[u8] {
         debug_assert!(self.valid);
-        &self.block.data[self.current_value_offset..self.current_value_offset + self.current_value_len]
+        &self.block.data
+            [self.current_value_offset..self.current_value_offset + self.current_value_len]
     }
 
     /// Advance to the next entry.

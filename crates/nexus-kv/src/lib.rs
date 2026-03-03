@@ -52,6 +52,7 @@ pub mod iterator;
 pub mod manifest;
 pub mod memtable;
 pub mod sstable;
+pub mod wal;
 
 pub use config::{CompactionStrategy, CompressionType, LsmConfig};
 pub use engine::LsmEngine;

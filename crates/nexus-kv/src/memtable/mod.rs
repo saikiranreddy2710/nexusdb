@@ -152,8 +152,7 @@ impl MemTable {
         self.check_capacity(key.len() + value.len())?;
         let seq = self.allocate_sequence();
         let _guard = self.write_lock.write();
-        self.table
-            .insert(InternalKey::put(key, seq), value);
+        self.table.insert(InternalKey::put(key, seq), value);
         self.update_sequence_bounds(seq);
         Ok(seq)
     }

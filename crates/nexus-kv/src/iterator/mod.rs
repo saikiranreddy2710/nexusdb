@@ -141,9 +141,7 @@ impl MergeIterator {
                     // Advance the source that produced this entry
                     self.sources[heap_entry.source_idx].advance();
                     if self.sources[heap_entry.source_idx].valid() {
-                        if let Some(next_entry) =
-                            self.sources[heap_entry.source_idx].current()
-                        {
+                        if let Some(next_entry) = self.sources[heap_entry.source_idx].current() {
                             self.heap.push(HeapEntry {
                                 entry: next_entry,
                                 source_idx: heap_entry.source_idx,
@@ -170,9 +168,7 @@ impl MergeIterator {
                 // Advance the source
                 self.sources[popped.source_idx].advance();
                 if self.sources[popped.source_idx].valid() {
-                    if let Some(next_entry) =
-                        self.sources[popped.source_idx].current()
-                    {
+                    if let Some(next_entry) = self.sources[popped.source_idx].current() {
                         self.heap.push(HeapEntry {
                             entry: next_entry,
                             source_idx: popped.source_idx,
@@ -255,9 +251,7 @@ impl KvIterator for VecIterator {
     }
 
     fn seek(&mut self, target: &InternalKey) {
-        self.position = self
-            .entries
-            .partition_point(|e| e.key < *target);
+        self.position = self.entries.partition_point(|e| e.key < *target);
     }
 
     fn seek_to_first(&mut self) {

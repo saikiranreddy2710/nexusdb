@@ -187,10 +187,8 @@ impl CompactionStrategy for LeveledCompaction {
                 return None;
             }
 
-            let picked = self.pick_compaction_file(
-                &levels[input_level_idx],
-                &levels[output_level_idx],
-            )?;
+            let picked =
+                self.pick_compaction_file(&levels[input_level_idx], &levels[output_level_idx])?;
             let picked_file = levels[input_level_idx].files[picked].clone();
 
             // Find overlapping files in the output level
@@ -276,10 +274,7 @@ mod tests {
             ));
         }
 
-        let levels = vec![
-            l0,
-            LevelInfo::new(1, config.l1_max_bytes),
-        ];
+        let levels = vec![l0, LevelInfo::new(1, config.l1_max_bytes)];
 
         let job = strategy.pick_compaction(&levels);
         assert!(job.is_some());

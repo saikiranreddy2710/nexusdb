@@ -22,9 +22,14 @@ use crate::compaction::LevelInfo;
 use crate::config::LsmConfig;
 use crate::error::{KvError, KvResult};
 use crate::sstable::SSTableInfo;
-use parking_lot::RwLock;
+use crc32fast::Hasher;
+use parking_lot::{Mutex, RwLock};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tracing::{info, warn};
 
 /// A single edit to the version state.
 #[derive(Debug, Clone)]
@@ -168,8 +173,7 @@ impl VersionEdit {
                     if pos + 4 + 8 + 8 + 8 + 8 + 8 > data.len() {
                         return Err(KvError::CorruptedManifest("truncated file entry".into()));
                     }
-                    let level =
-                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                    let level = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     let id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
                     pos += 8;
@@ -228,8 +232,7 @@ impl VersionEdit {
                     if pos + 4 + 8 > data.len() {
                         return Err(KvError::CorruptedManifest("truncated remove entry".into()));
                     }
-                    let level =
-                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                    let level = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     let file_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
                     pos += 8;
@@ -340,6 +343,151 @@ impl Version {
     }
 }
 
+// ── Manifest File Constants ─────────────────────────────────────────────────
+
+/// Manifest file magic: "NXMF" (NexusDB Manifest)
+const MANIFEST_MAGIC: u32 = 0x4E584D46;
+/// Current manifest format version.
+const MANIFEST_VERSION: u32 = 1;
+/// File header size: magic(4) + version(4)
+const MANIFEST_HEADER_SIZE: usize = 8;
+
+// ── Manifest Writer ─────────────────────────────────────────────────────────
+
+/// Appends encoded `VersionEdit`s to a manifest file on disk.
+struct ManifestWriter {
+    writer: BufWriter<File>,
+    path: PathBuf,
+}
+
+impl ManifestWriter {
+    /// Create (or truncate) a new manifest file and write its header.
+    fn create(path: &Path) -> KvResult<Self> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&MANIFEST_MAGIC.to_le_bytes())?;
+        writer.write_all(&MANIFEST_VERSION.to_le_bytes())?;
+        writer.flush()?;
+        Ok(Self {
+            writer,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Open an existing manifest file for appending.
+    fn open_append(path: &Path) -> KvResult<Self> {
+        let file = OpenOptions::new().append(true).open(path)?;
+        let writer = BufWriter::new(file);
+        Ok(Self {
+            writer,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Append a version edit record: [crc:4][length:4][edit_bytes:N]
+    fn append(&mut self, edit: &VersionEdit) -> KvResult<()> {
+        let data = edit.encode();
+        let crc = manifest_crc(&data);
+
+        self.writer.write_all(&crc.to_le_bytes())?;
+        self.writer.write_all(&(data.len() as u32).to_le_bytes())?;
+        self.writer.write_all(&data)?;
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+        Ok(())
+    }
+}
+
+// ── Manifest Reader ─────────────────────────────────────────────────────────
+
+/// Reads all version edits from a manifest file.
+fn read_manifest(path: &Path) -> KvResult<Vec<VersionEdit>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(KvError::Io(e)),
+    };
+
+    let file_len = file.metadata()?.len();
+    if file_len < MANIFEST_HEADER_SIZE as u64 {
+        return Err(KvError::CorruptedManifest("manifest file too small".into()));
+    }
+
+    let mut reader = BufReader::new(file);
+
+    // Validate header
+    let mut hdr = [0u8; MANIFEST_HEADER_SIZE];
+    reader.read_exact(&mut hdr)?;
+    let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+    if magic != MANIFEST_MAGIC {
+        return Err(KvError::CorruptedManifest(format!(
+            "bad magic: {:#010x}",
+            magic
+        )));
+    }
+    if version != MANIFEST_VERSION {
+        return Err(KvError::CorruptedManifest(format!(
+            "unsupported version: {}",
+            version
+        )));
+    }
+
+    let mut edits = Vec::new();
+    let mut envelope = [0u8; 8]; // crc(4) + length(4)
+
+    loop {
+        match reader.read_exact(&mut envelope) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(KvError::Io(e)),
+        }
+
+        let expected_crc = u32::from_le_bytes(envelope[0..4].try_into().unwrap());
+        let data_len = u32::from_le_bytes(envelope[4..8].try_into().unwrap()) as usize;
+
+        if data_len > 64 * 1024 * 1024 {
+            // Sanity limit: 64 MB per edit record
+            break;
+        }
+
+        let mut data = vec![0u8; data_len];
+        match reader.read_exact(&mut data) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(KvError::Io(e)),
+        }
+
+        let actual_crc = manifest_crc(&data);
+        if actual_crc != expected_crc {
+            warn!("manifest CRC mismatch, stopping replay");
+            break;
+        }
+
+        edits.push(VersionEdit::decode(&data)?);
+    }
+
+    Ok(edits)
+}
+
+fn manifest_crc(data: &[u8]) -> u32 {
+    let mut h = Hasher::new();
+    h.update(data);
+    h.finalize()
+}
+
+/// Path to the manifest file inside the data directory.
+pub fn manifest_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("MANIFEST")
+}
+
+/// Path to the CURRENT file (points to the active manifest).
+pub fn current_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("CURRENT")
+}
+
+// ── VersionSet ──────────────────────────────────────────────────────────────
+
 /// Manages versions and persists version edits to the manifest file.
 pub struct VersionSet {
     /// The current (latest) version.
@@ -352,10 +500,12 @@ pub struct VersionSet {
     config: LsmConfig,
     /// Manifest file log number.
     manifest_number: AtomicU64,
+    /// Manifest writer for persistent edits (None in memory-only mode).
+    manifest_writer: Mutex<Option<ManifestWriter>>,
 }
 
 impl VersionSet {
-    /// Create a new version set with an empty initial version.
+    /// Create a new version set with an empty initial version (memory-only).
     pub fn new(config: LsmConfig) -> Self {
         let initial = Version::new(&config);
         Self {
@@ -364,7 +514,81 @@ impl VersionSet {
             last_sequence: AtomicU64::new(0),
             config,
             manifest_number: AtomicU64::new(0),
+            manifest_writer: Mutex::new(None),
         }
+    }
+
+    /// Recover from an existing manifest file, or create a fresh one.
+    ///
+    /// This is the entry point for durable mode. It reads all version edits
+    /// from the MANIFEST file, replays them to rebuild the current version,
+    /// then opens the manifest for appending new edits.
+    pub fn recover(config: LsmConfig) -> KvResult<Self> {
+        let mpath = manifest_path(&config.data_dir);
+        let edits = read_manifest(&mpath)?;
+
+        let mut version = Version::new(&config);
+        let mut last_seq = 0u64;
+        let mut next_file = 1u64;
+
+        for edit in &edits {
+            version = version.apply(edit);
+            if let Some(s) = edit.last_sequence {
+                last_seq = last_seq.max(s);
+            }
+            if let Some(n) = edit.next_file_number {
+                next_file = next_file.max(n);
+            }
+        }
+
+        // Also scan for the highest file number among existing files
+        for level in &version.levels {
+            for f in &level.files {
+                next_file = next_file.max(f.id + 1);
+            }
+        }
+
+        info!(
+            edits = edits.len(),
+            version = version.version_number,
+            files = version.total_file_count(),
+            last_seq = last_seq,
+            next_file = next_file,
+            "manifest recovered"
+        );
+
+        // Re-open manifest for appending (or create if it didn't exist)
+        let writer = if mpath.exists() {
+            ManifestWriter::open_append(&mpath)?
+        } else {
+            let mut w = ManifestWriter::create(&mpath)?;
+            // Write a full snapshot as the first edit so the manifest is self-contained
+            let snapshot_edit = Self::snapshot_edit(&version, last_seq, next_file);
+            w.append(&snapshot_edit)?;
+            w
+        };
+
+        Ok(Self {
+            current: RwLock::new(Arc::new(version)),
+            next_file_number: AtomicU64::new(next_file),
+            last_sequence: AtomicU64::new(last_seq),
+            config,
+            manifest_number: AtomicU64::new(0),
+            manifest_writer: Mutex::new(Some(writer)),
+        })
+    }
+
+    /// Build a snapshot edit that captures the full state.
+    fn snapshot_edit(version: &Version, last_seq: u64, next_file: u64) -> VersionEdit {
+        let mut edit = VersionEdit::new();
+        edit.set_last_sequence(last_seq);
+        edit.set_next_file_number(next_file);
+        for level in &version.levels {
+            for file in &level.files {
+                edit.add_file(level.level, file.clone());
+            }
+        }
+        edit
     }
 
     /// Get the current version.
@@ -373,7 +597,19 @@ impl VersionSet {
     }
 
     /// Apply a version edit and make it the current version.
+    ///
+    /// If a manifest writer is present (durable mode), the edit is persisted
+    /// to disk before the in-memory state is updated. This ensures that a
+    /// crash after `apply_edit` returns always has the edit on disk.
     pub fn apply_edit(&self, edit: &VersionEdit) -> KvResult<Arc<Version>> {
+        // Persist first (write-ahead)
+        {
+            let mut guard = self.manifest_writer.lock();
+            if let Some(ref mut writer) = *guard {
+                writer.append(edit)?;
+            }
+        }
+
         let current = self.current.read().clone();
         let new_version = Arc::new(current.apply(edit));
 

@@ -338,11 +338,7 @@ impl SkipList {
     /// This finds the newest version of the key with sequence <= `sequence`.
     pub fn get(&self, user_key: &[u8], sequence: u64) -> Option<(ValueType, &Bytes)> {
         // Create a lookup key with the target sequence
-        let lookup = InternalKey::new(
-            Bytes::copy_from_slice(user_key),
-            sequence,
-            ValueType::Value,
-        );
+        let lookup = InternalKey::new(Bytes::copy_from_slice(user_key), sequence, ValueType::Value);
         let node = self.find_ge(&lookup);
         if node.is_null() {
             return None;
@@ -381,11 +377,7 @@ impl SkipList {
 
     /// Check if the skip list contains any entry with the given user key.
     pub fn contains_key(&self, user_key: &[u8]) -> bool {
-        let lookup = InternalKey::new(
-            Bytes::copy_from_slice(user_key),
-            u64::MAX,
-            ValueType::Value,
-        );
+        let lookup = InternalKey::new(Bytes::copy_from_slice(user_key), u64::MAX, ValueType::Value);
         let node = self.find_ge(&lookup);
         if node.is_null() {
             return false;
@@ -524,18 +516,9 @@ mod tests {
     #[test]
     fn test_multiple_versions() {
         let sl = SkipList::new();
-        sl.insert(
-            InternalKey::put(Bytes::from("key"), 1),
-            Bytes::from("v1"),
-        );
-        sl.insert(
-            InternalKey::put(Bytes::from("key"), 2),
-            Bytes::from("v2"),
-        );
-        sl.insert(
-            InternalKey::put(Bytes::from("key"), 3),
-            Bytes::from("v3"),
-        );
+        sl.insert(InternalKey::put(Bytes::from("key"), 1), Bytes::from("v1"));
+        sl.insert(InternalKey::put(Bytes::from("key"), 2), Bytes::from("v2"));
+        sl.insert(InternalKey::put(Bytes::from("key"), 3), Bytes::from("v3"));
 
         // Reading at sequence 3 should return v3
         let (_, val) = sl.get(b"key", 3).unwrap();
@@ -557,10 +540,7 @@ mod tests {
             InternalKey::put(Bytes::from("key"), 1),
             Bytes::from("value"),
         );
-        sl.insert(
-            InternalKey::delete(Bytes::from("key"), 2),
-            Bytes::new(),
-        );
+        sl.insert(InternalKey::delete(Bytes::from("key"), 2), Bytes::new());
 
         // At sequence 2, key is deleted
         let (vt, _) = sl.get(b"key", 2).unwrap();
@@ -575,18 +555,9 @@ mod tests {
     #[test]
     fn test_ordering() {
         let sl = SkipList::new();
-        sl.insert(
-            InternalKey::put(Bytes::from("c"), 1),
-            Bytes::from("3"),
-        );
-        sl.insert(
-            InternalKey::put(Bytes::from("a"), 1),
-            Bytes::from("1"),
-        );
-        sl.insert(
-            InternalKey::put(Bytes::from("b"), 1),
-            Bytes::from("2"),
-        );
+        sl.insert(InternalKey::put(Bytes::from("c"), 1), Bytes::from("3"));
+        sl.insert(InternalKey::put(Bytes::from("a"), 1), Bytes::from("1"));
+        sl.insert(InternalKey::put(Bytes::from("b"), 1), Bytes::from("2"));
 
         let mut iter = sl.iter();
         let (k, v) = iter.current().unwrap();

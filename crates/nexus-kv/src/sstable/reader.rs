@@ -4,9 +4,7 @@
 //! and range scans via sequential block iteration.
 
 use crate::error::{KvError, KvResult};
-use crate::sstable::block::{
-    BlockCompressionType, BlockHandle, BlockReader, BLOCK_TRAILER_SIZE,
-};
+use crate::sstable::block::{BlockCompressionType, BlockHandle, BlockReader, BLOCK_TRAILER_SIZE};
 use crate::sstable::footer::{Footer, FOOTER_SIZE};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -418,26 +416,14 @@ mod tests {
         let mut reader = SSTableReader::open(cursor, PathBuf::from("test.sst")).unwrap();
 
         // Point lookups
-        assert_eq!(
-            reader.get(b"apple").unwrap(),
-            Some(b"red".to_vec())
-        );
-        assert_eq!(
-            reader.get(b"banana").unwrap(),
-            Some(b"yellow".to_vec())
-        );
+        assert_eq!(reader.get(b"apple").unwrap(), Some(b"red".to_vec()));
+        assert_eq!(reader.get(b"banana").unwrap(), Some(b"yellow".to_vec()));
         assert_eq!(reader.get(b"grape").unwrap(), None);
     }
 
     #[test]
     fn test_sstable_iterator() {
-        let entries = vec![
-            ("a", "1"),
-            ("b", "2"),
-            ("c", "3"),
-            ("d", "4"),
-            ("e", "5"),
-        ];
+        let entries = vec![("a", "1"), ("b", "2"), ("c", "3"), ("d", "4"), ("e", "5")];
         let data = create_test_sstable(&entries);
 
         let cursor = Cursor::new(data);
