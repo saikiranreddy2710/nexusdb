@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_cache::plan_cache::{PlanCache, PlanCacheConfig};
+use nexus_cache::result_cache::{ResultCache, ResultCacheConfig, ResultCacheKey};
 use nexus_common::types::TxnId;
 use nexus_mvcc::IsolationLevel;
 use nexus_sql::executor::{Row, Value};
@@ -106,6 +107,8 @@ pub struct Session {
     statement_count: u64,
     /// Query plan cache for prepared statements and repeated queries.
     plan_cache: PlanCache<PhysicalPlan>,
+    /// Query result cache for SELECT queries.
+    result_cache: Arc<ResultCache<ExecuteResult>>,
 }
 
 impl Session {
@@ -127,6 +130,7 @@ impl Session {
             created_at: Instant::now(),
             statement_count: 0,
             plan_cache: PlanCache::new(PlanCacheConfig::with_capacity(100)),
+            result_cache: Arc::new(ResultCache::new(ResultCacheConfig::new(500, 60))),
         }
     }
 
@@ -287,20 +291,33 @@ impl Session {
                 Ok(StatementResult::transaction("ROLLBACK"))
             }
 
-            // DDL - invalidate plan cache when schema changes
+            // DDL - invalidate plan cache and result cache when schema changes
             Statement::CreateTable(create) => {
-                self.plan_cache.clear(); // Invalidate all plans on DDL
+                self.plan_cache.clear();
+                self.result_cache.clear();
                 self.execute_create_table(create)
             }
             Statement::DropTable(drop) => {
-                self.plan_cache.clear(); // Invalidate all plans on DDL
+                self.plan_cache.clear();
+                for table_ref in &drop.names {
+                    self.result_cache.invalidate_table(&table_ref.table);
+                }
                 self.execute_drop_table(drop)
             }
 
-            // DML
-            Statement::Insert(insert) => self.execute_insert(insert),
-            Statement::Update(update) => self.execute_update(update),
-            Statement::Delete(delete) => self.execute_delete(delete),
+            // DML - invalidate result cache for affected tables
+            Statement::Insert(insert) => {
+                self.result_cache.invalidate_table(&insert.table.table);
+                self.execute_insert(insert)
+            }
+            Statement::Update(update) => {
+                self.result_cache.invalidate_table(&update.table.table);
+                self.execute_update(update)
+            }
+            Statement::Delete(delete) => {
+                self.result_cache.invalidate_table(&delete.table.table);
+                self.execute_delete(delete)
+            }
 
             // Query - use plan cache
             Statement::Select(_) => self.execute_query(statement, sql, start),
@@ -311,7 +328,10 @@ impl Session {
             Statement::DescribeTable(table_name) => self.execute_describe_table(table_name),
 
             // Multi-database
-            Statement::CreateDatabase { name, if_not_exists } => {
+            Statement::CreateDatabase {
+                name,
+                if_not_exists,
+            } => {
                 self.database.create_database(name, *if_not_exists)?;
                 Ok(StatementResult::ddl("CREATE DATABASE"))
             }
@@ -576,13 +596,22 @@ impl Session {
         sql: &str,
         start: Instant,
     ) -> DatabaseResult<StatementResult> {
-        // Try to get cached physical plan
+        // ── Result cache lookup (only outside transactions) ─────
+        let cache_key = if !self.in_transaction() {
+            let key = ResultCacheKey::from_sql(sql);
+            if let Some(cached) = self.result_cache.get(&key) {
+                // Cache hit - return the cached result directly
+                return Ok(StatementResult::Query((*cached).clone()));
+            }
+            Some(key)
+        } else {
+            None
+        };
+
+        // ── Plan cache lookup / build ───────────────────────────
         let physical_plan = if let Some(cached_plan) = self.plan_cache.get(sql) {
-            // Cache hit - use the cached plan
             (*cached_plan).clone()
         } else {
-            // Cache miss - build the plan from scratch
-
             // Build a catalog from current storage
             let mut catalog = MemoryCatalog::new();
             for table_name in self.storage().list_tables() {
@@ -617,11 +646,10 @@ impl Session {
             plan
         };
 
-        // Execute the plan
+        // ── Execute ─────────────────────────────────────────────
         let ctx = ExecutionContext::default();
         let mut executor = nexus_sql::executor::QueryExecutor::new(ctx);
 
-        // Register tables with data
         for table_name in self.storage().list_tables() {
             if let Ok(batches) = self.storage().execute_scan(&table_name) {
                 executor.register_table(table_name, batches);
@@ -633,7 +661,41 @@ impl Session {
         let elapsed = start.elapsed();
         let execute_result = ExecuteResult::from_batches(result.schema, result.batches, elapsed);
 
+        // ── Store in result cache ───────────────────────────────
+        if let Some(key) = cache_key {
+            let tables = Self::extract_table_names(statement);
+            self.result_cache
+                .insert(key, execute_result.clone(), tables);
+        }
+
         Ok(StatementResult::Query(execute_result))
+    }
+
+    /// Extract table names referenced in a statement (for cache dependency tracking).
+    fn extract_table_names(statement: &Statement) -> Vec<String> {
+        let mut tables = Vec::new();
+        if let Statement::Select(select) = statement {
+            Self::collect_from_items(&select.from, &mut tables);
+        }
+        tables
+    }
+
+    /// Recursively collect table names from FROM items.
+    fn collect_from_items(from: &[nexus_sql::parser::FromItem], tables: &mut Vec<String>) {
+        for item in from {
+            match item {
+                nexus_sql::parser::FromItem::Table(t) => {
+                    tables.push(t.table.clone());
+                }
+                nexus_sql::parser::FromItem::Join { left, right, .. } => {
+                    Self::collect_from_items(&[*left.clone()], tables);
+                    Self::collect_from_items(&[*right.clone()], tables);
+                }
+                nexus_sql::parser::FromItem::Subquery { query, .. } => {
+                    Self::collect_from_items(&query.from, tables);
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -650,9 +712,10 @@ impl Session {
         sorted_names.sort();
 
         // Build schema for result
-        let schema = Arc::new(Schema::new(vec![
-            Field::not_null("table_name", DataType::Text),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::not_null(
+            "table_name",
+            DataType::Text,
+        )]));
 
         // Build rows
         let rows: Vec<Row> = sorted_names
@@ -680,9 +743,10 @@ impl Session {
         use nexus_sql::parser::DataType;
 
         let names = self.database.list_databases();
-        let schema = Arc::new(Schema::new(vec![
-            Field::not_null("database_name", DataType::Text),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::not_null(
+            "database_name",
+            DataType::Text,
+        )]));
 
         let rows: Vec<Row> = names
             .into_iter()
@@ -1148,10 +1212,7 @@ mod tests {
         if let StatementResult::Query(query_result) = result {
             assert_eq!(query_result.total_rows, 1);
             let rows = query_result.rows();
-            assert_eq!(
-                rows[0].get(0),
-                Some(&Value::String("nexusdb".to_string()))
-            );
+            assert_eq!(rows[0].get(0), Some(&Value::String("nexusdb".to_string())));
         } else {
             panic!("expected Query result");
         }
