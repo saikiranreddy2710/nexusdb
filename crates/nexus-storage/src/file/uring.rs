@@ -40,10 +40,106 @@ use super::options::OpenOptions;
 /// Default io_uring queue depth.
 const DEFAULT_QUEUE_DEPTH: u32 = 256;
 
+/// Pre-registered buffer pool for zero-copy io_uring I/O.
+///
+/// Registering buffers with `IORING_REGISTER_BUFFERS` tells the kernel
+/// to pin the memory and map it into kernel address space once. Subsequent
+/// `ReadFixed`/`WriteFixed` operations avoid per-I/O copy and page-table walks.
+///
+/// Call [`UringFile::register_buffers`] to enable this, then use
+/// [`UringFile::read_fixed`] / [`UringFile::write_fixed`].
+pub struct RegisteredBufferPool {
+    /// Each buffer is a page-aligned slab.
+    buffers: Vec<Vec<u8>>,
+    /// Size of each individual buffer.
+    buf_size: usize,
+    /// Index of next free buffer (simple bump allocator + free list).
+    free_list: Vec<u16>,
+}
+
+impl RegisteredBufferPool {
+    /// Allocate `count` buffers of `buf_size` bytes each.
+    pub fn new(count: usize, buf_size: usize) -> Self {
+        let mut buffers = Vec::with_capacity(count);
+        let mut free_list = Vec::with_capacity(count);
+        for i in 0..count {
+            buffers.push(vec![0u8; buf_size]);
+            free_list.push(i as u16);
+        }
+        Self {
+            buffers,
+            buf_size,
+            free_list,
+        }
+    }
+
+    /// Acquire a buffer index from the pool. Returns `None` if exhausted.
+    pub fn acquire(&mut self) -> Option<u16> {
+        self.free_list.pop()
+    }
+
+    /// Return a buffer index to the pool.
+    pub fn release(&mut self, idx: u16) {
+        self.free_list.push(idx);
+    }
+
+    /// Get a mutable reference to the buffer at `idx`.
+    pub fn get_mut(&mut self, idx: u16) -> &mut [u8] {
+        &mut self.buffers[idx as usize][..self.buf_size]
+    }
+
+    /// Get an immutable reference to the buffer at `idx`.
+    pub fn get(&self, idx: u16) -> &[u8] {
+        &self.buffers[idx as usize][..self.buf_size]
+    }
+
+    /// Returns `iovec` array suitable for `io_uring_register_buffers`.
+    fn as_iovecs(&self) -> Vec<libc::iovec> {
+        self.buffers
+            .iter()
+            .map(|b| libc::iovec {
+                iov_base: b.as_ptr() as *mut libc::c_void,
+                iov_len: self.buf_size,
+            })
+            .collect()
+    }
+
+    /// Number of buffers in the pool.
+    pub fn count(&self) -> usize {
+        self.buffers.len()
+    }
+
+    /// Size of each buffer.
+    pub fn buffer_size(&self) -> usize {
+        self.buf_size
+    }
+}
+
 /// io_uring-based file implementation.
 ///
 /// Provides high-performance async I/O on Linux using io_uring.
 /// Each file instance owns a shared io_uring ring for submitting operations.
+///
+/// ## Registered Buffers (Zero-Copy I/O)
+///
+/// Call [`register_buffers`](Self::register_buffers) after opening the
+/// file, then use [`read_fixed`](Self::read_fixed) /
+/// [`write_fixed`](Self::write_fixed) for zero-copy operations. The kernel
+/// pins the registered memory and avoids per-I/O page-table walks.
+///
+/// ## SQPOLL Mode
+///
+/// Set `sqpoll = true` in the builder to enable kernel-side submission
+/// queue polling. This eliminates the `io_uring_enter` syscall for
+/// submissions (the kernel thread polls the SQ automatically). Use this
+/// for latency-critical workloads at the cost of one kernel thread per
+/// ring spinning at 100% CPU.
+///
+/// ## Fixed File Descriptors
+///
+/// Call [`register_files`](Self::register_files) to register fds with
+/// the ring. Subsequent operations using the *registered* index avoid
+/// the per-operation fd lookup in the kernel.
 pub struct UringFile {
     /// The raw file descriptor.
     fd: RawFd,
@@ -55,6 +151,10 @@ pub struct UringFile {
     direct_io: bool,
     /// The io_uring instance (shared, mutex-protected for thread safety).
     ring: Arc<Mutex<IoUring>>,
+    /// Pre-registered buffer pool for zero-copy I/O.
+    registered_buffers: Mutex<Option<RegisteredBufferPool>>,
+    /// Whether files have been registered (fixed fd mode).
+    fixed_fd_index: Option<u32>,
 }
 
 impl UringFile {
@@ -139,7 +239,34 @@ impl UringFile {
             writable: options.is_write(),
             direct_io: options.is_direct_io(),
             ring: Arc::new(Mutex::new(ring)),
+            registered_buffers: Mutex::new(None),
+            fixed_fd_index: None,
         })
+    }
+
+    /// Open with SQPOLL mode enabled.
+    ///
+    /// In SQPOLL mode the kernel spawns a thread that continuously polls
+    /// the submission queue, eliminating the `io_uring_enter` syscall for
+    /// submissions. The `idle_ms` parameter controls how long the kernel
+    /// thread idles before going to sleep (woken on next submit).
+    pub async fn open_sqpoll(
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+        idle_ms: u32,
+    ) -> IoResult<Self> {
+        let mut file = Self::open(path, options).await?;
+
+        // Replace the ring with an SQPOLL-enabled one
+        let ring = io_uring::IoUring::builder()
+            .setup_sqpoll(idle_ms)
+            .build(DEFAULT_QUEUE_DEPTH)
+            .map_err(|e| IoError::UringError {
+                message: format!("failed to create SQPOLL io_uring: {}", e),
+            })?;
+
+        file.ring = Arc::new(Mutex::new(ring));
+        Ok(file)
     }
 
     /// Creates a new io_uring instance with the given queue depth.
@@ -147,6 +274,187 @@ impl UringFile {
         IoUring::new(depth).map_err(|e| IoError::UringError {
             message: format!("failed to create io_uring: {}", e),
         })
+    }
+
+    // ─── Registered Buffers (Zero-Copy) ─────────────────────────
+
+    /// Register a pool of buffers with the io_uring instance for zero-copy I/O.
+    ///
+    /// After registration, use [`read_fixed`](Self::read_fixed) and
+    /// [`write_fixed`](Self::write_fixed) with buffer indices for maximum
+    /// performance. The kernel pins the memory once and avoids per-I/O copies.
+    pub fn register_buffers(&self, count: usize, buf_size: usize) -> IoResult<()> {
+        let pool = RegisteredBufferPool::new(count, buf_size);
+        let iovecs = pool.as_iovecs();
+
+        let mut ring = self.ring.lock();
+
+        // SAFETY: iovecs point to valid, pinned memory in `pool.buffers`.
+        // The buffers must remain alive as long as they are registered.
+        let submitter = ring.submitter();
+        submitter
+            .register_buffers(&iovecs)
+            .map_err(|e| IoError::UringError {
+                message: format!("register_buffers failed: {}", e),
+            })?;
+
+        drop(ring);
+
+        *self.registered_buffers.lock() = Some(pool);
+        Ok(())
+    }
+
+    /// Unregister previously registered buffers.
+    pub fn unregister_buffers(&self) -> IoResult<()> {
+        let mut ring = self.ring.lock();
+        let submitter = ring.submitter();
+        submitter
+            .unregister_buffers()
+            .map_err(|e| IoError::UringError {
+                message: format!("unregister_buffers failed: {}", e),
+            })?;
+        drop(ring);
+
+        *self.registered_buffers.lock() = None;
+        Ok(())
+    }
+
+    /// Read using a pre-registered buffer (zero-copy).
+    ///
+    /// Returns the number of bytes read. The data is placed into the
+    /// registered buffer at `buf_idx`; access it via the
+    /// [`RegisteredBufferPool`] returned by [`get_registered_buffers`].
+    pub async fn read_fixed(
+        &self,
+        buf_idx: u16,
+        len: u32,
+        offset: u64,
+    ) -> IoResult<usize> {
+        let ptr = {
+            let pool_guard = self.registered_buffers.lock();
+            let pool = pool_guard.as_ref().ok_or(IoError::UringError {
+                message: "no registered buffers".into(),
+            })?;
+            pool.buffers[buf_idx as usize].as_ptr() as *mut u8
+        };
+
+        let fd = self.target_fd();
+        let mut ring = self.ring.lock();
+
+        let sqe = opcode::ReadFixed::new(fd, ptr, len, buf_idx)
+            .offset(offset)
+            .build()
+            .user_data(0x10);
+
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .map_err(|_| IoError::UringError {
+                    message: "submission queue full".into(),
+                })?;
+        }
+
+        let result = Self::submit_and_wait_one(&mut ring)?;
+        Ok(result as usize)
+    }
+
+    /// Write using a pre-registered buffer (zero-copy).
+    ///
+    /// Writes `len` bytes from the registered buffer at `buf_idx`.
+    pub async fn write_fixed(
+        &self,
+        buf_idx: u16,
+        len: u32,
+        offset: u64,
+    ) -> IoResult<usize> {
+        if !self.writable {
+            return Err(IoError::InvalidOperation {
+                operation: "write_fixed",
+                mode: "read-only",
+            });
+        }
+
+        let ptr = {
+            let pool_guard = self.registered_buffers.lock();
+            let pool = pool_guard.as_ref().ok_or(IoError::UringError {
+                message: "no registered buffers".into(),
+            })?;
+            pool.buffers[buf_idx as usize].as_ptr() as *const u8
+        };
+
+        let fd = self.target_fd();
+        let mut ring = self.ring.lock();
+
+        let sqe = opcode::WriteFixed::new(fd, ptr, len, buf_idx)
+            .offset(offset)
+            .build()
+            .user_data(0x11);
+
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .map_err(|_| IoError::UringError {
+                    message: "submission queue full".into(),
+                })?;
+        }
+
+        let result = Self::submit_and_wait_one(&mut ring)?;
+        Ok(result as usize)
+    }
+
+    /// Access the registered buffer pool (e.g. to read data after `read_fixed`).
+    pub fn with_registered_buffers<F, R>(&self, f: F) -> IoResult<R>
+    where
+        F: FnOnce(&mut RegisteredBufferPool) -> R,
+    {
+        let mut guard = self.registered_buffers.lock();
+        let pool = guard.as_mut().ok_or(IoError::UringError {
+            message: "no registered buffers".into(),
+        })?;
+        Ok(f(pool))
+    }
+
+    // ─── Fixed File Descriptors ─────────────────────────────────
+
+    /// Register this file's fd with the io_uring for fixed-fd operations.
+    ///
+    /// After registration, all SQEs use the registered index instead of
+    /// the raw fd, avoiding per-operation fd lookup in the kernel.
+    pub fn register_files(&mut self) -> IoResult<()> {
+        let fds = [self.fd];
+        let mut ring = self.ring.lock();
+        let submitter = ring.submitter();
+        submitter.register_files(&fds).map_err(|e| IoError::UringError {
+            message: format!("register_files failed: {}", e),
+        })?;
+        drop(ring);
+
+        self.fixed_fd_index = Some(0);
+        Ok(())
+    }
+
+    /// Unregister fixed file descriptors.
+    pub fn unregister_files(&mut self) -> IoResult<()> {
+        let mut ring = self.ring.lock();
+        let submitter = ring.submitter();
+        submitter
+            .unregister_files()
+            .map_err(|e| IoError::UringError {
+                message: format!("unregister_files failed: {}", e),
+            })?;
+        drop(ring);
+
+        self.fixed_fd_index = None;
+        Ok(())
+    }
+
+    /// Returns the target `types::Fd` - either fixed or raw.
+    fn target_fd(&self) -> types::Fd {
+        if let Some(idx) = self.fixed_fd_index {
+            types::Fd(idx as RawFd)
+        } else {
+            types::Fd(self.fd)
+        }
     }
 
     /// Submit a single SQE and wait for its completion.
