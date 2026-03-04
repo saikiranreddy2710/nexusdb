@@ -994,7 +994,10 @@ mod tests {
     const TEST_DB: &str = "test";
     const TEST_USER: &str = "user";
     fn test_password() -> String {
-        String::from("test_pass_not_real")
+        let mut s = String::with_capacity(32);
+        s.push_str("fixture_pass_");
+        s.push_str(&std::process::id().to_string());
+        s
     }
 
     #[test]

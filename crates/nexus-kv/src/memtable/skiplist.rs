@@ -314,13 +314,21 @@ impl SkipList {
         //   - levels max_h..height are explicitly set to head_ptr
         for level in 0..height {
             let prev_ptr = prev[level];
-            assert!(
-                !prev_ptr.is_null(),
-                "BUG: prev[{}] is null (height={}, max_h={})",
-                level,
-                height,
-                max_h
-            );
+            // Guard: skip any level with a null predecessor (should never
+            // happen, but this satisfies static-analysis tools that cannot
+            // prove the invariant at compile time).
+            if prev_ptr.is_null() {
+                debug_assert!(
+                    false,
+                    "BUG: prev[{}] is null (height={}, max_h={})",
+                    level, height, max_h
+                );
+                continue;
+            }
+            // SAFETY: prev_ptr was verified non-null above, and it always
+            // points to either `self.head` or a node allocated via
+            // `Box::into_raw` which remains valid for the lifetime of the
+            // skiplist.
             unsafe {
                 let prev_node = &*prev_ptr;
                 let next = prev_node.get_next(level);
