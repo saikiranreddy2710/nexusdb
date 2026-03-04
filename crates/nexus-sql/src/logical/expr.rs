@@ -627,6 +627,9 @@ impl LogicalExpr {
                 aggregate_return_type(name, args.first().and_then(|a| a.data_type(schema)))
             }
             LogicalExpr::Exists { .. } => Some(DataType::Boolean),
+            LogicalExpr::ScalarFunction { name, args, .. } => {
+                scalar_function_data_type(name, args, schema)
+            }
             _ => None,
         }
     }
@@ -666,6 +669,27 @@ fn literal_data_type(lit: &Literal) -> DataType {
         Literal::Float(_) => DataType::Double,
         Literal::String(_) => DataType::Text,
         Literal::Blob(_) => DataType::Blob,
+        Literal::Vector(v) => DataType::Vector(v.len() as u32),
+    }
+}
+
+fn scalar_function_data_type(
+    name: &str,
+    args: &[LogicalExpr],
+    schema: &Schema,
+) -> Option<DataType> {
+    match name.to_lowercase().as_str() {
+        "upper" | "lower" | "trim" | "concat" | "substring" | "substr" => Some(DataType::Text),
+        "length" | "char_length" => Some(DataType::BigInt),
+        "abs" | "ceil" | "ceiling" | "floor" => Some(DataType::BigInt),
+        "round" | "sqrt" | "power" | "pow" => Some(DataType::Double),
+        "coalesce" => args.first().and_then(|a| a.data_type(schema)),
+        "nullif" => args.first().and_then(|a| a.data_type(schema)),
+        // Vector functions
+        "vector_distance" | "l2_distance" | "cosine_distance" | "cosine_similarity"
+        | "inner_product" | "vector_norm" => Some(DataType::Double),
+        "vector_dims" => Some(DataType::BigInt),
+        _ => None,
     }
 }
 

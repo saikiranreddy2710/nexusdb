@@ -114,6 +114,8 @@ pub struct Database {
     authorizer: Arc<Authorizer>,
     /// Tamper-proof audit log.
     audit_log: Arc<AuditLog>,
+    /// Vector index manager (HNSW indexes).
+    vector_index_manager: Arc<super::vector_index::VectorIndexManager>,
 }
 
 impl Database {
@@ -178,6 +180,8 @@ impl Database {
             tracing::info!("Authentication in permissive mode (all requests allowed)");
         }
 
+        let vector_index_manager = Arc::new(super::vector_index::VectorIndexManager::new());
+
         Ok(Self {
             config,
             databases: RwLock::new(databases),
@@ -189,6 +193,7 @@ impl Database {
             authenticator,
             authorizer,
             audit_log,
+            vector_index_manager,
         })
     }
 
@@ -344,6 +349,11 @@ impl Database {
     /// Returns the audit log.
     pub fn audit_log(&self) -> &Arc<AuditLog> {
         &self.audit_log
+    }
+
+    /// Returns the vector index manager.
+    pub fn vector_index_manager(&self) -> &Arc<super::vector_index::VectorIndexManager> {
+        &self.vector_index_manager
     }
 
     // =========================================================================
@@ -1002,5 +1012,128 @@ mod tests {
             matches!(result, Err(DatabaseError::AuthorizationError(_))),
             "viewer should not be able to DELETE"
         );
+    }
+
+    // =========================================================================
+    // Vector / HNSW Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_vector_create_table_with_vector_column() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        session
+            .execute("CREATE TABLE embeddings (id INT PRIMARY KEY, vec VECTOR(3))")
+            .unwrap();
+
+        // Verify schema via DESCRIBE
+        let result = session.execute("DESCRIBE embeddings").unwrap();
+        if let StatementResult::Query(q) = result {
+            assert!(q.total_rows >= 2, "should have at least 2 columns");
+        } else {
+            panic!("expected query result");
+        }
+    }
+
+    #[test]
+    fn test_vector_create_hnsw_index() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        session
+            .execute("CREATE TABLE docs (id INT PRIMARY KEY, embedding VECTOR(128))")
+            .unwrap();
+
+        session
+            .execute("CREATE INDEX idx_embedding ON docs (embedding)")
+            .unwrap();
+
+        // Verify the index was registered in the vector index manager
+        let vim = db.vector_index_manager();
+        let keys = vim.list_table_indexes(DEFAULT_DATABASE_NAME, "docs");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].index_name, "idx_embedding");
+    }
+
+    #[test]
+    fn test_vector_create_btree_index_on_non_vector() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        session
+            .execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        session
+            .execute("CREATE INDEX idx_name ON items (name)")
+            .unwrap();
+
+        // Should NOT create a vector index
+        let vim = db.vector_index_manager();
+        assert_eq!(vim.num_indexes(), 0);
+    }
+
+    #[test]
+    fn test_vector_drop_index() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        session
+            .execute("CREATE TABLE docs (id INT PRIMARY KEY, embedding VECTOR(64))")
+            .unwrap();
+        session
+            .execute("CREATE INDEX idx_emb ON docs (embedding)")
+            .unwrap();
+
+        assert_eq!(db.vector_index_manager().num_indexes(), 1);
+
+        session.execute("DROP INDEX idx_emb").unwrap();
+
+        assert_eq!(db.vector_index_manager().num_indexes(), 0);
+    }
+
+    #[test]
+    fn test_vector_drop_table_cleans_up_indexes() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        session
+            .execute("CREATE TABLE docs (id INT PRIMARY KEY, embedding VECTOR(64))")
+            .unwrap();
+        session
+            .execute("CREATE INDEX idx_emb ON docs (embedding)")
+            .unwrap();
+
+        assert_eq!(db.vector_index_manager().num_indexes(), 1);
+
+        session.execute("DROP TABLE docs").unwrap();
+
+        assert_eq!(db.vector_index_manager().num_indexes(), 0);
+    }
+
+    #[test]
+    fn test_vector_drop_index_if_exists() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        // Should not error with IF EXISTS
+        session.execute("DROP INDEX IF EXISTS nonexistent").unwrap();
+
+        // Should error without IF EXISTS
+        let result = session.execute("DROP INDEX nonexistent");
+        assert!(result.is_err());
     }
 }

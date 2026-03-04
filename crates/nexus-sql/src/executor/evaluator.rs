@@ -478,8 +478,158 @@ fn evaluate_scalar_function(name: &str, args: &[Value]) -> Result<Value, EvalErr
             }
         }
 
+        // ── Vector distance functions ──────────────────────────────
+        "vector_distance" => {
+            // vector_distance(vec1, vec2 [, metric])
+            // metric: 'l2' (default), 'cosine', 'inner_product'/'ip', 'manhattan'/'l1'
+            if args.len() < 2 {
+                return Err(EvalError::InvalidArgument(
+                    "vector_distance requires at least 2 arguments".to_string(),
+                ));
+            }
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Value::Null);
+            }
+            let vec_a = match &args[0] {
+                Value::Vector(v) => v.as_slice(),
+                _ => {
+                    return Err(EvalError::InvalidArgument(
+                        "vector_distance: first argument must be a VECTOR".to_string(),
+                    ))
+                }
+            };
+            let vec_b = match &args[1] {
+                Value::Vector(v) => v.as_slice(),
+                _ => {
+                    return Err(EvalError::InvalidArgument(
+                        "vector_distance: second argument must be a VECTOR".to_string(),
+                    ))
+                }
+            };
+            if vec_a.len() != vec_b.len() {
+                return Err(EvalError::InvalidArgument(format!(
+                    "vector dimension mismatch: {} vs {}",
+                    vec_a.len(),
+                    vec_b.len()
+                )));
+            }
+            let metric_str = args
+                .get(2)
+                .and_then(|v| v.to_string_value())
+                .unwrap_or_else(|| "l2".to_string());
+            let dist = match metric_str.to_lowercase().as_str() {
+                "l2" | "euclidean" => nexus_hnsw::distance::l2_distance(vec_a, vec_b),
+                "cosine" => nexus_hnsw::distance::cosine_distance(vec_a, vec_b),
+                "inner_product" | "ip" => {
+                    nexus_hnsw::distance::inner_product_distance(vec_a, vec_b)
+                }
+                "manhattan" | "l1" => nexus_hnsw::distance::manhattan_distance(vec_a, vec_b),
+                _ => {
+                    return Err(EvalError::InvalidArgument(format!(
+                        "unknown distance metric: {}",
+                        metric_str
+                    )))
+                }
+            };
+            Ok(Value::Double(dist as f64))
+        }
+
+        "l2_distance" => {
+            if args.len() < 2 || args[0].is_null() || args[1].is_null() {
+                return Ok(Value::Null);
+            }
+            let (a, b) = extract_vector_pair(&args[0], &args[1])?;
+            Ok(Value::Double(nexus_hnsw::distance::l2_distance(a, b) as f64))
+        }
+
+        "cosine_distance" => {
+            if args.len() < 2 || args[0].is_null() || args[1].is_null() {
+                return Ok(Value::Null);
+            }
+            let (a, b) = extract_vector_pair(&args[0], &args[1])?;
+            Ok(Value::Double(
+                nexus_hnsw::distance::cosine_distance(a, b) as f64
+            ))
+        }
+
+        "cosine_similarity" => {
+            if args.len() < 2 || args[0].is_null() || args[1].is_null() {
+                return Ok(Value::Null);
+            }
+            let (a, b) = extract_vector_pair(&args[0], &args[1])?;
+            Ok(Value::Double(
+                nexus_hnsw::distance::cosine_similarity(a, b) as f64
+            ))
+        }
+
+        "inner_product" => {
+            if args.len() < 2 || args[0].is_null() || args[1].is_null() {
+                return Ok(Value::Null);
+            }
+            let (a, b) = extract_vector_pair(&args[0], &args[1])?;
+            Ok(Value::Double(nexus_hnsw::distance::dot_product(a, b) as f64))
+        }
+
+        "vector_dims" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::BigInt(v.len() as i64)),
+                _ => Err(EvalError::InvalidArgument(
+                    "vector_dims: argument must be a VECTOR".to_string(),
+                )),
+            }
+        }
+
+        "vector_norm" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    Ok(Value::Double(norm as f64))
+                }
+                _ => Err(EvalError::InvalidArgument(
+                    "vector_norm: argument must be a VECTOR".to_string(),
+                )),
+            }
+        }
+
         _ => Err(EvalError::UnknownFunction(name.to_string())),
     }
+}
+
+/// Extracts a pair of f32 slices from two Value::Vector arguments.
+fn extract_vector_pair<'a>(
+    a: &'a Value,
+    b: &'a Value,
+) -> Result<(&'a [f32], &'a [f32]), EvalError> {
+    let va = match a {
+        Value::Vector(v) => v.as_slice(),
+        _ => {
+            return Err(EvalError::InvalidArgument(
+                "expected VECTOR argument".to_string(),
+            ))
+        }
+    };
+    let vb = match b {
+        Value::Vector(v) => v.as_slice(),
+        _ => {
+            return Err(EvalError::InvalidArgument(
+                "expected VECTOR argument".to_string(),
+            ))
+        }
+    };
+    if va.len() != vb.len() {
+        return Err(EvalError::InvalidArgument(format!(
+            "vector dimension mismatch: {} vs {}",
+            va.len(),
+            vb.len()
+        )));
+    }
+    Ok((va, vb))
 }
 
 /// Matches a value against a SQL LIKE pattern.
@@ -967,5 +1117,157 @@ mod tests {
         acc.accumulate(&Value::int(20));
 
         assert_eq!(acc.result(), Value::Int(30));
+    }
+
+    // =========================================================================
+    // Vector function tests
+    // =========================================================================
+
+    #[test]
+    fn test_vector_distance_l2() {
+        let a = Value::Vector(vec![1.0, 0.0, 0.0]);
+        let b = Value::Vector(vec![0.0, 1.0, 0.0]);
+        let result = evaluate_scalar_function("vector_distance", &[a, b]).unwrap();
+        if let Value::Double(d) = result {
+            assert!((d - std::f64::consts::SQRT_2).abs() < 1e-5);
+        } else {
+            panic!("expected Double, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_vector_distance_cosine() {
+        let a = Value::Vector(vec![1.0, 0.0]);
+        let b = Value::Vector(vec![0.0, 1.0]);
+        let metric = Value::String("cosine".to_string());
+        let result = evaluate_scalar_function("vector_distance", &[a, b, metric]).unwrap();
+        if let Value::Double(d) = result {
+            assert!(
+                (d - 1.0).abs() < 1e-5,
+                "cosine distance of orthogonal = 1.0"
+            );
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn test_vector_distance_inner_product() {
+        let a = Value::Vector(vec![1.0, 2.0, 3.0]);
+        let b = Value::Vector(vec![4.0, 5.0, 6.0]);
+        let metric = Value::String("ip".to_string());
+        let result = evaluate_scalar_function("vector_distance", &[a, b, metric]).unwrap();
+        if let Value::Double(d) = result {
+            // ip distance = -dot = -(4+10+18) = -32
+            assert!((d - (-32.0)).abs() < 1e-5);
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn test_vector_distance_null_handling() {
+        let a = Value::Null;
+        let b = Value::Vector(vec![1.0, 2.0]);
+        let result = evaluate_scalar_function("vector_distance", &[a, b]).unwrap();
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_vector_distance_dimension_mismatch() {
+        let a = Value::Vector(vec![1.0, 2.0]);
+        let b = Value::Vector(vec![1.0, 2.0, 3.0]);
+        let result = evaluate_scalar_function("vector_distance", &[a, b]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_l2_distance_function() {
+        let a = Value::Vector(vec![3.0, 0.0]);
+        let b = Value::Vector(vec![0.0, 4.0]);
+        let result = evaluate_scalar_function("l2_distance", &[a, b]).unwrap();
+        if let Value::Double(d) = result {
+            assert!((d - 5.0).abs() < 1e-5); // 3-4-5 triangle
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn test_cosine_similarity_function() {
+        let a = Value::Vector(vec![1.0, 0.0]);
+        let b = Value::Vector(vec![1.0, 0.0]);
+        let result = evaluate_scalar_function("cosine_similarity", &[a, b]).unwrap();
+        if let Value::Double(d) = result {
+            assert!((d - 1.0).abs() < 1e-5, "identical vectors = 1.0");
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn test_cosine_distance_function() {
+        let a = Value::Vector(vec![1.0, 0.0]);
+        let b = Value::Vector(vec![1.0, 0.0]);
+        let result = evaluate_scalar_function("cosine_distance", &[a, b]).unwrap();
+        if let Value::Double(d) = result {
+            assert!(d.abs() < 1e-5, "identical vectors = distance 0");
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn test_inner_product_function() {
+        let a = Value::Vector(vec![1.0, 2.0, 3.0]);
+        let b = Value::Vector(vec![4.0, 5.0, 6.0]);
+        let result = evaluate_scalar_function("inner_product", &[a, b]).unwrap();
+        if let Value::Double(d) = result {
+            assert!((d - 32.0).abs() < 1e-5);
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn test_vector_dims_function() {
+        let v = Value::Vector(vec![1.0, 2.0, 3.0, 4.0]);
+        let result = evaluate_scalar_function("vector_dims", &[v]).unwrap();
+        assert_eq!(result, Value::BigInt(4));
+    }
+
+    #[test]
+    fn test_vector_norm_function() {
+        let v = Value::Vector(vec![3.0, 4.0]);
+        let result = evaluate_scalar_function("vector_norm", &[v]).unwrap();
+        if let Value::Double(d) = result {
+            assert!((d - 5.0).abs() < 1e-5); // sqrt(9+16) = 5
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn test_vector_distance_unknown_metric() {
+        let a = Value::Vector(vec![1.0]);
+        let b = Value::Vector(vec![2.0]);
+        let metric = Value::String("unknown_metric".to_string());
+        let result = evaluate_scalar_function("vector_distance", &[a, b, metric]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vector_distance_too_few_args() {
+        let a = Value::Vector(vec![1.0]);
+        let result = evaluate_scalar_function("vector_distance", &[a]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vector_distance_non_vector_args() {
+        let a = Value::Int(1);
+        let b = Value::Vector(vec![1.0]);
+        let result = evaluate_scalar_function("vector_distance", &[a, b]);
+        assert!(result.is_err());
     }
 }

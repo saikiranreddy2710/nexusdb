@@ -1247,6 +1247,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-hnsw"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "nexus-kv"
 version = "0.1.0"
 dependencies = [
@@ -1348,6 +1360,7 @@ dependencies = [
  "nexus-buffer",
  "nexus-cache",
  "nexus-common",
+ "nexus-hnsw",
  "nexus-mvcc",
  "nexus-proto",
  "nexus-query",
@@ -1374,6 +1387,7 @@ name = "nexus-sql"
 version = "0.1.0"
 dependencies = [
  "nexus-common",
+ "nexus-hnsw",
  "nexus-storage",
  "proptest",
  "serde",

@@ -67,11 +67,13 @@ mod engine;
 mod error;
 mod result;
 mod session;
+mod vector_index;
 
 pub use engine::{Database, DatabaseConfig, DatabaseStats, DEFAULT_DATABASE_NAME};
 pub use error::{DatabaseError, DatabaseResult};
 pub use result::{ExecuteResult, StatementResult};
 pub use session::{Session, SessionConfig, SessionId, SessionState};
+pub use vector_index::{VectorIndexKey, VectorIndexManager};
 
 // Re-export security types for convenience
 pub use nexus_security::{

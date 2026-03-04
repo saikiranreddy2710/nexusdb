@@ -40,6 +40,8 @@ pub enum Value {
     Time(i64),
     /// Timestamp (microseconds since epoch).
     Timestamp(i64),
+    /// Vector of f32 values (for embeddings / similarity search).
+    Vector(Vec<f32>),
 }
 
 impl Value {
@@ -73,6 +75,35 @@ impl Value {
         Value::String(v.into())
     }
 
+    /// Creates a vector value.
+    pub fn vector(v: Vec<f32>) -> Self {
+        Value::Vector(v)
+    }
+
+    /// Parses a vector from a string like `[1.0, 2.0, 3.0]`.
+    pub fn parse_vector(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let s = s
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .ok_or_else(|| "vector literal must be enclosed in brackets: [...]".to_string())?;
+
+        if s.trim().is_empty() {
+            return Ok(Value::Vector(Vec::new()));
+        }
+
+        let values: Result<Vec<f32>, String> = s
+            .split(',')
+            .map(|v| {
+                v.trim()
+                    .parse::<f32>()
+                    .map_err(|e| format!("invalid vector element '{}': {}", v.trim(), e))
+            })
+            .collect();
+
+        Ok(Value::Vector(values?))
+    }
+
     /// Returns true if this value is NULL.
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
@@ -93,6 +124,7 @@ impl Value {
             Value::String(s) => !s.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
             Value::Date(_) | Value::Time(_) | Value::Timestamp(_) => true,
+            Value::Vector(v) => !v.is_empty(),
         }
     }
 
@@ -124,7 +156,7 @@ impl Value {
             Value::Date(d) => Some(*d as i64),
             Value::Time(t) => Some(*t),
             Value::Timestamp(t) => Some(*t),
-            Value::Bytes(_) => None,
+            Value::Bytes(_) | Value::Vector(_) => None,
         }
     }
 
@@ -144,7 +176,11 @@ impl Value {
                 Some(*value as f64 / divisor)
             }
             Value::String(s) => s.parse().ok(),
-            Value::Date(_) | Value::Time(_) | Value::Timestamp(_) | Value::Bytes(_) => None,
+            Value::Date(_)
+            | Value::Time(_)
+            | Value::Timestamp(_)
+            | Value::Bytes(_)
+            | Value::Vector(_) => None,
         }
     }
 
@@ -179,6 +215,10 @@ impl Value {
             Value::Date(d) => Some(format!("date:{}", d)),
             Value::Time(t) => Some(format!("time:{}", t)),
             Value::Timestamp(t) => Some(format!("ts:{}", t)),
+            Value::Vector(v) => {
+                let elems: Vec<std::string::String> = v.iter().map(|f| f.to_string()).collect();
+                Some(format!("[{}]", elems.join(",")))
+            }
         }
     }
 
@@ -202,6 +242,7 @@ impl Value {
             Value::Date(_) => DataType::Date,
             Value::Time(_) => DataType::Time,
             Value::Timestamp(_) => DataType::Timestamp,
+            Value::Vector(v) => DataType::Vector(v.len() as u32),
         }
     }
 
@@ -244,6 +285,13 @@ impl Value {
                 .to_string_value()
                 .map(Value::String)
                 .ok_or_else(|| "Cannot cast to string".to_string()),
+            DataType::Vector(_) => match self {
+                Value::String(s) => {
+                    Value::parse_vector(s).map_err(|e| format!("Cannot cast to vector: {}", e))
+                }
+                Value::Vector(_) => Ok(self.clone()),
+                _ => Err(format!("Cannot cast {:?} to VECTOR", self.data_type())),
+            },
             _ => Err(format!("Unsupported cast to {:?}", target)),
         }
     }
@@ -257,6 +305,7 @@ impl Value {
             Literal::Float(f) => Value::Double(*f),
             Literal::String(s) => Value::String(s.clone()),
             Literal::Blob(b) => Value::Bytes(b.clone()),
+            Literal::Vector(v) => Value::Vector(v.clone()),
         }
     }
 }
@@ -278,6 +327,12 @@ impl PartialEq for Value {
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::Time(a), Value::Time(b)) => a == b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| (x - y).abs() < f32::EPSILON)
+            }
             // Cross-type numeric comparisons
             (a, b) => {
                 if let (Some(a_f), Some(b_f)) = (a.to_f64(), b.to_f64()) {
@@ -356,6 +411,12 @@ impl Hash for Value {
             Value::Date(d) => d.hash(state),
             Value::Time(t) => t.hash(state),
             Value::Timestamp(t) => t.hash(state),
+            Value::Vector(v) => {
+                v.len().hash(state);
+                for f in v {
+                    f.to_bits().hash(state);
+                }
+            }
         }
     }
 }
@@ -392,6 +453,16 @@ impl fmt::Display for Value {
             Value::Date(d) => write!(f, "{}", d),
             Value::Time(t) => write!(f, "{}", t),
             Value::Timestamp(t) => write!(f, "{}", t),
+            Value::Vector(v) => {
+                write!(f, "[")?;
+                for (i, val) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", val)?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }

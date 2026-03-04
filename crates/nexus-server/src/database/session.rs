@@ -412,6 +412,16 @@ impl Session {
                 .authorizer
                 .check_global(&self.identity, Privilege::Drop),
 
+            // CREATE/DROP INDEX requires table-level privilege
+            Statement::CreateIndex(ci) => {
+                self.authorizer
+                    .check_table(&self.identity, db, &ci.table.table, Privilege::Create)
+            }
+            Statement::DropIndex(_) => {
+                self.authorizer
+                    .check_database(&self.identity, db, Privilege::Drop)
+            }
+
             // Transaction control, SHOW, DESCRIBE, USE - always allowed
             Statement::Begin
             | Statement::Commit
@@ -460,6 +470,8 @@ impl Session {
             }
             Statement::CreateTable(_)
             | Statement::DropTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
             | Statement::CreateDatabase { .. }
             | Statement::DropDatabase { .. } => AuditAction::SchemaChange,
             _ => AuditAction::Query,
@@ -482,6 +494,8 @@ impl Session {
                     .join(", "),
             ),
             Statement::DescribeTable(name) => Some(name.to_string()),
+            Statement::CreateIndex(ci) => Some(format!("{} ON {}", ci.name, ci.table.table)),
+            Statement::DropIndex(di) => Some(di.names.join(", ")),
             Statement::CreateDatabase { name, .. } | Statement::DropDatabase { name, .. } => {
                 Some(name.clone())
             }
@@ -557,6 +571,17 @@ impl Session {
                     self.result_cache.invalidate_table(&table_ref.table);
                 }
                 self.execute_drop_table(drop)
+            }
+            Statement::CreateIndex(create_index) => {
+                self.plan_cache.clear();
+                self.result_cache
+                    .invalidate_table(&create_index.table.table);
+                self.execute_create_index(create_index)
+            }
+            Statement::DropIndex(drop_index) => {
+                self.plan_cache.clear();
+                self.result_cache.clear();
+                self.execute_drop_index(drop_index)
             }
 
             // DML - invalidate result cache for affected tables
@@ -676,9 +701,143 @@ impl Session {
                     nexus_sql::storage::StorageError::TableNotFound(name.clone()),
                 ));
             }
+            // Also clean up any vector indexes for this table
+            self.database
+                .vector_index_manager()
+                .drop_table_indexes(&self.current_database, name);
             self.storage().drop_table(name)?;
         }
         Ok(StatementResult::ddl("DROP TABLE"))
+    }
+
+    /// Executes CREATE INDEX.
+    fn execute_create_index(
+        &self,
+        create: &nexus_sql::parser::CreateIndexStatement,
+    ) -> DatabaseResult<StatementResult> {
+        use nexus_sql::parser::DataType;
+
+        let table_name = &create.table.table;
+        let table_info = self.storage().get_table_info(table_name).ok_or_else(|| {
+            DatabaseError::StorageError(nexus_sql::storage::StorageError::TableNotFound(
+                table_name.clone(),
+            ))
+        })?;
+
+        // Resolve column indices
+        let mut col_indices = Vec::new();
+        for col_expr in &create.columns {
+            let col_name = col_expr.expr.to_string();
+            let idx = table_info
+                .schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == col_name)
+                .ok_or_else(|| {
+                    DatabaseError::ExecutionError(format!(
+                        "column \"{}\" not found in table \"{}\"",
+                        col_name, table_name
+                    ))
+                })?;
+            col_indices.push(idx);
+        }
+
+        if col_indices.is_empty() {
+            return Err(DatabaseError::ExecutionError(
+                "CREATE INDEX requires at least one column".to_string(),
+            ));
+        }
+
+        // Detect if this is a vector index:
+        // a single VECTOR column gets an HNSW index automatically
+        let is_vector_index = col_indices.len() == 1 && {
+            let field = &table_info.schema.fields()[col_indices[0]];
+            matches!(field.data_type, DataType::Vector(_))
+        };
+
+        if is_vector_index {
+            let col_idx = col_indices[0];
+            let field = &table_info.schema.fields()[col_idx];
+            let dim = match &field.data_type {
+                DataType::Vector(d) => *d,
+                _ => unreachable!(),
+            };
+
+            let metric =
+                super::vector_index::parse_metric("l2").unwrap_or(nexus_hnsw::DistanceMetric::L2);
+            let m = 16;
+            let ef_construction = 200;
+
+            let key = super::vector_index::VectorIndexKey::new(
+                &self.current_database,
+                table_name,
+                &create.name,
+            );
+            self.database
+                .vector_index_manager()
+                .create_index(key, dim, metric, m, ef_construction)
+                .map_err(|e| {
+                    DatabaseError::ExecutionError(format!("failed to create vector index: {}", e))
+                })?;
+
+            // Register in catalog
+            let index_info = nexus_sql::storage::IndexInfo::hnsw(
+                &create.name,
+                col_idx,
+                "l2",
+                m,
+                ef_construction,
+            );
+            self.storage().catalog().add_index(table_name, index_info)?;
+
+            tracing::info!(
+                "Created HNSW vector index \"{}\" on {}.{} ({}D, L2)",
+                create.name,
+                table_name,
+                field.name(),
+                dim
+            );
+        } else {
+            // Standard BTree index (metadata only for now)
+            let index_info =
+                nexus_sql::storage::IndexInfo::new(&create.name, col_indices, create.unique);
+            self.storage().catalog().add_index(table_name, index_info)?;
+
+            tracing::info!("Created index \"{}\" on {}", create.name, table_name);
+        }
+
+        Ok(StatementResult::ddl("CREATE INDEX"))
+    }
+
+    /// Executes DROP INDEX.
+    fn execute_drop_index(
+        &self,
+        drop: &nexus_sql::parser::DropIndexStatement,
+    ) -> DatabaseResult<StatementResult> {
+        let storage = self.storage();
+        for name in &drop.names {
+            // Try to find which table this index belongs to
+            let dropped = storage.catalog().drop_index(name);
+
+            if !dropped && !drop.if_exists {
+                return Err(DatabaseError::ExecutionError(format!(
+                    "index \"{}\" does not exist",
+                    name
+                )));
+            }
+
+            // Also drop from vector index manager (if it was a vector index)
+            // We check all tables since we don't know which table the index belongs to
+            let vim = self.database.vector_index_manager();
+            let keys = vim.list_indexes(&self.current_database);
+            for key in keys {
+                if key.index_name == *name {
+                    vim.drop_index(&key);
+                    break;
+                }
+            }
+        }
+        Ok(StatementResult::ddl("DROP INDEX"))
     }
 
     /// Executes INSERT.

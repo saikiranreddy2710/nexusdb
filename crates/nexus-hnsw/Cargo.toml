@@ -1,0 +1,18 @@
+[package]
+name = "nexus-hnsw"
+description = "HNSW (Hierarchical Navigable Small World) vector index for NexusDB"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+parking_lot = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

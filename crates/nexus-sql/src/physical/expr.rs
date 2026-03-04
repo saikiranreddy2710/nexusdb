@@ -253,6 +253,21 @@ impl fmt::Display for PhysicalExpr {
     }
 }
 
+/// Returns the return type for a scalar function by name.
+fn scalar_function_return_type(name: &str) -> DataType {
+    match name.to_lowercase().as_str() {
+        "upper" | "lower" | "trim" | "concat" | "substring" | "substr" => DataType::Text,
+        "length" | "char_length" => DataType::BigInt,
+        "abs" | "ceil" | "ceiling" | "floor" => DataType::BigInt,
+        "round" | "sqrt" | "power" | "pow" => DataType::Double,
+        // Vector functions
+        "vector_distance" | "l2_distance" | "cosine_distance" | "cosine_similarity"
+        | "inner_product" | "vector_norm" => DataType::Double,
+        "vector_dims" => DataType::BigInt,
+        _ => DataType::Text, // fallback
+    }
+}
+
 /// Returns the data type of a literal value.
 fn literal_data_type(lit: &Literal) -> DataType {
     match lit {
@@ -262,6 +277,7 @@ fn literal_data_type(lit: &Literal) -> DataType {
         Literal::Float(_) => DataType::Double,
         Literal::String(_) => DataType::Text,
         Literal::Blob(_) => DataType::Blob,
+        Literal::Vector(v) => DataType::Vector(v.len() as u32),
     }
 }
 
@@ -544,10 +560,11 @@ pub fn create_physical_expr(expr: &LogicalExpr, schema: &Schema) -> Result<Physi
                 .iter()
                 .map(|a| create_physical_expr(a, schema))
                 .collect();
+            let return_type = scalar_function_return_type(name);
             Ok(PhysicalExpr::ScalarFunction {
                 name: name.clone(),
                 args: phys_args?,
-                return_type: DataType::Text, // Would need function registry
+                return_type,
             })
         }
 

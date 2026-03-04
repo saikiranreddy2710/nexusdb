@@ -71,6 +71,28 @@ impl TableInfo {
     }
 }
 
+/// The type of index.
+#[derive(Debug, Clone)]
+pub enum IndexType {
+    /// Standard B-tree index.
+    BTree,
+    /// HNSW vector index.
+    Hnsw {
+        /// Distance metric name (l2, cosine, inner_product, manhattan).
+        metric: String,
+        /// Max connections per layer.
+        m: usize,
+        /// Construction candidate list size.
+        ef_construction: usize,
+    },
+}
+
+impl Default for IndexType {
+    fn default() -> Self {
+        IndexType::BTree
+    }
+}
+
 /// Index information.
 #[derive(Debug, Clone)]
 pub struct IndexInfo {
@@ -80,15 +102,38 @@ pub struct IndexInfo {
     pub columns: Vec<usize>,
     /// Whether the index is unique.
     pub unique: bool,
+    /// Type of index (BTree or HNSW).
+    pub index_type: IndexType,
 }
 
 impl IndexInfo {
-    /// Creates a new index.
+    /// Creates a new BTree index.
     pub fn new(name: impl Into<String>, columns: Vec<usize>, unique: bool) -> Self {
         Self {
             name: name.into(),
             columns,
             unique,
+            index_type: IndexType::BTree,
+        }
+    }
+
+    /// Creates a new HNSW vector index.
+    pub fn hnsw(
+        name: impl Into<String>,
+        column: usize,
+        metric: impl Into<String>,
+        m: usize,
+        ef_construction: usize,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            columns: vec![column],
+            unique: false,
+            index_type: IndexType::Hnsw {
+                metric: metric.into(),
+                m,
+                ef_construction,
+            },
         }
     }
 }
@@ -187,6 +232,40 @@ impl Catalog {
         } else {
             Err(StorageError::TableNotFound(name.to_string()))
         }
+    }
+
+    /// Adds an index to a table.
+    pub fn add_index(&self, table_name: &str, index: IndexInfo) -> StorageResult<()> {
+        let mut tables = self.tables.write().unwrap();
+
+        let info = tables
+            .get_mut(table_name)
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
+
+        // Check for duplicate index name
+        if info.indexes.iter().any(|i| i.name == index.name) {
+            return Err(StorageError::InvalidOperation(format!(
+                "index \"{}\" already exists on table \"{}\"",
+                index.name, table_name
+            )));
+        }
+
+        info.indexes.push(index);
+        Ok(())
+    }
+
+    /// Drops an index by name (searches all tables). Returns true if found.
+    pub fn drop_index(&self, index_name: &str) -> bool {
+        let mut tables = self.tables.write().unwrap();
+
+        for info in tables.values_mut() {
+            let before = info.indexes.len();
+            info.indexes.retain(|i| i.name != index_name);
+            if info.indexes.len() < before {
+                return true;
+            }
+        }
+        false
     }
 }
 

@@ -59,6 +59,7 @@ enum TypeTag {
     Date = 11,
     Time = 12,
     Timestamp = 13,
+    Vector = 14,
 }
 
 impl TypeTag {
@@ -78,6 +79,7 @@ impl TypeTag {
             11 => Some(TypeTag::Date),
             12 => Some(TypeTag::Time),
             13 => Some(TypeTag::Timestamp),
+            14 => Some(TypeTag::Vector),
             _ => None,
         }
     }
@@ -271,6 +273,14 @@ impl RowEncoder {
                 buf.push(TypeTag::Timestamp as u8);
                 buf.extend_from_slice(&ts.to_le_bytes());
             }
+            Value::Vector(v) => {
+                buf.push(TypeTag::Vector as u8);
+                // Write number of dimensions (u32), then each f32
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for f in v {
+                    buf.extend_from_slice(&f.to_le_bytes());
+                }
+            }
         }
         Ok(())
     }
@@ -306,6 +316,10 @@ fn value_to_json(value: &Value) -> String {
         Value::Date(d) => format!("\"{}\"", d),
         Value::Time(t) => format!("\"{}\"", t),
         Value::Timestamp(ts) => format!("\"{}\"", ts),
+        Value::Vector(v) => {
+            let elems: Vec<String> = v.iter().map(|f| f.to_string()).collect();
+            format!("[{}]", elems.join(","))
+        }
     }
 }
 
@@ -536,6 +550,27 @@ impl RowDecoder {
                 let v = i64::from_le_bytes(bytes[1..9].try_into().unwrap());
                 (Value::Timestamp(v), 9)
             }
+            TypeTag::Vector => {
+                if bytes.len() < 5 {
+                    return Err(StorageError::EncodingError(
+                        "Missing vector length".to_string(),
+                    ));
+                }
+                let dim = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+                let data_len = dim * 4;
+                if bytes.len() < 5 + data_len {
+                    return Err(StorageError::EncodingError(
+                        "Vector data truncated".to_string(),
+                    ));
+                }
+                let mut v = Vec::with_capacity(dim);
+                for i in 0..dim {
+                    let offset = 5 + i * 4;
+                    let f = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                    v.push(f);
+                }
+                (Value::Vector(v), 5 + data_len)
+            }
         };
 
         Ok((value, size))
@@ -659,5 +694,46 @@ mod tests {
             let decoded = decoder.decode(&encoded).unwrap();
             assert_eq!(decoded.get(0), Some(&value), "Failed for {:?}", value);
         }
+    }
+
+    #[test]
+    fn test_encode_decode_vector() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::not_null("id", DataType::Int),
+            Field::not_null("vec", DataType::Vector(3)),
+        ]));
+        let encoder = RowEncoder::new(1, vec![0], schema.clone());
+        let decoder = RowDecoder::new(schema);
+
+        let row = Row::new(vec![Value::Int(1), Value::Vector(vec![1.5, 2.5, 3.5])]);
+
+        let encoded = encoder.encode_value(&row).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        assert_eq!(decoded.get(0), Some(&Value::Int(1)));
+        assert_eq!(decoded.get(1), Some(&Value::Vector(vec![1.5, 2.5, 3.5])));
+    }
+
+    #[test]
+    fn test_encode_decode_empty_vector() {
+        let schema = Arc::new(Schema::new(vec![Field::not_null(
+            "vec",
+            DataType::Vector(0),
+        )]));
+        let encoder = RowEncoder::new(1, vec![], schema.clone());
+        let decoder = RowDecoder::new(schema);
+
+        let row = Row::new(vec![Value::Vector(vec![])]);
+        let encoded = encoder.encode_value(&row).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        assert_eq!(decoded.get(0), Some(&Value::Vector(vec![])));
+    }
+
+    #[test]
+    fn test_vector_value_json_encoding() {
+        let v = Value::Vector(vec![1.0, 2.5, 3.0]);
+        let json = value_to_json(&v);
+        assert_eq!(json, "[1,2.5,3]");
     }
 }

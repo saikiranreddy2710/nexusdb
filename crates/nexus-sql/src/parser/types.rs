@@ -59,6 +59,9 @@ pub enum DataType {
     Jsonb,
     /// Array of another type.
     Array(Box<DataType>),
+    /// Fixed-dimension vector of f32 for embeddings / similarity search.
+    /// The `u32` is the number of dimensions (e.g. 128, 768, 1536).
+    Vector(u32),
     /// Nullable wrapper.
     Nullable(Box<DataType>),
 }
@@ -84,6 +87,11 @@ impl DataType {
             self,
             DataType::Char(_) | DataType::Varchar(_) | DataType::Text
         )
+    }
+
+    /// Returns true if this type is a vector type.
+    pub fn is_vector(&self) -> bool {
+        matches!(self, DataType::Vector(_))
     }
 
     /// Returns true if this type is a temporal type.
@@ -153,6 +161,35 @@ impl DataType {
                 };
                 Ok(DataType::Array(Box::new(inner)))
             }
+            // Handle VECTOR(n) as a custom type from sqlparser
+            sql_ast::DataType::Custom(name, args) => {
+                let type_name = name
+                    .0
+                    .iter()
+                    .map(|id| id.value.to_uppercase())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if type_name == "VECTOR" {
+                    let dim = if args.is_empty() {
+                        return Err(ParseError::Unsupported(
+                            "VECTOR type requires a dimension, e.g. VECTOR(128)".to_string(),
+                        ));
+                    } else {
+                        args[0].parse::<u32>().map_err(|_| {
+                            ParseError::InvalidLiteral(format!(
+                                "Invalid VECTOR dimension: {}",
+                                args[0]
+                            ))
+                        })?
+                    };
+                    Ok(DataType::Vector(dim))
+                } else {
+                    Err(ParseError::Unsupported(format!(
+                        "Custom data type: {}",
+                        type_name
+                    )))
+                }
+            }
             _ => Err(ParseError::Unsupported(format!("Data type: {:?}", dt))),
         }
     }
@@ -192,6 +229,7 @@ impl fmt::Display for DataType {
             DataType::Json => write!(f, "JSON"),
             DataType::Jsonb => write!(f, "JSONB"),
             DataType::Array(inner) => write!(f, "{}[]", inner),
+            DataType::Vector(dim) => write!(f, "VECTOR({})", dim),
             DataType::Nullable(inner) => write!(f, "{}", inner),
         }
     }
@@ -212,6 +250,8 @@ pub enum Literal {
     String(String),
     /// Binary data.
     Blob(Vec<u8>),
+    /// Vector literal (list of f32 values).
+    Vector(Vec<f32>),
 }
 
 impl Literal {
@@ -259,6 +299,16 @@ impl fmt::Display for Literal {
             Literal::Float(v) => write!(f, "{}", v),
             Literal::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
             Literal::Blob(b) => write!(f, "X'{}'", bytes_to_hex(b)),
+            Literal::Vector(v) => {
+                write!(f, "[")?;
+                for (i, val) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", val)?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -441,6 +491,19 @@ mod tests {
         assert_eq!(Literal::Integer(42).to_string(), "42");
         assert_eq!(Literal::String("hello".to_string()).to_string(), "'hello'");
         assert_eq!(Literal::Boolean(true).to_string(), "TRUE");
+    }
+
+    #[test]
+    fn test_vector_type() {
+        assert!(DataType::Vector(128).is_vector());
+        assert!(!DataType::Int.is_vector());
+        assert_eq!(DataType::Vector(768).to_string(), "VECTOR(768)");
+    }
+
+    #[test]
+    fn test_vector_literal() {
+        let lit = Literal::Vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(lit.to_string(), "[1,2,3]");
     }
 
     #[test]
