@@ -159,16 +159,6 @@ crates/
 - RBAC authorization with role inheritance
 - Tamper-proof audit logging
 
-## What's Planned
-
-- Vector data type and HNSW index (Phase 4)
-- ML integration and embedding generation (Phase 5)
-- Agent-first semantic API (Phase 6)
-- Learned indexes and time-travel queries (Phase 7)
-- Graph database (node/edge tables, Cypher-like queries) (Phase 8)
-- Natural language interface (Text-to-SQL) (Phase 9)
-- Autonomous self-tuning database (Phase 10)
-
 ## Running Tests
 
 ```bash
