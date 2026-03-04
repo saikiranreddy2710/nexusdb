@@ -56,6 +56,9 @@ pub struct Role {
     pub permissions: HashSet<Permission>,
     /// Roles this role inherits from.
     pub inherits: Vec<String>,
+    /// Whether this role is a built-in role that cannot be dropped.
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 impl Role {
@@ -64,6 +67,7 @@ impl Role {
             name: name.into(),
             permissions: HashSet::new(),
             inherits: Vec::new(),
+            builtin: false,
         }
     }
 
@@ -107,13 +111,12 @@ impl Authorizer {
     pub fn new(enforce: bool) -> Self {
         let mut roles = HashMap::new();
 
-        // Built-in superuser role has global ALL privilege
-        roles.insert(
-            "superuser".to_string(),
-            Role::new("superuser").with_permission(Permission::Global {
-                privilege: Privilege::All,
-            }),
-        );
+        // Built-in superuser role has global ALL privilege and cannot be dropped
+        let mut superuser_role = Role::new("superuser").with_permission(Permission::Global {
+            privilege: Privilege::All,
+        });
+        superuser_role.builtin = true;
+        roles.insert("superuser".to_string(), superuser_role);
 
         Self {
             roles: RwLock::new(roles),
@@ -126,6 +129,11 @@ impl Authorizer {
         Self::new(false)
     }
 
+    /// Whether authorization is enforced.
+    pub fn is_enforcing(&self) -> bool {
+        self.enforce
+    }
+
     /// Define a new role.
     pub fn create_role(&self, role: Role) {
         let mut roles = self.roles.write();
@@ -133,9 +141,18 @@ impl Authorizer {
     }
 
     /// Drop a role.
-    pub fn drop_role(&self, name: &str) {
+    ///
+    /// Returns `false` if the role does not exist or is a built-in role.
+    pub fn drop_role(&self, name: &str) -> bool {
         let mut roles = self.roles.write();
-        roles.remove(name);
+        // Protect built-in roles from deletion
+        if let Some(role) = roles.get(name) {
+            if role.builtin {
+                tracing::warn!(role = name, "cannot drop built-in role");
+                return false;
+            }
+        }
+        roles.remove(name).is_some()
     }
 
     /// Grant a permission to a role.
@@ -247,6 +264,33 @@ impl Authorizer {
         AccessDecision::Deny(format!(
             "user '{}' lacks {:?} on database '{}'",
             identity.username, privilege, database
+        ))
+    }
+
+    /// Check global server-level permission.
+    pub fn check_global(&self, identity: &Identity, privilege: Privilege) -> AccessDecision {
+        if !self.enforce {
+            return AccessDecision::Allow;
+        }
+        if identity.is_superuser() {
+            return AccessDecision::Allow;
+        }
+
+        let roles = self.roles.read();
+        let mut visited = HashSet::new();
+        let effective = self.collect_permissions(identity, &roles, &mut visited);
+
+        for perm in &effective {
+            if let Permission::Global { privilege: p } = perm {
+                if p.satisfies(&privilege) {
+                    return AccessDecision::Allow;
+                }
+            }
+        }
+
+        AccessDecision::Deny(format!(
+            "user '{}' lacks global {:?} privilege",
+            identity.username, privilege
         ))
     }
 
@@ -417,5 +461,37 @@ mod tests {
         assert!(!authz
             .check_table(&id, "db", "t", Privilege::Select)
             .is_allowed());
+    }
+
+    #[test]
+    fn test_builtin_superuser_cannot_be_dropped() {
+        let authz = Authorizer::new(true);
+
+        // Attempting to drop the built-in superuser role should fail
+        assert!(!authz.drop_role("superuser"));
+
+        // Superuser role should still exist and work
+        let id = Identity::system();
+        assert!(authz
+            .check_table(&id, "any", "table", Privilege::Delete)
+            .is_allowed());
+    }
+
+    #[test]
+    fn test_custom_role_can_be_dropped() {
+        let authz = Authorizer::new(true);
+        authz.create_role(Role::new("temp_role"));
+        assert!(authz.drop_role("temp_role"));
+    }
+
+    #[test]
+    fn test_check_global() {
+        let authz = Authorizer::new(true);
+
+        let id = Identity::system();
+        assert!(authz.check_global(&id, Privilege::Create).is_allowed());
+
+        let limited = analyst_identity();
+        assert!(!authz.check_global(&limited, Privilege::Create).is_allowed());
     }
 }

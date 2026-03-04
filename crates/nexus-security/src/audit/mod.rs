@@ -4,8 +4,13 @@
 //! to its predecessor via a SHA-256 hash, forming an append-only chain.
 //! Modifying or deleting any entry breaks the chain, making tampering
 //! detectable.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//!
+//! # Thread Safety
+//!
+//! All state is protected by a single `Mutex` to guarantee atomicity of
+//! sequence allocation, hash chaining, and entry insertion.  This prevents
+//! the race condition where two concurrent `record()` calls could observe
+//! the same `prev_hash`.
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -83,12 +88,29 @@ impl AuditEntry {
     }
 }
 
+/// Genesis hash (64 hex zeros).
+fn genesis_hash() -> String {
+    "0".repeat(64)
+}
+
+/// Consolidated inner state protected by a single mutex to prevent
+/// race conditions in the hash chain.
+#[derive(Debug)]
+struct AuditLogInner {
+    entries: Vec<AuditEntry>,
+    next_seq: u64,
+    last_hash: String,
+    /// Hash at the start of the retained window.  After eviction, the first
+    /// remaining entry's `prev_hash` will NOT match genesis.  This field
+    /// records what the valid "chain start" hash should be so that
+    /// `verify_integrity` still works after eviction.
+    chain_start_hash: String,
+}
+
 /// In-memory tamper-proof audit log with hash-chain integrity.
 #[derive(Debug)]
 pub struct AuditLog {
-    entries: Mutex<Vec<AuditEntry>>,
-    next_seq: AtomicU64,
-    last_hash: Mutex<String>,
+    inner: Mutex<AuditLogInner>,
     /// Maximum number of entries to retain in memory.
     max_entries: usize,
 }
@@ -96,15 +118,23 @@ pub struct AuditLog {
 impl AuditLog {
     /// Create a new audit log.
     pub fn new(max_entries: usize) -> Self {
+        let genesis = genesis_hash();
         Self {
-            entries: Mutex::new(Vec::new()),
-            next_seq: AtomicU64::new(1),
-            last_hash: Mutex::new("0".repeat(64)), // genesis hash
+            inner: Mutex::new(AuditLogInner {
+                entries: Vec::new(),
+                next_seq: 1,
+                last_hash: genesis.clone(),
+                chain_start_hash: genesis,
+            }),
             max_entries,
         }
     }
 
     /// Record an audit event.
+    ///
+    /// The entire operation (sequence allocation, hash computation, insertion,
+    /// and eviction) is performed under a single lock to guarantee chain
+    /// integrity even under concurrent access.
     pub fn record(
         &self,
         username: impl Into<String>,
@@ -114,8 +144,10 @@ impl AuditLog {
         client_ip: Option<String>,
         success: bool,
     ) {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let prev_hash = self.last_hash.lock().clone();
+        let mut inner = self.inner.lock();
+
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
 
         let mut entry = AuditEntry {
             sequence: seq,
@@ -126,20 +158,22 @@ impl AuditLog {
             detail,
             client_ip,
             success,
-            prev_hash,
+            prev_hash: inner.last_hash.clone(),
             hash: String::new(),
         };
 
         entry.hash = entry.compute_hash();
-        *self.last_hash.lock() = entry.hash.clone();
-
-        let mut entries = self.entries.lock();
-        entries.push(entry);
+        inner.last_hash = entry.hash.clone();
+        inner.entries.push(entry);
 
         // Evict oldest entries if over capacity
-        if entries.len() > self.max_entries {
-            let drain = entries.len() - self.max_entries;
-            entries.drain(..drain);
+        if inner.entries.len() > self.max_entries {
+            let drain = inner.entries.len() - self.max_entries;
+            // The last evicted entry's hash becomes the new chain start
+            if let Some(last_evicted) = inner.entries.get(drain - 1) {
+                inner.chain_start_hash = last_evicted.hash.clone();
+            }
+            inner.entries.drain(..drain);
         }
     }
 
@@ -173,23 +207,24 @@ impl AuditLog {
 
     /// Get the total number of entries.
     pub fn len(&self) -> usize {
-        self.entries.lock().len()
+        self.inner.lock().entries.len()
     }
 
     /// Check if the log is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().is_empty()
+        self.inner.lock().entries.is_empty()
     }
 
     /// Get all entries (clone).
     pub fn entries(&self) -> Vec<AuditEntry> {
-        self.entries.lock().clone()
+        self.inner.lock().entries.clone()
     }
 
     /// Get entries filtered by action.
     pub fn entries_by_action(&self, action: AuditAction) -> Vec<AuditEntry> {
-        self.entries
+        self.inner
             .lock()
+            .entries
             .iter()
             .filter(|e| e.action == action)
             .cloned()
@@ -198,8 +233,9 @@ impl AuditLog {
 
     /// Get entries for a specific user.
     pub fn entries_by_user(&self, username: &str) -> Vec<AuditEntry> {
-        self.entries
+        self.inner
             .lock()
+            .entries
             .iter()
             .filter(|e| e.username == username)
             .cloned()
@@ -209,14 +245,16 @@ impl AuditLog {
     /// Verify the integrity of the hash chain.
     ///
     /// Returns `true` if all entries are properly linked and no entry
-    /// has been tampered with. Returns `false` if any hash is invalid.
+    /// has been tampered with.  Correctly handles the case where oldest
+    /// entries have been evicted (the chain starts from the last evicted
+    /// entry's hash rather than genesis).
     pub fn verify_integrity(&self) -> bool {
-        let entries = self.entries.lock();
-        let genesis = "0".repeat(64);
-        let mut expected_prev = &genesis;
+        let inner = self.inner.lock();
 
-        for entry in entries.iter() {
-            // Check prev_hash links to previous entry
+        let mut expected_prev = &inner.chain_start_hash;
+
+        for entry in inner.entries.iter() {
+            // Check prev_hash links to previous entry (or chain start)
             if entry.prev_hash != *expected_prev {
                 return false;
             }
@@ -233,8 +271,15 @@ impl AuditLog {
 
     /// Export entries as JSON (for SIEM integration).
     pub fn export_json(&self) -> String {
-        let entries = self.entries.lock();
-        serde_json::to_string_pretty(&*entries).unwrap_or_default()
+        let inner = self.inner.lock();
+        serde_json::to_string_pretty(&inner.entries).unwrap_or_default()
+    }
+
+    /// Get the number of entries that have been evicted since creation.
+    pub fn evicted_count(&self) -> u64 {
+        let inner = self.inner.lock();
+        let first_seq = inner.entries.first().map(|e| e.sequence).unwrap_or(1);
+        first_seq.saturating_sub(1)
     }
 }
 
@@ -287,8 +332,8 @@ mod tests {
 
         // Tamper with an entry
         {
-            let mut entries = log.entries.lock();
-            entries[1].detail = Some("MODIFIED".to_string());
+            let mut inner = log.inner.lock();
+            inner.entries[1].detail = Some("MODIFIED".to_string());
         }
 
         // Chain should now be broken
@@ -307,6 +352,40 @@ mod tests {
         // Oldest entries should have been evicted
         let entries = log.entries();
         assert_eq!(entries[0].sequence, 6);
+    }
+
+    #[test]
+    fn test_integrity_after_eviction() {
+        // This test verifies that verify_integrity works correctly even
+        // after entries have been evicted from the log.
+        let log = AuditLog::new(5);
+
+        for i in 0..10 {
+            log.record_query("u", &format!("q{}", i), true);
+        }
+
+        // Integrity should still hold after eviction
+        assert!(log.verify_integrity());
+        assert_eq!(log.evicted_count(), 5);
+    }
+
+    #[test]
+    fn test_tamper_detection_after_eviction() {
+        let log = AuditLog::new(5);
+
+        for i in 0..10 {
+            log.record_query("u", &format!("q{}", i), true);
+        }
+
+        assert!(log.verify_integrity());
+
+        // Tamper with the first remaining entry
+        {
+            let mut inner = log.inner.lock();
+            inner.entries[0].detail = Some("TAMPERED".to_string());
+        }
+
+        assert!(!log.verify_integrity());
     }
 
     #[test]
@@ -343,5 +422,31 @@ mod tests {
         let json = log.export_json();
         assert!(json.contains("alice"));
         assert!(json.contains("SELECT 1"));
+    }
+
+    #[test]
+    fn test_concurrent_records_maintain_integrity() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let log = Arc::new(AuditLog::new(10_000));
+        let mut handles = Vec::new();
+
+        for t in 0..4 {
+            let log = Arc::clone(&log);
+            handles.push(thread::spawn(move || {
+                for i in 0..100 {
+                    log.record_query(&format!("thread_{}", t), &format!("SELECT {}", i), true);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(log.len(), 400);
+        // Hash chain must be intact despite concurrent writes
+        assert!(log.verify_integrity());
     }
 }

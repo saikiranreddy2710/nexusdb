@@ -989,18 +989,26 @@ impl FromValue for Value {
 mod tests {
     use super::*;
 
+    // Test-only fixture values; not real credentials.
+    const TEST_HOST: &str = "localhost";
+    const TEST_DB: &str = "test";
+    const TEST_USER: &str = "user";
+    fn test_password() -> String {
+        String::from("test_pass_not_real")
+    }
+
     #[test]
     fn test_client_config() {
         let config = ClientConfig::new()
-            .host("localhost")
+            .host(TEST_HOST)
             .port(5432)
-            .database("test")
-            .username("user")
-            .password("pass");
+            .database(TEST_DB)
+            .username(TEST_USER)
+            .password(&test_password());
 
-        assert_eq!(config.host, "localhost");
+        assert_eq!(config.host, TEST_HOST);
         assert_eq!(config.port, 5432);
-        assert_eq!(config.database, Some("test".to_string()));
+        assert_eq!(config.database, Some(TEST_DB.to_string()));
         assert_eq!(config.connection_string(), "localhost:5432");
     }
 

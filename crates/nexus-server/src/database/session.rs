@@ -403,15 +403,14 @@ impl Session {
                 nexus_security::AccessDecision::Allow
             }
 
-            // CREATE/DROP DATABASE requires global Create/Drop
-            Statement::CreateDatabase { .. } => {
-                self.authorizer
-                    .check_database(&self.identity, db, Privilege::Create)
-            }
-            Statement::DropDatabase { .. } => {
-                self.authorizer
-                    .check_database(&self.identity, db, Privilege::Drop)
-            }
+            // CREATE/DROP DATABASE requires global-level privilege
+            // (not database-level, since the database may not exist yet)
+            Statement::CreateDatabase { .. } => self
+                .authorizer
+                .check_global(&self.identity, Privilege::Create),
+            Statement::DropDatabase { .. } => self
+                .authorizer
+                .check_global(&self.identity, Privilege::Drop),
 
             // Transaction control, SHOW, DESCRIBE, USE - always allowed
             Statement::Begin
@@ -491,15 +490,34 @@ impl Session {
     }
 
     /// Executes multiple SQL statements.
+    ///
+    /// Each statement is individually authorized and audited, same as `execute()`.
     pub fn execute_batch(&mut self, sql: &str) -> DatabaseResult<Vec<StatementResult>> {
         let statements = Parser::parse(sql)?;
 
         let mut results = Vec::with_capacity(statements.len());
-        for statement in statements {
+        for statement in &statements {
+            self.statement_count += 1;
             let start = Instant::now();
-            // For batch execution, we use a placeholder since we don't have individual SQL strings
-            // The plan cache will normalize the SQL, so this works for repeated queries
-            results.push(self.execute_statement(&statement, sql, start)?);
+
+            // Authorize before execution
+            self.authorize_statement(statement)?;
+
+            let result = self.execute_statement(statement, sql, start);
+
+            // Audit each statement
+            let success = result.is_ok();
+            let action = Self::statement_audit_action(statement);
+            self.audit_log.record(
+                &self.identity.username,
+                action,
+                Self::statement_target(statement),
+                Some(format!("{:?}", statement)),
+                None,
+                success,
+            );
+
+            results.push(result?);
         }
 
         Ok(results)

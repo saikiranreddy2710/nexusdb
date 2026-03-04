@@ -306,9 +306,23 @@ impl SkipList {
         // Link the new node into the list at each level.
         // We insert bottom-up so that concurrent readers on higher levels
         // never see a node that isn't fully linked at lower levels.
+        //
+        // Safety: prev[level] is guaranteed non-null for all levels in
+        // 0..height because:
+        //   - levels 0..max_h are set in the search loop above (starting
+        //     from head_ptr which is always valid)
+        //   - levels max_h..height are explicitly set to head_ptr
         for level in 0..height {
+            let prev_ptr = prev[level];
+            assert!(
+                !prev_ptr.is_null(),
+                "BUG: prev[{}] is null (height={}, max_h={})",
+                level,
+                height,
+                max_h
+            );
             unsafe {
-                let prev_node = &*prev[level];
+                let prev_node = &*prev_ptr;
                 let next = prev_node.get_next(level);
                 (*new_ptr).set_next(level, next);
                 prev_node.set_next(level, new_ptr);

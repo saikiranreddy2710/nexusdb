@@ -52,8 +52,16 @@ impl NexusDbService {
     /// - `x-nexus-username` + `x-nexus-password`: password auth
     ///
     /// Returns the verified identity or a gRPC `Status::unauthenticated` error.
+    ///
+    /// On successful authentication the event is recorded in the audit log.
+    /// On failure the event is also recorded before returning the error.
     fn authenticate<T>(&self, request: &Request<T>) -> Result<Identity, Status> {
         let metadata = request.metadata();
+
+        // Try to extract the client IP from the gRPC connection info
+        let client_ip = request
+            .remote_addr()
+            .map(|addr| addr.to_string());
 
         // Try Authorization header first
         if let Some(auth_header) = metadata.get("authorization") {
@@ -71,10 +79,22 @@ impl NexusDbService {
                 ));
             };
 
-            return self.db.authenticator().authenticate(&credential).map_err(|e| {
-                self.db.audit_log().record_auth("unknown", false, None);
-                Status::unauthenticated(format!("authentication failed: {}", e))
-            });
+            return self
+                .db
+                .authenticator()
+                .authenticate(&credential)
+                .map(|identity| {
+                    self.db
+                        .audit_log()
+                        .record_auth(&identity.username, true, client_ip.clone());
+                    identity
+                })
+                .map_err(|e| {
+                    self.db
+                        .audit_log()
+                        .record_auth("unknown", false, client_ip);
+                    Status::unauthenticated(format!("authentication failed: {}", e))
+                });
         }
 
         // Try username + password from metadata
@@ -91,11 +111,26 @@ impl NexusDbService {
                 .map_err(|_| Status::unauthenticated("invalid password encoding"))?
                 .to_string();
 
-            let credential = Credential::Password { username: username.clone(), password };
-            return self.db.authenticator().authenticate(&credential).map_err(|e| {
-                self.db.audit_log().record_auth(&username, false, None);
-                Status::unauthenticated(format!("authentication failed: {}", e))
-            });
+            let credential = Credential::Password {
+                username: username.clone(),
+                password,
+            };
+            return self
+                .db
+                .authenticator()
+                .authenticate(&credential)
+                .map(|identity| {
+                    self.db
+                        .audit_log()
+                        .record_auth(&identity.username, true, client_ip.clone());
+                    identity
+                })
+                .map_err(|e| {
+                    self.db
+                        .audit_log()
+                        .record_auth(&username, false, client_ip);
+                    Status::unauthenticated(format!("authentication failed: {}", e))
+                });
         }
 
         // No credentials provided
@@ -109,41 +144,28 @@ impl NexusDbService {
         }
     }
 
-    /// Executes SQL using a specific transaction/session, or a temporary session on the given database.
-    #[allow(dead_code)]
-    fn execute_with_txn(
-        &self,
-        sql: &str,
-        transaction_id: Option<u64>,
-        database_name: &str,
-    ) -> Result<StatementResult, crate::database::DatabaseError> {
-        if let Some(txn_id) = transaction_id {
-            // Use the existing session for this transaction
-            let sessions = self.transaction_sessions.read().unwrap();
-            if let Some(&session_id) = sessions.get(&txn_id) {
-                if let Some(session_arc) = self.db.get_session(session_id) {
-                    let mut session = session_arc.write().unwrap();
-                    return session.execute(sql);
-                }
+    /// Maps a [`DatabaseError`] to the correct gRPC proto [`ErrorCode`].
+    fn map_error_code(err: &crate::database::DatabaseError) -> ErrorCode {
+        match err {
+            crate::database::DatabaseError::ParseError(_) => ErrorCode::SyntaxError,
+            crate::database::DatabaseError::PlanError(_) => ErrorCode::InvalidQuery,
+            crate::database::DatabaseError::ExecutionError(_) => ErrorCode::InternalError,
+            crate::database::DatabaseError::TransactionError(_) => ErrorCode::TransactionNotFound,
+            crate::database::DatabaseError::AuthenticationError(_) => {
+                ErrorCode::AuthenticationFailed
             }
-            // Transaction not found, fall through to temporary session
+            crate::database::DatabaseError::AuthorizationError(_) => {
+                ErrorCode::AuthorizationFailed
+            }
+            crate::database::DatabaseError::StorageError(_) => ErrorCode::InternalError,
+            _ => ErrorCode::InternalError,
         }
-
-        // Use a temporary session (autocommit) on the requested database
-        let session_id = self.db.create_session(database_name);
-        let result = {
-            let session_arc = self.db.get_session(session_id).unwrap();
-            let mut session = session_arc.write().unwrap();
-            session.execute(sql)
-        };
-        self.db.close_session(session_id);
-        result
     }
 
     /// Converts an ExecuteResult to a QueryResult proto.
     fn execute_result_to_query_result(&self, result: &ExecuteResult) -> QueryResult {
         let fields = result.schema.fields();
-        
+
         let proto_columns: Vec<ColumnInfo> = fields
             .iter()
             .map(|f| ColumnInfo {
@@ -154,7 +176,8 @@ impl NexusDbService {
             })
             .collect();
 
-        let proto_rows: Vec<Row> = result.rows()
+        let proto_rows: Vec<Row> = result
+            .rows()
             .into_iter()
             .map(|row| {
                 let values: Vec<Value> = row
@@ -293,14 +316,10 @@ impl NexusDb for NexusDbService {
     ) -> Result<Response<ExecuteResponse>, Status> {
         // Authenticate the request
         let identity = self.authenticate(&request)?;
-        self.db.audit_log().record_auth(&identity.username, true, None);
 
         let req = request.into_inner();
         let start = Instant::now();
-        let database = req
-            .database
-            .as_deref()
-            .unwrap_or(DEFAULT_DATABASE_NAME);
+        let database = req.database.as_deref().unwrap_or(DEFAULT_DATABASE_NAME);
 
         // Execute the SQL using authenticated session
         let result = if let Some(txn_id) = req.transaction_id {
@@ -311,14 +330,16 @@ impl NexusDb for NexusDbService {
                     let mut session = session_arc.write().unwrap();
                     session.execute(&req.sql)
                 } else {
-                    Err(crate::database::DatabaseError::TransactionError(
-                        format!("session for transaction {} not found", txn_id),
-                    ))
+                    Err(crate::database::DatabaseError::TransactionError(format!(
+                        "session for transaction {} not found",
+                        txn_id
+                    )))
                 }
             } else {
-                Err(crate::database::DatabaseError::TransactionError(
-                    format!("transaction {} not found", txn_id),
-                ))
+                Err(crate::database::DatabaseError::TransactionError(format!(
+                    "transaction {} not found",
+                    txn_id
+                )))
             }
         } else {
             // Create a temporary authenticated session (autocommit)
@@ -349,18 +370,7 @@ impl NexusDb for NexusDbService {
                 Ok(Response::new(self.statement_to_response(result, stats)))
             }
             Err(e) => {
-                let error_code = match &e {
-                    crate::database::DatabaseError::ParseError(_) => ErrorCode::SyntaxError,
-                    crate::database::DatabaseError::PlanError(_) => ErrorCode::InvalidQuery,
-                    crate::database::DatabaseError::ExecutionError(_) => ErrorCode::InternalError,
-                    crate::database::DatabaseError::TransactionError(_) => {
-                        ErrorCode::TransactionNotFound
-                    }
-                    crate::database::DatabaseError::AuthenticationError(_) => ErrorCode::InternalError,
-                    crate::database::DatabaseError::AuthorizationError(_) => ErrorCode::InternalError,
-                    _ => ErrorCode::InternalError,
-                };
-
+                let error_code = Self::map_error_code(&e);
                 Ok(Response::new(
                     self.error_response(e.to_string(), error_code),
                 ))
@@ -391,29 +401,26 @@ impl NexusDb for NexusDbService {
         };
         self.db.close_session(session_id);
 
-        let result = result.map_err(|e| {
-            Status::internal(format!("Query execution failed: {}", e))
-        })?;
+        let result = result.map_err(|e| Status::internal(format!("Query execution failed: {}", e)))?;
 
         // Convert to a stream
         let rows: Vec<Row> = match result {
-            StatementResult::Query(exec_result) => {
-                exec_result.rows()
-                    .into_iter()
-                    .map(|row| {
-                        let values: Vec<Value> = row
-                            .iter()
-                            .map(|v| {
-                                use nexus_proto::proto::value::Value as ProtoValue;
-                                Value {
-                                    value: Some(ProtoValue::StringValue(v.to_string())),
-                                }
-                            })
-                            .collect();
-                        Row { values }
-                    })
-                    .collect()
-            }
+            StatementResult::Query(exec_result) => exec_result
+                .rows()
+                .into_iter()
+                .map(|row| {
+                    let values: Vec<Value> = row
+                        .iter()
+                        .map(|v| {
+                            use nexus_proto::proto::value::Value as ProtoValue;
+                            Value {
+                                value: Some(ProtoValue::StringValue(v.to_string())),
+                            }
+                        })
+                        .collect();
+                    Row { values }
+                })
+                .collect(),
             _ => vec![],
         };
 
@@ -449,8 +456,11 @@ impl NexusDb for NexusDbService {
     /// Prepare a statement for later execution.
     async fn prepare(
         &self,
-        _request: Request<PrepareRequest>,
+        request: Request<PrepareRequest>,
     ) -> Result<Response<PrepareResponse>, Status> {
+        // Authenticate the request (even for unimplemented endpoints)
+        let _identity = self.authenticate(&request)?;
+
         // For now, return a placeholder - prepared statements not yet implemented
         Ok(Response::new(PrepareResponse {
             success: false,
@@ -464,8 +474,11 @@ impl NexusDb for NexusDbService {
     /// Execute a prepared statement.
     async fn execute_prepared(
         &self,
-        _request: Request<ExecutePreparedRequest>,
+        request: Request<ExecutePreparedRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
+        // Authenticate the request
+        let _identity = self.authenticate(&request)?;
+
         Ok(Response::new(self.error_response(
             "Prepared statements not yet implemented".to_string(),
             ErrorCode::InternalError,
@@ -479,11 +492,12 @@ impl NexusDb for NexusDbService {
     ) -> Result<Response<BeginTransactionResponse>, Status> {
         // Authenticate the request
         let identity = self.authenticate(&request)?;
-        self.db.audit_log().record_auth(&identity.username, true, None);
 
         // Create a persistent authenticated session for this transaction
-        let session_id = self.db.create_authenticated_session(DEFAULT_DATABASE_NAME, identity);
-        
+        let session_id = self
+            .db
+            .create_authenticated_session(DEFAULT_DATABASE_NAME, identity);
+
         // Begin the transaction in this session
         if let Some(session_arc) = self.db.get_session(session_id) {
             let mut session = session_arc.write().unwrap();
@@ -491,10 +505,10 @@ impl NexusDb for NexusDbService {
                 Ok(()) => {
                     // Generate a unique transaction ID and map it to this session
                     let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
-                    
+
                     let mut sessions = self.transaction_sessions.write().unwrap();
                     sessions.insert(txn_id, session_id);
-                    
+
                     Ok(Response::new(BeginTransactionResponse {
                         success: true,
                         error: None,
@@ -525,15 +539,18 @@ impl NexusDb for NexusDbService {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
+        // Authenticate the request before accessing the transaction
+        let _identity = self.authenticate(&request)?;
+
         let req = request.into_inner();
         let txn_id = req.transaction_id;
-        
+
         // Find the session for this transaction
         let session_id = {
             let sessions = self.transaction_sessions.read().unwrap();
             sessions.get(&txn_id).copied()
         };
-        
+
         if let Some(session_id) = session_id {
             if let Some(session_arc) = self.db.get_session(session_id) {
                 let mut session = session_arc.write().unwrap();
@@ -587,15 +604,18 @@ impl NexusDb for NexusDbService {
         &self,
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
+        // Authenticate the request before accessing the transaction
+        let _identity = self.authenticate(&request)?;
+
         let req = request.into_inner();
         let txn_id = req.transaction_id;
-        
+
         // Find the session for this transaction
         let session_id = {
             let sessions = self.transaction_sessions.read().unwrap();
             sessions.get(&txn_id).copied()
         };
-        
+
         if let Some(session_id) = session_id {
             if let Some(session_arc) = self.db.get_session(session_id) {
                 let mut session = session_arc.write().unwrap();
@@ -674,6 +694,8 @@ impl NexusDb for NexusDbService {
                 "Transactions".to_string(),
                 "MVCC".to_string(),
                 "Streaming".to_string(),
+                "TLS".to_string(),
+                "mTLS".to_string(),
                 "Authentication".to_string(),
                 "RBAC".to_string(),
                 "AuditLog".to_string(),
