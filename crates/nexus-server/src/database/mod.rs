@@ -72,3 +72,9 @@ pub use engine::{Database, DatabaseConfig, DatabaseStats, DEFAULT_DATABASE_NAME}
 pub use error::{DatabaseError, DatabaseResult};
 pub use result::{ExecuteResult, StatementResult};
 pub use session::{Session, SessionConfig, SessionId, SessionState};
+
+// Re-export security types for convenience
+pub use nexus_security::{
+    AccessDecision, AuditLog, AuthError, Authenticator, Authorizer, Credential, Identity,
+    Permission, Privilege, Role,
+};

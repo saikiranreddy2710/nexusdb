@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use nexus_security::{AuditLog, Authenticator, Authorizer};
 use nexus_sql::storage::StorageEngine;
-use nexus_wal::{Wal, WalConfig, SyncPolicy};
+use nexus_wal::{SyncPolicy, Wal, WalConfig};
 
 use super::error::{DatabaseError, DatabaseResult};
 use super::result::StatementResult;
@@ -29,6 +30,12 @@ pub struct DatabaseConfig {
     pub wal_enabled: bool,
     /// WAL sync mode (0=none, 1=normal, 2=full).
     pub wal_sync_mode: u8,
+    /// Whether authentication is enforced (false = permissive mode).
+    pub auth_enabled: bool,
+    /// Whether authorization (RBAC) is enforced.
+    pub authz_enabled: bool,
+    /// Maximum audit log entries in memory.
+    pub audit_max_entries: usize,
 }
 
 impl Default for DatabaseConfig {
@@ -39,6 +46,9 @@ impl Default for DatabaseConfig {
             session_config: SessionConfig::default(),
             wal_enabled: true,
             wal_sync_mode: 1,
+            auth_enabled: false,
+            authz_enabled: false,
+            audit_max_entries: 10_000,
         }
     }
 }
@@ -98,6 +108,12 @@ pub struct Database {
     total_sessions: AtomicU64,
     /// When the database was started.
     started_at: Instant,
+    /// Authentication service (SCRAM-SHA-256, API keys, JWT).
+    authenticator: Arc<Authenticator>,
+    /// Authorization service (RBAC).
+    authorizer: Arc<Authorizer>,
+    /// Tamper-proof audit log.
+    audit_log: Arc<AuditLog>,
 }
 
 impl Database {
@@ -115,7 +131,7 @@ impl Database {
                     _ => SyncPolicy::EveryWrite,
                 };
                 let wal_config = WalConfig::new(&wal_dir).with_sync_policy(sync_policy);
-                
+
                 // Try to open existing WAL or create new one
                 let wal = if wal_dir.exists() {
                     match Wal::open(wal_config.clone()) {
@@ -137,7 +153,7 @@ impl Database {
                         DatabaseError::Internal(format!("Failed to create WAL: {}", e))
                     })?
                 };
-                
+
                 Some(Arc::new(wal))
             } else {
                 // WAL enabled but no data directory - log warning
@@ -151,6 +167,17 @@ impl Database {
         let mut databases = HashMap::new();
         databases.insert(DEFAULT_DATABASE_NAME.to_string(), storage);
 
+        // Initialize security subsystems
+        let authenticator = Arc::new(Authenticator::new(config.auth_enabled));
+        let authorizer = Arc::new(Authorizer::new(config.authz_enabled));
+        let audit_log = Arc::new(AuditLog::new(config.audit_max_entries));
+
+        if config.auth_enabled {
+            tracing::info!("Authentication enforcement enabled");
+        } else {
+            tracing::info!("Authentication in permissive mode (all requests allowed)");
+        }
+
         Ok(Self {
             config,
             databases: RwLock::new(databases),
@@ -159,31 +186,38 @@ impl Database {
             next_session_id: AtomicU64::new(1),
             total_sessions: AtomicU64::new(0),
             started_at: Instant::now(),
+            authenticator,
+            authorizer,
+            audit_log,
         })
     }
 
     /// Replays the WAL to recover state after a crash.
     fn replay_wal(wal: &Wal, _storage: &StorageEngine) -> DatabaseResult<()> {
         use nexus_wal::record::RecordType;
-        
+
         let min_recovery_lsn = wal.min_recovery_lsn();
-        
+
         // Read all records from the minimum recovery LSN
-        let records = wal.iter_from(min_recovery_lsn).map_err(|e| {
-            DatabaseError::Internal(format!("Failed to read WAL: {}", e))
-        })?;
-        
+        let records = wal
+            .iter_from(min_recovery_lsn)
+            .map_err(|e| DatabaseError::Internal(format!("Failed to read WAL: {}", e)))?;
+
         if records.is_empty() {
             tracing::info!("No WAL records to replay");
             return Ok(());
         }
-        
-        tracing::info!("Replaying {} WAL records from LSN {:?}", records.len(), min_recovery_lsn);
-        
+
+        tracing::info!(
+            "Replaying {} WAL records from LSN {:?}",
+            records.len(),
+            min_recovery_lsn
+        );
+
         // Track committed and aborted transactions
         let mut committed_txns = std::collections::HashSet::new();
         let mut aborted_txns = std::collections::HashSet::new();
-        
+
         // First pass: identify committed and aborted transactions
         for record in &records {
             match record.header.record_type {
@@ -196,24 +230,24 @@ impl Database {
                 _ => {}
             }
         }
-        
+
         tracing::info!(
             "Found {} committed, {} aborted transactions",
             committed_txns.len(),
             aborted_txns.len()
         );
-        
+
         // TODO: Second pass - replay committed transactions' operations
         // This requires integration with the storage engine to re-apply
         // INSERT, UPDATE, DELETE operations. For now, we just log.
         //
         // In a full implementation:
         // - For each INSERT record from a committed txn: re-insert the row
-        // - For each UPDATE record from a committed txn: re-apply the update  
+        // - For each UPDATE record from a committed txn: re-apply the update
         // - For each DELETE record from a committed txn: re-delete the row
         //
         // We also need to handle the page_id/slot_id mapping to actual storage.
-        
+
         Ok(())
     }
 
@@ -297,17 +331,32 @@ impl Database {
         &self.config
     }
 
+    /// Returns the authenticator.
+    pub fn authenticator(&self) -> &Arc<Authenticator> {
+        &self.authenticator
+    }
+
+    /// Returns the authorizer.
+    pub fn authorizer(&self) -> &Arc<Authorizer> {
+        &self.authorizer
+    }
+
+    /// Returns the audit log.
+    pub fn audit_log(&self) -> &Arc<AuditLog> {
+        &self.audit_log
+    }
+
     // =========================================================================
     // Session Management
     // =========================================================================
 
     /// Creates a new session attached to the given database name.
-    /// Uses default database name if not specified.
+    /// Uses system identity (superuser). For authenticated sessions, use `create_authenticated_session`.
     pub fn create_session(self: &Arc<Self>, database_name: &str) -> SessionId {
         self.create_session_with_config(database_name, self.config.session_config.clone())
     }
 
-    /// Creates a session with custom configuration.
+    /// Creates a session with custom configuration (system identity).
     pub fn create_session_with_config(
         self: &Arc<Self>,
         database_name: &str,
@@ -315,6 +364,31 @@ impl Database {
     ) -> SessionId {
         let id = SessionId::new(self.next_session_id.fetch_add(1, Ordering::SeqCst));
         let session = Session::new(id, self.clone(), database_name.to_string(), config);
+
+        let mut sessions = self.sessions.write().unwrap();
+        sessions.insert(id, Arc::new(RwLock::new(session)));
+
+        self.total_sessions.fetch_add(1, Ordering::Relaxed);
+
+        id
+    }
+
+    /// Creates a new session with a specific authenticated identity.
+    ///
+    /// Used by the gRPC layer after validating client credentials.
+    pub fn create_authenticated_session(
+        self: &Arc<Self>,
+        database_name: &str,
+        identity: nexus_security::Identity,
+    ) -> SessionId {
+        let id = SessionId::new(self.next_session_id.fetch_add(1, Ordering::SeqCst));
+        let session = Session::new_with_identity(
+            id,
+            self.clone(),
+            database_name.to_string(),
+            self.config.session_config.clone(),
+            identity,
+        );
 
         let mut sessions = self.sessions.write().unwrap();
         sessions.insert(id, Arc::new(RwLock::new(session)));
@@ -683,5 +757,245 @@ mod tests {
         }
 
         assert_eq!(db.active_session_count(), 2);
+    }
+
+    // =========================================================================
+    // Security Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_security_permissive_mode() {
+        // Default config has auth_enabled=false (permissive)
+        let db = Arc::new(Database::open_memory().unwrap());
+        assert!(!db.authenticator().is_enforcing());
+
+        // All queries should succeed without credentials
+        db.execute("CREATE TABLE sec_test (id INT PRIMARY KEY, data TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO sec_test VALUES (1, 'open')")
+            .unwrap();
+        let result = db.execute("SELECT * FROM sec_test").unwrap();
+        assert!(matches!(result, StatementResult::Query(_)));
+    }
+
+    #[test]
+    fn test_security_audit_log_records_queries() {
+        let db = Arc::new(Database::open_memory().unwrap());
+
+        // Execute some queries
+        db.execute("CREATE TABLE audit_test (id INT PRIMARY KEY)")
+            .unwrap();
+        db.execute("INSERT INTO audit_test VALUES (1)").unwrap();
+        db.execute("SELECT * FROM audit_test").unwrap();
+
+        // Audit log should have entries for all 3 queries
+        let entries = db.audit_log().entries();
+        assert!(
+            entries.len() >= 3,
+            "audit log should have at least 3 entries, got {}",
+            entries.len()
+        );
+
+        // Verify integrity of the hash chain
+        assert!(db.audit_log().verify_integrity());
+    }
+
+    #[test]
+    fn test_security_enforced_auth_blocks_unauthorized() {
+        let config = DatabaseConfig {
+            auth_enabled: true,
+            authz_enabled: true,
+            ..DatabaseConfig::in_memory()
+        };
+        let db = Arc::new(Database::open(config).unwrap());
+
+        // Create a user with limited permissions
+        db.authenticator()
+            .create_user("reader", "pass", vec!["reader".into()])
+            .unwrap();
+
+        // Create the reader role with only SELECT on nexusdb.*
+        db.authorizer()
+            .create_role(nexus_security::Role::new("reader").with_permission(
+                nexus_security::Permission::Database {
+                    database: DEFAULT_DATABASE_NAME.to_string(),
+                    privilege: nexus_security::Privilege::Select,
+                },
+            ));
+
+        // Authenticate as the reader
+        let cred = nexus_security::Credential::Password {
+            username: "reader".into(),
+            password: "pass".into(),
+        };
+        let identity = db.authenticator().authenticate(&cred).unwrap();
+        assert_eq!(identity.username, "reader");
+
+        // Create an authenticated session
+        let session_id = db.create_authenticated_session(DEFAULT_DATABASE_NAME, identity);
+        let session_arc = db.get_session(session_id).unwrap();
+        let mut session = session_arc.write().unwrap();
+
+        // reader should NOT be able to CREATE TABLE (requires Create privilege)
+        let result = session.execute("CREATE TABLE forbidden (id INT PRIMARY KEY)");
+        assert!(result.is_err(), "reader should not be able to CREATE TABLE");
+        if let Err(DatabaseError::AuthorizationError(msg)) = &result {
+            assert!(
+                msg.contains("reader"),
+                "error should mention the user: {}",
+                msg
+            );
+        } else {
+            panic!("expected AuthorizationError, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_security_enforced_auth_allows_authorized() {
+        let config = DatabaseConfig {
+            auth_enabled: true,
+            authz_enabled: true,
+            ..DatabaseConfig::in_memory()
+        };
+        let db = Arc::new(Database::open(config).unwrap());
+
+        // Create a user with admin role
+        db.authenticator()
+            .create_user("admin", "admin_pass", vec!["superuser".into()])
+            .unwrap();
+
+        // Authenticate as admin
+        let cred = nexus_security::Credential::Password {
+            username: "admin".into(),
+            password: "admin_pass".into(),
+        };
+        let identity = db.authenticator().authenticate(&cred).unwrap();
+        assert!(identity.is_superuser());
+
+        // Create an authenticated session
+        let session_id = db.create_authenticated_session(DEFAULT_DATABASE_NAME, identity);
+        let session_arc = db.get_session(session_id).unwrap();
+        let mut session = session_arc.write().unwrap();
+
+        // superuser can do everything
+        session
+            .execute("CREATE TABLE admin_test (id INT PRIMARY KEY, data TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO admin_test VALUES (1, 'admin data')")
+            .unwrap();
+        let result = session.execute("SELECT * FROM admin_test").unwrap();
+        if let StatementResult::Query(q) = result {
+            assert_eq!(q.total_rows, 1);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_security_audit_log_captures_auth_events() {
+        let config = DatabaseConfig {
+            auth_enabled: true,
+            ..DatabaseConfig::in_memory()
+        };
+        let db = Arc::new(Database::open(config).unwrap());
+
+        db.authenticator()
+            .create_user("testuser", "secret", vec!["superuser".into()])
+            .unwrap();
+
+        // Successful auth
+        let cred = nexus_security::Credential::Password {
+            username: "testuser".into(),
+            password: "secret".into(),
+        };
+        let _identity = db.authenticator().authenticate(&cred).unwrap();
+
+        // Record it in audit log manually (as gRPC layer would)
+        db.audit_log().record_auth("testuser", true, None);
+
+        // Failed auth
+        let bad_cred = nexus_security::Credential::Password {
+            username: "testuser".into(),
+            password: "wrong".into(),
+        };
+        let _ = db.authenticator().authenticate(&bad_cred);
+        db.audit_log().record_auth("testuser", false, None);
+
+        // Verify audit entries
+        let entries = db.audit_log().entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].success);
+        assert!(!entries[1].success);
+        assert!(db.audit_log().verify_integrity());
+    }
+
+    #[test]
+    fn test_security_rbac_select_allowed_insert_denied() {
+        let config = DatabaseConfig {
+            auth_enabled: true,
+            authz_enabled: true,
+            ..DatabaseConfig::in_memory()
+        };
+        let db = Arc::new(Database::open(config).unwrap());
+
+        // Setup: create table as system user
+        let admin_sid = db.create_session(DEFAULT_DATABASE_NAME);
+        {
+            let s = db.get_session(admin_sid).unwrap();
+            let mut session = s.write().unwrap();
+            session
+                .execute("CREATE TABLE products (id INT PRIMARY KEY, name TEXT)")
+                .unwrap();
+            session
+                .execute("INSERT INTO products VALUES (1, 'Widget')")
+                .unwrap();
+        }
+        db.close_session(admin_sid);
+
+        // Create a read-only user
+        db.authenticator()
+            .create_user("viewer", "view", vec!["viewer".into()])
+            .unwrap();
+        db.authorizer()
+            .create_role(nexus_security::Role::new("viewer").with_permission(
+                nexus_security::Permission::Table {
+                    database: DEFAULT_DATABASE_NAME.to_string(),
+                    table: "products".to_string(),
+                    privilege: nexus_security::Privilege::Select,
+                },
+            ));
+
+        // Authenticate as viewer
+        let cred = nexus_security::Credential::Password {
+            username: "viewer".into(),
+            password: "view".into(),
+        };
+        let identity = db.authenticator().authenticate(&cred).unwrap();
+
+        let sid = db.create_authenticated_session(DEFAULT_DATABASE_NAME, identity);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        // SELECT should work
+        let result = session.execute("SELECT * FROM products").unwrap();
+        if let StatementResult::Query(q) = result {
+            assert_eq!(q.total_rows, 1);
+        }
+
+        // INSERT should be denied
+        let result = session.execute("INSERT INTO products VALUES (2, 'Gadget')");
+        assert!(
+            matches!(result, Err(DatabaseError::AuthorizationError(_))),
+            "viewer should not be able to INSERT, got {:?}",
+            result
+        );
+
+        // DELETE should be denied
+        let result = session.execute("DELETE FROM products WHERE id = 1");
+        assert!(
+            matches!(result, Err(DatabaseError::AuthorizationError(_))),
+            "viewer should not be able to DELETE"
+        );
     }
 }

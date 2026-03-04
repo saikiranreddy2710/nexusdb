@@ -12,6 +12,9 @@ use nexus_cache::plan_cache::{PlanCache, PlanCacheConfig};
 use nexus_cache::result_cache::{ResultCache, ResultCacheConfig, ResultCacheKey};
 use nexus_common::types::TxnId;
 use nexus_mvcc::IsolationLevel;
+use nexus_security::audit::{AuditAction, AuditLog};
+use nexus_security::authn::Identity;
+use nexus_security::authz::{Authorizer, Privilege};
 use nexus_sql::executor::{Row, Value};
 use nexus_sql::logical::{build_plan, Field, MemoryCatalog, Schema};
 use nexus_sql::optimizer::{Optimizer, OptimizerConfig};
@@ -109,6 +112,12 @@ pub struct Session {
     plan_cache: PlanCache<PhysicalPlan>,
     /// Query result cache for SELECT queries.
     result_cache: Arc<ResultCache<ExecuteResult>>,
+    /// Authenticated identity for this session.
+    identity: Identity,
+    /// Reference to authorizer for permission checks.
+    authorizer: Arc<Authorizer>,
+    /// Reference to audit log for recording events.
+    audit_log: Arc<AuditLog>,
 }
 
 impl Session {
@@ -119,6 +128,8 @@ impl Session {
         current_database: String,
         config: SessionConfig,
     ) -> Self {
+        let authorizer = Arc::clone(database.authorizer());
+        let audit_log = Arc::clone(database.audit_log());
         Self {
             id,
             state: SessionState::Idle,
@@ -131,7 +142,48 @@ impl Session {
             statement_count: 0,
             plan_cache: PlanCache::new(PlanCacheConfig::with_capacity(100)),
             result_cache: Arc::new(ResultCache::new(ResultCacheConfig::new(500, 60))),
+            identity: Identity::system(), // default system identity; overridden for authenticated sessions
+            authorizer,
+            audit_log,
         }
+    }
+
+    /// Creates a new session with a specific authenticated identity.
+    pub fn new_with_identity(
+        id: SessionId,
+        database: Arc<Database>,
+        current_database: String,
+        config: SessionConfig,
+        identity: Identity,
+    ) -> Self {
+        let authorizer = Arc::clone(database.authorizer());
+        let audit_log = Arc::clone(database.audit_log());
+        Self {
+            id,
+            state: SessionState::Idle,
+            config,
+            current_txn: None,
+            database,
+            current_database,
+            variables: HashMap::new(),
+            created_at: Instant::now(),
+            statement_count: 0,
+            plan_cache: PlanCache::new(PlanCacheConfig::with_capacity(100)),
+            result_cache: Arc::new(ResultCache::new(ResultCacheConfig::new(500, 60))),
+            identity,
+            authorizer,
+            audit_log,
+        }
+    }
+
+    /// Returns the authenticated identity for this session.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    /// Sets the identity for this session (used after gRPC authentication).
+    pub fn set_identity(&mut self, identity: Identity) {
+        self.identity = identity;
     }
 
     /// Returns the storage engine for the current database.
@@ -248,10 +300,194 @@ impl Session {
         // Parse the SQL
         let statement = Parser::parse_one(sql)?;
 
-        // Execute based on statement type
-        let result = self.execute_statement(&statement, sql, start)?;
+        // Authorize the statement before execution
+        self.authorize_statement(&statement)?;
 
-        Ok(result)
+        // Execute based on statement type
+        let result = self.execute_statement(&statement, sql, start);
+
+        // Audit the query
+        let success = result.is_ok();
+        let action = Self::statement_audit_action(&statement);
+        self.audit_log.record(
+            &self.identity.username,
+            action,
+            Self::statement_target(&statement),
+            Some(sql.to_string()),
+            None,
+            success,
+        );
+
+        result
+    }
+
+    /// Checks whether the current identity is authorized to execute the given statement.
+    ///
+    /// Maps each SQL statement type to the required privilege and calls the authorizer.
+    /// If the authorizer is in permissive mode (enforce=false), all checks pass.
+    fn authorize_statement(&self, statement: &Statement) -> DatabaseResult<()> {
+        let db = &self.current_database;
+
+        let decision = match statement {
+            // SELECT requires Select privilege
+            Statement::Select(select) => {
+                let tables = Self::extract_table_names_from_statement(statement);
+                // Check all referenced tables; deny if any fails
+                for table in &tables {
+                    let d =
+                        self.authorizer
+                            .check_table(&self.identity, db, table, Privilege::Select);
+                    if !d.is_allowed() {
+                        return Err(DatabaseError::AuthorizationError(format!(
+                            "user '{}' lacks SELECT on {}.{}",
+                            self.identity.username, db, table
+                        )));
+                    }
+                }
+                // If no FROM tables (e.g. SELECT 1), allow
+                if tables.is_empty() && !select.from.is_empty() {
+                    // Table names were somehow not extracted; fallback to db-level check
+                    self.authorizer
+                        .check_database(&self.identity, db, Privilege::Select)
+                } else {
+                    nexus_security::AccessDecision::Allow
+                }
+            }
+
+            // INSERT requires Insert privilege
+            Statement::Insert(insert) => self.authorizer.check_table(
+                &self.identity,
+                db,
+                &insert.table.table,
+                Privilege::Insert,
+            ),
+
+            // UPDATE requires Update privilege
+            Statement::Update(update) => self.authorizer.check_table(
+                &self.identity,
+                db,
+                &update.table.table,
+                Privilege::Update,
+            ),
+
+            // DELETE requires Delete privilege
+            Statement::Delete(delete) => self.authorizer.check_table(
+                &self.identity,
+                db,
+                &delete.table.table,
+                Privilege::Delete,
+            ),
+
+            // CREATE TABLE requires Create privilege at database level
+            Statement::CreateTable(_) => {
+                self.authorizer
+                    .check_database(&self.identity, db, Privilege::Create)
+            }
+
+            // DROP TABLE requires Drop privilege
+            Statement::DropTable(drop) => {
+                for table_ref in &drop.names {
+                    let d = self.authorizer.check_table(
+                        &self.identity,
+                        db,
+                        &table_ref.table,
+                        Privilege::Drop,
+                    );
+                    if !d.is_allowed() {
+                        return Err(DatabaseError::AuthorizationError(format!(
+                            "user '{}' lacks DROP on {}.{}",
+                            self.identity.username, db, table_ref.table
+                        )));
+                    }
+                }
+                nexus_security::AccessDecision::Allow
+            }
+
+            // CREATE/DROP DATABASE requires global Create/Drop
+            Statement::CreateDatabase { .. } => {
+                self.authorizer
+                    .check_database(&self.identity, db, Privilege::Create)
+            }
+            Statement::DropDatabase { .. } => {
+                self.authorizer
+                    .check_database(&self.identity, db, Privilege::Drop)
+            }
+
+            // Transaction control, SHOW, DESCRIBE, USE - always allowed
+            Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::ShowTables
+            | Statement::ShowDatabases
+            | Statement::DescribeTable(_)
+            | Statement::UseDatabase(_) => nexus_security::AccessDecision::Allow,
+
+            // Unknown statements: allow (will likely fail at execution)
+            _ => nexus_security::AccessDecision::Allow,
+        };
+
+        match decision {
+            nexus_security::AccessDecision::Allow => Ok(()),
+            nexus_security::AccessDecision::Deny(reason) => {
+                Err(DatabaseError::AuthorizationError(reason))
+            }
+        }
+    }
+
+    /// Extract table names from any statement for authorization checks.
+    fn extract_table_names_from_statement(statement: &Statement) -> Vec<String> {
+        let mut tables = Vec::new();
+        match statement {
+            Statement::Select(select) => {
+                Self::collect_from_items(&select.from, &mut tables);
+            }
+            Statement::Insert(insert) => tables.push(insert.table.table.clone()),
+            Statement::Update(update) => tables.push(update.table.table.clone()),
+            Statement::Delete(delete) => tables.push(delete.table.table.clone()),
+            _ => {}
+        }
+        tables
+    }
+
+    /// Map a statement to its audit action category.
+    fn statement_audit_action(statement: &Statement) -> AuditAction {
+        match statement {
+            Statement::Select(_)
+            | Statement::ShowTables
+            | Statement::ShowDatabases
+            | Statement::DescribeTable(_) => AuditAction::Query,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                AuditAction::DataModification
+            }
+            Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. } => AuditAction::SchemaChange,
+            _ => AuditAction::Query,
+        }
+    }
+
+    /// Extract the target object name for audit logging.
+    fn statement_target(statement: &Statement) -> Option<String> {
+        match statement {
+            Statement::Select(_) => None,
+            Statement::Insert(insert) => Some(insert.table.table.clone()),
+            Statement::Update(update) => Some(update.table.table.clone()),
+            Statement::Delete(delete) => Some(delete.table.table.clone()),
+            Statement::CreateTable(create) => Some(create.name.table.clone()),
+            Statement::DropTable(drop) => Some(
+                drop.names
+                    .iter()
+                    .map(|t| t.table.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            Statement::DescribeTable(name) => Some(name.to_string()),
+            Statement::CreateDatabase { name, .. } | Statement::DropDatabase { name, .. } => {
+                Some(name.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Executes multiple SQL statements.

@@ -23,6 +23,10 @@ pub enum DatabaseError {
     InvalidState(String),
     /// Not implemented.
     NotImplemented(String),
+    /// Authentication error (invalid credentials, locked account, etc.).
+    AuthenticationError(String),
+    /// Authorization error (insufficient permissions).
+    AuthorizationError(String),
     /// Internal error.
     Internal(String),
 }
@@ -38,6 +42,8 @@ impl fmt::Display for DatabaseError {
             DatabaseError::SessionError(msg) => write!(f, "session error: {}", msg),
             DatabaseError::InvalidState(msg) => write!(f, "invalid state: {}", msg),
             DatabaseError::NotImplemented(msg) => write!(f, "not implemented: {}", msg),
+            DatabaseError::AuthenticationError(msg) => write!(f, "authentication error: {}", msg),
+            DatabaseError::AuthorizationError(msg) => write!(f, "authorization error: {}", msg),
             DatabaseError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }
@@ -60,6 +66,12 @@ impl From<nexus_sql::parser::ParseError> for DatabaseError {
 impl From<nexus_sql::executor::ExecutionError> for DatabaseError {
     fn from(e: nexus_sql::executor::ExecutionError) -> Self {
         DatabaseError::ExecutionError(e.to_string())
+    }
+}
+
+impl From<nexus_security::AuthError> for DatabaseError {
+    fn from(e: nexus_security::AuthError) -> Self {
+        DatabaseError::AuthenticationError(e.to_string())
     }
 }
 

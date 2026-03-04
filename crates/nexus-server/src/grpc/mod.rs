@@ -17,6 +17,8 @@ use nexus_proto::proto::{
     Row, RowBatch, ServerInfoRequest, ServerInfoResponse, Value,
 };
 
+use nexus_security::{Credential, Identity};
+
 use crate::database::{Database, ExecuteResult, SessionId, StatementResult, DEFAULT_DATABASE_NAME};
 
 /// NexusDB gRPC service implementation.
@@ -43,7 +45,72 @@ impl NexusDbService {
         }
     }
 
+    /// Extracts credentials from gRPC request metadata and authenticates.
+    ///
+    /// Supported metadata keys:
+    /// - `authorization`: "Bearer <token>" (JWT) or "ApiKey <key>"
+    /// - `x-nexus-username` + `x-nexus-password`: password auth
+    ///
+    /// Returns the verified identity or a gRPC `Status::unauthenticated` error.
+    fn authenticate<T>(&self, request: &Request<T>) -> Result<Identity, Status> {
+        let metadata = request.metadata();
+
+        // Try Authorization header first
+        if let Some(auth_header) = metadata.get("authorization") {
+            let auth_str = auth_header
+                .to_str()
+                .map_err(|_| Status::unauthenticated("invalid authorization header encoding"))?;
+
+            let credential = if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                Credential::Jwt(token.to_string())
+            } else if let Some(key) = auth_str.strip_prefix("ApiKey ") {
+                Credential::ApiKey(key.to_string())
+            } else {
+                return Err(Status::unauthenticated(
+                    "unsupported authorization scheme; use 'Bearer <jwt>' or 'ApiKey <key>'",
+                ));
+            };
+
+            return self.db.authenticator().authenticate(&credential).map_err(|e| {
+                self.db.audit_log().record_auth("unknown", false, None);
+                Status::unauthenticated(format!("authentication failed: {}", e))
+            });
+        }
+
+        // Try username + password from metadata
+        if let (Some(username), Some(password)) = (
+            metadata.get("x-nexus-username"),
+            metadata.get("x-nexus-password"),
+        ) {
+            let username = username
+                .to_str()
+                .map_err(|_| Status::unauthenticated("invalid username encoding"))?
+                .to_string();
+            let password = password
+                .to_str()
+                .map_err(|_| Status::unauthenticated("invalid password encoding"))?
+                .to_string();
+
+            let credential = Credential::Password { username: username.clone(), password };
+            return self.db.authenticator().authenticate(&credential).map_err(|e| {
+                self.db.audit_log().record_auth(&username, false, None);
+                Status::unauthenticated(format!("authentication failed: {}", e))
+            });
+        }
+
+        // No credentials provided
+        if self.db.authenticator().is_enforcing() {
+            Err(Status::unauthenticated(
+                "authentication required; provide 'authorization' header or 'x-nexus-username'/'x-nexus-password' metadata",
+            ))
+        } else {
+            // Permissive mode: return a default superuser identity
+            Ok(Identity::system())
+        }
+    }
+
     /// Executes SQL using a specific transaction/session, or a temporary session on the given database.
+    #[allow(dead_code)]
     fn execute_with_txn(
         &self,
         sql: &str,
@@ -224,6 +291,10 @@ impl NexusDb for NexusDbService {
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
+        // Authenticate the request
+        let identity = self.authenticate(&request)?;
+        self.db.audit_log().record_auth(&identity.username, true, None);
+
         let req = request.into_inner();
         let start = Instant::now();
         let database = req
@@ -231,8 +302,37 @@ impl NexusDb for NexusDbService {
             .as_deref()
             .unwrap_or(DEFAULT_DATABASE_NAME);
 
-        // Execute the SQL using the transaction session if provided, or temp session on database
-        match self.execute_with_txn(&req.sql, req.transaction_id, database) {
+        // Execute the SQL using authenticated session
+        let result = if let Some(txn_id) = req.transaction_id {
+            // Use the existing transaction session (identity was set at begin_transaction)
+            let sessions = self.transaction_sessions.read().unwrap();
+            if let Some(&session_id) = sessions.get(&txn_id) {
+                if let Some(session_arc) = self.db.get_session(session_id) {
+                    let mut session = session_arc.write().unwrap();
+                    session.execute(&req.sql)
+                } else {
+                    Err(crate::database::DatabaseError::TransactionError(
+                        format!("session for transaction {} not found", txn_id),
+                    ))
+                }
+            } else {
+                Err(crate::database::DatabaseError::TransactionError(
+                    format!("transaction {} not found", txn_id),
+                ))
+            }
+        } else {
+            // Create a temporary authenticated session (autocommit)
+            let session_id = self.db.create_authenticated_session(database, identity);
+            let result = {
+                let session_arc = self.db.get_session(session_id).unwrap();
+                let mut session = session_arc.write().unwrap();
+                session.execute(&req.sql)
+            };
+            self.db.close_session(session_id);
+            result
+        };
+
+        match result {
             Ok(result) => {
                 let elapsed = start.elapsed();
                 let stats = ExecutionStats {
@@ -256,6 +356,8 @@ impl NexusDb for NexusDbService {
                     crate::database::DatabaseError::TransactionError(_) => {
                         ErrorCode::TransactionNotFound
                     }
+                    crate::database::DatabaseError::AuthenticationError(_) => ErrorCode::InternalError,
+                    crate::database::DatabaseError::AuthorizationError(_) => ErrorCode::InternalError,
                     _ => ErrorCode::InternalError,
                 };
 
@@ -274,11 +376,14 @@ impl NexusDb for NexusDbService {
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<Self::ExecuteStreamStream>, Status> {
+        // Authenticate the request
+        let identity = self.authenticate(&request)?;
+
         let req = request.into_inner();
         let database = req.database.as_deref().unwrap_or(DEFAULT_DATABASE_NAME);
 
-        // Execute the query on the requested database
-        let session_id = self.db.create_session(database);
+        // Execute the query on the requested database with authenticated identity
+        let session_id = self.db.create_authenticated_session(database, identity);
         let result = {
             let session_arc = self.db.get_session(session_id).unwrap();
             let mut session = session_arc.write().unwrap();
@@ -370,10 +475,14 @@ impl NexusDb for NexusDbService {
     /// Begin a new transaction.
     async fn begin_transaction(
         &self,
-        _request: Request<BeginTransactionRequest>,
+        request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
-        // Create a persistent session for this transaction (default database)
-        let session_id = self.db.create_session(DEFAULT_DATABASE_NAME);
+        // Authenticate the request
+        let identity = self.authenticate(&request)?;
+        self.db.audit_log().record_auth(&identity.username, true, None);
+
+        // Create a persistent authenticated session for this transaction
+        let session_id = self.db.create_authenticated_session(DEFAULT_DATABASE_NAME, identity);
         
         // Begin the transaction in this session
         if let Some(session_arc) = self.db.get_session(session_id) {
@@ -565,6 +674,9 @@ impl NexusDb for NexusDbService {
                 "Transactions".to_string(),
                 "MVCC".to_string(),
                 "Streaming".to_string(),
+                "Authentication".to_string(),
+                "RBAC".to_string(),
+                "AuditLog".to_string(),
             ],
             uptime_seconds: uptime.as_secs(),
             active_connections: stats.active_sessions as u32,
