@@ -114,10 +114,13 @@ struct UserRecord {
 const MAX_FAILED_ATTEMPTS: u32 = 5;
 
 /// PBKDF2 iteration count. Higher = more resistant to brute-force but slower.
-/// OWASP recommends >= 600 000 for PBKDF2-HMAC-SHA256; we use 10 000 as a
-/// balance between security and test-suite speed.  Override via
-/// `Authenticator::with_iterations()` for production deployments.
-const DEFAULT_PBKDF2_ITERATIONS: u32 = 10_000;
+/// OWASP (2023) recommends >= 600,000 for PBKDF2-HMAC-SHA256.
+const DEFAULT_PBKDF2_ITERATIONS: u32 = 600_000;
+
+/// Reduced iteration count for tests to keep the test suite fast.
+/// Never use this in production.
+#[cfg(test)]
+const TEST_PBKDF2_ITERATIONS: u32 = 1_000;
 
 /// The main authenticator that manages users and validates credentials.
 #[derive(Debug)]
@@ -152,6 +155,13 @@ impl Authenticator {
     /// Create a non-enforcing authenticator (all requests pass).
     pub fn permissive() -> Self {
         Self::new(false)
+    }
+
+    /// Create an authenticator with reduced PBKDF2 iterations for tests.
+    /// This keeps the test suite fast while still exercising the full code path.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_test(enforce: bool) -> Self {
+        Self::new(enforce).with_iterations(TEST_PBKDF2_ITERATIONS)
     }
 
     /// Set the PBKDF2 iteration count (call before creating users).
@@ -245,13 +255,16 @@ impl Authenticator {
     /// Authenticate a credential and return a verified identity.
     pub fn authenticate(&self, credential: &Credential) -> AuthResult<Identity> {
         if !self.enforce {
+            tracing::warn!(
+                "authentication in permissive mode: granting default (non-superuser) identity"
+            );
             return Ok(Identity {
                 username: match credential {
                     Credential::Password { username, .. } => username.clone(),
                     Credential::ApiKey(_) => "api_user".to_string(),
                     Credential::Jwt(_) => "jwt_user".to_string(),
                 },
-                roles: vec!["superuser".to_string()],
+                roles: vec!["default".to_string()],
                 authenticated_at: now_epoch(),
                 method: match credential {
                     Credential::Password { .. } => AuthMethod::Password,
@@ -640,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_create_and_authenticate_user() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("alice");
         auth.create_user("alice", &pw, vec!["analyst".into()])
             .unwrap();
@@ -654,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_bad_password_rejected() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("bob");
         auth.create_user("bob", &pw, vec![]).unwrap();
 
@@ -670,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_account_lockout() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("charlie");
         auth.create_user("charlie", &pw, vec![]).unwrap();
 
@@ -697,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_api_key_auth() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("svc");
         auth.create_user("svc", &pw, vec!["service".into()])
             .unwrap();
@@ -710,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_api_key_reassign() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("svc");
         auth.create_user("svc", &pw, vec!["service".into()])
             .unwrap();
@@ -726,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_jwt_roundtrip() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("admin");
         auth.create_user("admin", &pw, vec!["superuser".into()])
             .unwrap();
@@ -741,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_jwt_tampered_signature_rejected() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("admin");
         auth.create_user("admin", &pw, vec!["superuser".into()])
             .unwrap();
@@ -774,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_user() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("dup");
         auth.create_user("dup", &pw, vec![]).unwrap();
         assert!(matches!(
@@ -785,7 +798,7 @@ mod tests {
 
     #[test]
     fn test_drop_user() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("temp");
         auth.create_user("temp", &pw, vec![]).unwrap();
         assert_eq!(auth.user_count(), 1);
@@ -795,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_drop_user_cleans_api_key() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let pw = test_pw("svc");
         auth.create_user("svc", &pw, vec![]).unwrap();
         let key = auth.assign_api_key("svc").unwrap();
@@ -807,7 +820,7 @@ mod tests {
 
     #[test]
     fn test_empty_password_rejected() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let empty = String::new();
         assert!(matches!(
             auth.create_user("bad", &empty, vec![]),
@@ -817,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_change_password() {
-        let auth = Authenticator::new(true);
+        let auth = Authenticator::new_for_test(true);
         let old_pw = test_pw("old");
         let new_pw = test_pw("new");
         auth.create_user("alice", &old_pw, vec![]).unwrap();

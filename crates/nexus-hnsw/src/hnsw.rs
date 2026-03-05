@@ -443,9 +443,10 @@ impl HnswIndex {
         // Phase 2: search layer 0 with ef candidates
         let candidates = self.search_layer(&inner, query, &[current_ep], ef, 0);
 
-        // Return top-k
+        // Return top-k, filtering out deleted (tombstoned) nodes
         let mut results: Vec<SearchResult> = candidates
             .into_iter()
+            .filter(|c| inner.id_to_index.contains_key(&inner.nodes[c.index].id))
             .map(|c| SearchResult {
                 id: inner.nodes[c.index].id,
                 distance: c.distance,
@@ -491,8 +492,10 @@ impl HnswIndex {
 
         let candidates = self.search_layer(&inner, query, &[current_ep], ef, 0);
 
+        // Filter out deleted (tombstoned) nodes
         let mut results: Vec<SearchResult> = candidates
             .into_iter()
+            .filter(|c| inner.id_to_index.contains_key(&inner.nodes[c.index].id))
             .map(|c| SearchResult {
                 id: inner.nodes[c.index].id,
                 distance: c.distance,

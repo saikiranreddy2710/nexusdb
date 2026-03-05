@@ -3,7 +3,6 @@
 //! This module implements the NexusDB gRPC service defined in nexus-proto.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -21,17 +20,24 @@ use nexus_security::{Credential, Identity};
 
 use crate::database::{Database, ExecuteResult, SessionId, StatementResult, DEFAULT_DATABASE_NAME};
 
+/// Metadata stored per active transaction for ownership verification.
+struct TransactionMeta {
+    /// The session that owns this transaction.
+    session_id: SessionId,
+    /// The username that initiated this transaction (for ownership checks).
+    owner: String,
+}
+
 /// NexusDB gRPC service implementation.
 pub struct NexusDbService {
     /// The database instance.
     db: Arc<Database>,
     /// Server start time.
     start_time: Instant,
-    /// Maps transaction IDs to session IDs for persistent transactions.
-    /// This allows transactions to span multiple gRPC calls.
-    transaction_sessions: RwLock<HashMap<u64, SessionId>>,
-    /// Next transaction ID counter.
-    next_txn_id: AtomicU64,
+    /// Maps transaction IDs to session metadata for persistent transactions.
+    /// This allows transactions to span multiple gRPC calls while enforcing
+    /// that only the originating user can commit/rollback/execute within them.
+    transaction_sessions: RwLock<HashMap<u64, TransactionMeta>>,
 }
 
 impl NexusDbService {
@@ -41,7 +47,6 @@ impl NexusDbService {
             db,
             start_time: Instant::now(),
             transaction_sessions: RwLock::new(HashMap::new()),
-            next_txn_id: AtomicU64::new(1),
         }
     }
 
@@ -323,21 +328,32 @@ impl NexusDb for NexusDbService {
 
         // Execute the SQL using authenticated session
         let result = if let Some(txn_id) = req.transaction_id {
-            // Use the existing transaction session (identity was set at begin_transaction)
-            let sessions = self.transaction_sessions.read().unwrap();
-            if let Some(&session_id) = sessions.get(&txn_id) {
-                if let Some(session_arc) = self.db.get_session(session_id) {
-                    let mut session = session_arc.write().unwrap();
-                    session.execute(&req.sql)
-                } else {
-                    Err(crate::database::DatabaseError::TransactionError(format!(
-                        "session for transaction {} not found",
-                        txn_id
-                    )))
+            // Look up transaction and verify ownership
+            let (session_id, owner) = {
+                let sessions = self.transaction_sessions.read().unwrap();
+                match sessions.get(&txn_id) {
+                    Some(meta) => (meta.session_id, meta.owner.clone()),
+                    None => {
+                        return Ok(Response::new(self.error_response(
+                            format!("transaction {} not found", txn_id),
+                            ErrorCode::InternalError,
+                        )));
+                    }
                 }
+            };
+            // Verify the authenticated user owns this transaction
+            if identity.username != owner {
+                return Ok(Response::new(self.error_response(
+                    "transaction owned by a different user".to_string(),
+                    ErrorCode::AuthorizationFailed,
+                )));
+            }
+            if let Some(session_arc) = self.db.get_session(session_id) {
+                let mut session = session_arc.write().unwrap();
+                session.execute(&req.sql)
             } else {
                 Err(crate::database::DatabaseError::TransactionError(format!(
-                    "transaction {} not found",
+                    "session for transaction {} not found",
                     txn_id
                 )))
             }
@@ -492,6 +508,7 @@ impl NexusDb for NexusDbService {
     ) -> Result<Response<BeginTransactionResponse>, Status> {
         // Authenticate the request
         let identity = self.authenticate(&request)?;
+        let owner_name = identity.username.clone();
 
         // Create a persistent authenticated session for this transaction
         let session_id = self
@@ -503,11 +520,14 @@ impl NexusDb for NexusDbService {
             let mut session = session_arc.write().unwrap();
             match session.begin() {
                 Ok(()) => {
-                    // Generate a unique transaction ID and map it to this session
-                    let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
+                    // Generate a cryptographically random transaction ID
+                    let txn_id = rand::random::<u64>();
 
                     let mut sessions = self.transaction_sessions.write().unwrap();
-                    sessions.insert(txn_id, session_id);
+                    sessions.insert(txn_id, TransactionMeta {
+                        session_id,
+                        owner: owner_name,
+                    });
 
                     Ok(Response::new(BeginTransactionResponse {
                         success: true,
@@ -540,18 +560,34 @@ impl NexusDb for NexusDbService {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         // Authenticate the request before accessing the transaction
-        let _identity = self.authenticate(&request)?;
+        let identity = self.authenticate(&request)?;
 
         let req = request.into_inner();
         let txn_id = req.transaction_id;
 
-        // Find the session for this transaction
+        // Find the session for this transaction and verify ownership
         let session_id = {
             let sessions = self.transaction_sessions.read().unwrap();
-            sessions.get(&txn_id).copied()
+            match sessions.get(&txn_id) {
+                Some(meta) => {
+                    if identity.username != meta.owner {
+                        return Ok(Response::new(CommitResponse {
+                            success: false,
+                            error: Some("transaction owned by a different user".to_string()),
+                        }));
+                    }
+                    meta.session_id
+                }
+                None => {
+                    return Ok(Response::new(CommitResponse {
+                        success: false,
+                        error: Some(format!("Transaction {} not found", txn_id)),
+                    }));
+                }
+            }
         };
 
-        if let Some(session_id) = session_id {
+        {
             if let Some(session_arc) = self.db.get_session(session_id) {
                 let mut session = session_arc.write().unwrap();
                 match session.commit() {
@@ -591,11 +627,6 @@ impl NexusDb for NexusDbService {
                     error: Some("Session not found".to_string()),
                 }))
             }
-        } else {
-            Ok(Response::new(CommitResponse {
-                success: false,
-                error: Some(format!("Transaction {} not found", txn_id)),
-            }))
         }
     }
 
@@ -605,19 +636,34 @@ impl NexusDb for NexusDbService {
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
         // Authenticate the request before accessing the transaction
-        let _identity = self.authenticate(&request)?;
+        let identity = self.authenticate(&request)?;
 
         let req = request.into_inner();
         let txn_id = req.transaction_id;
 
-        // Find the session for this transaction
+        // Find the session for this transaction and verify ownership
         let session_id = {
             let sessions = self.transaction_sessions.read().unwrap();
-            sessions.get(&txn_id).copied()
+            match sessions.get(&txn_id) {
+                Some(meta) => {
+                    if identity.username != meta.owner {
+                        return Ok(Response::new(RollbackResponse {
+                            success: false,
+                            error: Some("transaction owned by a different user".to_string()),
+                        }));
+                    }
+                    meta.session_id
+                }
+                None => {
+                    return Ok(Response::new(RollbackResponse {
+                        success: false,
+                        error: Some(format!("Transaction {} not found", txn_id)),
+                    }));
+                }
+            }
         };
 
-        if let Some(session_id) = session_id {
-            if let Some(session_arc) = self.db.get_session(session_id) {
+        if let Some(session_arc) = self.db.get_session(session_id) {
                 let mut session = session_arc.write().unwrap();
                 match session.rollback() {
                     Ok(()) => {
@@ -655,12 +701,6 @@ impl NexusDb for NexusDbService {
                     error: Some("Session not found".to_string()),
                 }))
             }
-        } else {
-            Ok(Response::new(RollbackResponse {
-                success: false,
-                error: Some(format!("Transaction {} not found", txn_id)),
-            }))
-        }
     }
 
     /// Ping the server.
@@ -680,8 +720,9 @@ impl NexusDb for NexusDbService {
     /// Get server information.
     async fn get_server_info(
         &self,
-        _request: Request<ServerInfoRequest>,
+        request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
+        let _identity = self.authenticate(&request)?;
         let stats = self.db.stats();
         let uptime = self.start_time.elapsed();
 

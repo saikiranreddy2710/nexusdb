@@ -212,8 +212,8 @@ impl std::fmt::Debug for BloomFilter {
 /// Instead of single bits, uses counters so items can be removed.
 /// Uses more memory than a standard Bloom filter.
 pub struct CountingBloomFilter {
-    /// Counter array.
-    counters: Vec<u8>,
+    /// Counter array (u16 to avoid overflow after 256+ insertions of the same item).
+    counters: Vec<u16>,
     /// Number of counters.
     num_counters: usize,
     /// Number of hash functions.
@@ -239,7 +239,7 @@ impl CountingBloomFilter {
             .collect();
 
         Self {
-            counters: vec![0u8; num_counters],
+            counters: vec![0u16; num_counters],
             num_counters,
             num_hashes,
             count: 0,

@@ -36,6 +36,8 @@ pub struct DatabaseConfig {
     pub authz_enabled: bool,
     /// Maximum audit log entries in memory.
     pub audit_max_entries: usize,
+    /// PBKDF2 iteration count for password hashing (0 = use library default).
+    pub pbkdf2_iterations: u32,
 }
 
 impl Default for DatabaseConfig {
@@ -49,6 +51,7 @@ impl Default for DatabaseConfig {
             auth_enabled: false,
             authz_enabled: false,
             audit_max_entries: 10_000,
+            pbkdf2_iterations: 0, // 0 = use library default (600,000)
         }
     }
 }
@@ -170,7 +173,11 @@ impl Database {
         databases.insert(DEFAULT_DATABASE_NAME.to_string(), storage);
 
         // Initialize security subsystems
-        let authenticator = Arc::new(Authenticator::new(config.auth_enabled));
+        let mut authenticator = Authenticator::new(config.auth_enabled);
+        if config.pbkdf2_iterations > 0 {
+            authenticator = authenticator.with_iterations(config.pbkdf2_iterations);
+        }
+        let authenticator = Arc::new(authenticator);
         let authorizer = Arc::new(Authorizer::new(config.authz_enabled));
         let audit_log = Arc::new(AuditLog::new(config.audit_max_entries));
 
@@ -315,6 +322,8 @@ impl Database {
                 name
             )));
         }
+        // Cascade: clean up all vector indexes for this database
+        self.vector_index_manager.drop_database_indexes(name);
         Ok(())
     }
 
@@ -835,6 +844,7 @@ mod tests {
         let config = DatabaseConfig {
             auth_enabled: true,
             authz_enabled: true,
+            pbkdf2_iterations: 1_000,
             ..DatabaseConfig::in_memory()
         };
         let db = Arc::new(Database::open(config).unwrap());
@@ -883,6 +893,7 @@ mod tests {
         let config = DatabaseConfig {
             auth_enabled: true,
             authz_enabled: true,
+            pbkdf2_iterations: 1_000,
             ..DatabaseConfig::in_memory()
         };
         let db = Arc::new(Database::open(config).unwrap());
@@ -922,6 +933,7 @@ mod tests {
     fn test_security_audit_log_captures_auth_events() {
         let config = DatabaseConfig {
             auth_enabled: true,
+            pbkdf2_iterations: 1_000,
             ..DatabaseConfig::in_memory()
         };
         let db = Arc::new(Database::open(config).unwrap());
@@ -959,6 +971,7 @@ mod tests {
         let config = DatabaseConfig {
             auth_enabled: true,
             authz_enabled: true,
+            pbkdf2_iterations: 1_000,
             ..DatabaseConfig::in_memory()
         };
         let db = Arc::new(Database::open(config).unwrap());

@@ -58,12 +58,24 @@ pub struct RegisteredBufferPool {
 }
 
 impl RegisteredBufferPool {
-    /// Allocate `count` buffers of `buf_size` bytes each.
+    /// Allocate `count` page-aligned buffers of `buf_size` bytes each.
+    ///
+    /// Buffers are aligned to 4096 bytes for O_DIRECT compatibility.
     pub fn new(count: usize, buf_size: usize) -> Self {
         let mut buffers = Vec::with_capacity(count);
         let mut free_list = Vec::with_capacity(count);
         for i in 0..count {
-            buffers.push(vec![0u8; buf_size]);
+            // Allocate page-aligned buffer for O_DIRECT support
+            let layout = std::alloc::Layout::from_size_align(buf_size, 4096)
+                .expect("invalid buffer layout");
+            let buf = unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout);
+                if ptr.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                Vec::from_raw_parts(ptr, buf_size, buf_size)
+            };
+            buffers.push(buf);
             free_list.push(i as u16);
         }
         Self {
@@ -330,13 +342,13 @@ impl UringFile {
         len: u32,
         offset: u64,
     ) -> IoResult<usize> {
-        let ptr = {
-            let pool_guard = self.registered_buffers.lock();
-            let pool = pool_guard.as_ref().ok_or(IoError::UringError {
-                message: "no registered buffers".into(),
-            })?;
-            pool.buffers[buf_idx as usize].as_ptr() as *mut u8
-        };
+        // Hold the pool lock for the entire SQE submission+completion to
+        // prevent use-after-free if another thread calls unregister_buffers.
+        let pool_guard = self.registered_buffers.lock();
+        let pool = pool_guard.as_ref().ok_or(IoError::UringError {
+            message: "no registered buffers".into(),
+        })?;
+        let ptr = pool.buffers[buf_idx as usize].as_ptr() as *mut u8;
 
         let fd = self.target_fd();
         let mut ring = self.ring.lock();
@@ -355,6 +367,7 @@ impl UringFile {
         }
 
         let result = Self::submit_and_wait_one(&mut ring)?;
+        drop(pool_guard); // Explicitly release after I/O completes
         Ok(result as usize)
     }
 
@@ -374,13 +387,12 @@ impl UringFile {
             });
         }
 
-        let ptr = {
-            let pool_guard = self.registered_buffers.lock();
-            let pool = pool_guard.as_ref().ok_or(IoError::UringError {
-                message: "no registered buffers".into(),
-            })?;
-            pool.buffers[buf_idx as usize].as_ptr() as *const u8
-        };
+        // Hold the pool lock for the entire SQE lifecycle.
+        let pool_guard = self.registered_buffers.lock();
+        let pool = pool_guard.as_ref().ok_or(IoError::UringError {
+            message: "no registered buffers".into(),
+        })?;
+        let ptr = pool.buffers[buf_idx as usize].as_ptr() as *const u8;
 
         let fd = self.target_fd();
         let mut ring = self.ring.lock();
@@ -399,6 +411,7 @@ impl UringFile {
         }
 
         let result = Self::submit_and_wait_one(&mut ring)?;
+        drop(pool_guard);
         Ok(result as usize)
     }
 
@@ -563,7 +576,7 @@ impl FileHandle for UringFile {
 
         // Build the Read SQE
         let read_e = opcode::Read::new(
-            types::Fd(self.fd),
+            self.target_fd(),
             buf.as_mut_ptr(),
             buf.len() as u32,
         )
@@ -600,7 +613,7 @@ impl FileHandle for UringFile {
 
         // Build the Write SQE
         let write_e = opcode::Write::new(
-            types::Fd(self.fd),
+            self.target_fd(),
             buf.as_ptr(),
             buf.len() as u32,
         )
@@ -723,7 +736,7 @@ impl FileHandle for UringFile {
         Ok(())
     }
 
-    async fn close(self) -> IoResult<()> {
+    async fn close(mut self) -> IoResult<()> {
         let mut ring = self.ring.lock();
 
         // Submit a Close SQE via io_uring
@@ -741,8 +754,9 @@ impl FileHandle for UringFile {
 
         Self::submit_and_wait_one(&mut ring)?;
 
-        // Prevent Drop from closing the fd again
-        std::mem::forget(self);
+        // Mark fd as closed so Drop doesn't close it again.
+        // Using -1 as sentinel (Drop checks for this).
+        self.fd = -1;
 
         Ok(())
     }
@@ -750,9 +764,11 @@ impl FileHandle for UringFile {
 
 impl Drop for UringFile {
     fn drop(&mut self) {
-        // Close the file descriptor
-        unsafe {
-            libc::close(self.fd);
+        // fd == -1 means close() was already called via io_uring
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
         }
     }
 }
@@ -781,7 +797,11 @@ impl UringBatch {
     }
 
     /// Add a read operation to the batch.
-    pub fn add_read(
+    ///
+    /// # Safety
+    /// The caller must ensure `buf` remains valid and is not moved or dropped
+    /// until [`submit`] completes.
+    pub unsafe fn add_read(
         &mut self,
         fd: RawFd,
         buf: &mut [u8],
@@ -809,7 +829,11 @@ impl UringBatch {
     }
 
     /// Add a write operation to the batch.
-    pub fn add_write(
+    ///
+    /// # Safety
+    /// The caller must ensure `buf` remains valid and is not moved or dropped
+    /// until [`submit`] completes.
+    pub unsafe fn add_write(
         &mut self,
         fd: RawFd,
         buf: &[u8],

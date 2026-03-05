@@ -422,6 +422,19 @@ impl Session {
                     .check_database(&self.identity, db, Privilege::Drop)
             }
 
+            // ALTER TABLE requires Alter privilege on the table
+            Statement::AlterTable(alter) => self.authorizer.check_table(
+                &self.identity,
+                db,
+                &alter.table.table,
+                Privilege::Alter,
+            ),
+
+            // EXPLAIN / EXPLAIN ANALYZE: authorize the inner statement
+            Statement::Explain(inner) | Statement::ExplainAnalyze(inner) => {
+                return self.authorize_statement(inner);
+            }
+
             // Transaction control, SHOW, DESCRIBE, USE - always allowed
             Statement::Begin
             | Statement::Commit
@@ -431,8 +444,8 @@ impl Session {
             | Statement::DescribeTable(_)
             | Statement::UseDatabase(_) => nexus_security::AccessDecision::Allow,
 
-            // Unknown statements: allow (will likely fail at execution)
-            _ => nexus_security::AccessDecision::Allow,
+            // Deny any unrecognized statement types by default
+            _ => nexus_security::AccessDecision::Deny("statement type not authorized".to_string()),
         };
 
         match decision {
@@ -790,6 +803,47 @@ impl Session {
             );
             self.storage().catalog().add_index(table_name, index_info)?;
 
+            // Backfill: insert existing rows into the new vector index
+            let backfill_key = super::vector_index::VectorIndexKey::new(
+                &self.current_database,
+                table_name,
+                &create.name,
+            );
+            if let Ok(batches) = self.storage().execute_scan(table_name) {
+                for batch in &batches {
+                    for row in batch.rows() {
+                        if let Some(Value::Vector(ref vec_data)) = row.get(col_idx) {
+                            let vector_id: u64 = if !table_info.primary_key.is_empty() {
+                                let pk_val = row
+                                    .get(table_info.primary_key[0])
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                match pk_val {
+                                    Value::Int(v) => v as u64,
+                                    Value::BigInt(v) => v as u64,
+                                    Value::SmallInt(v) => v as u64,
+                                    Value::TinyInt(v) => v as u64,
+                                    _ => {
+                                        use std::hash::{Hash, Hasher};
+                                        let mut hasher =
+                                            std::collections::hash_map::DefaultHasher::new();
+                                        format!("{:?}", pk_val).hash(&mut hasher);
+                                        hasher.finish()
+                                    }
+                                }
+                            } else {
+                                0u64 // fallback; no PK
+                            };
+                            let _ = self.database.vector_index_manager().insert(
+                                &backfill_key,
+                                vector_id,
+                                vec_data,
+                            );
+                        }
+                    }
+                }
+            }
+
             tracing::info!(
                 "Created HNSW vector index \"{}\" on {}.{} ({}D, L2)",
                 create.name,
@@ -900,7 +954,50 @@ impl Session {
             rows.push(Row::new(row_values));
         }
 
-        let count = self.storage().execute_insert(table_name, rows)?;
+        let count = self.storage().execute_insert(table_name, rows.clone())?;
+
+        // Populate any HNSW vector indexes for this table
+        let vim = self.database.vector_index_manager();
+        let vector_keys = vim.list_table_indexes(&self.current_database, table_name);
+        if !vector_keys.is_empty() {
+            // Find HNSW index info to know which column has the vector
+            for vk in &vector_keys {
+                if let Some(idx_info) = table_info.indexes.iter().find(|i| i.name == vk.index_name)
+                {
+                    if let Some(&col_idx) = idx_info.columns.first() {
+                        for (row_i, row) in rows.iter().enumerate() {
+                            if let Some(Value::Vector(ref vec_data)) = row.get(col_idx) {
+                                // Derive a VectorId from the primary key or row counter
+                                let vector_id: u64 = if !table_info.primary_key.is_empty() {
+                                    let pk_val = row
+                                        .get(table_info.primary_key[0])
+                                        .cloned()
+                                        .unwrap_or(Value::Null);
+                                    match pk_val {
+                                        Value::Int(v) => v as u64,
+                                        Value::BigInt(v) => v as u64,
+                                        Value::SmallInt(v) => v as u64,
+                                        Value::TinyInt(v) => v as u64,
+                                        _ => {
+                                            use std::hash::{Hash, Hasher};
+                                            let mut hasher =
+                                                std::collections::hash_map::DefaultHasher::new();
+                                            format!("{:?}", pk_val).hash(&mut hasher);
+                                            hasher.finish()
+                                        }
+                                    }
+                                } else {
+                                    row_i as u64
+                                };
+                                // Best-effort: ignore errors (e.g. duplicate id)
+                                let _ = vim.insert(vk, vector_id, vec_data);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(StatementResult::Insert {
             rows_affected: count,
         })

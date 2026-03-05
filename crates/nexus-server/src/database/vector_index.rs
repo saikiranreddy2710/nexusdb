@@ -82,6 +82,11 @@ impl VectorIndexManager {
             .retain(|k, _| !(k.database == database && k.table == table));
     }
 
+    /// Drops all indexes for a given database.
+    pub fn drop_database_indexes(&self, database: &str) {
+        self.indexes.write().retain(|k, _| k.database != database);
+    }
+
     /// Returns a reference to an index.
     pub fn get_index(&self, key: &VectorIndexKey) -> Option<Arc<HnswIndex>> {
         self.indexes.read().get(key).cloned()

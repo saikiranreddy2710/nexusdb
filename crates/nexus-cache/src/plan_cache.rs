@@ -162,23 +162,18 @@ impl<P: Clone> PlanCache<P> {
     /// Useful when a table schema changes and related plans need to be
     /// invalidated.
     ///
-    /// Note: Due to LruCache API limitations, this currently clears the entire
-    /// cache if any key matches the predicate. A future improvement would be
-    /// to add iteration support to LruCache for selective invalidation.
-    pub fn invalidate_where<F>(&self, predicate: F)
+    /// **Limitation:** The underlying `LruCache` does not support iteration
+    /// over its keys, so selective removal based on `predicate` is not
+    /// possible. This method therefore performs a **full cache clear**
+    /// (equivalent to [`clear()`](Self::clear)). The predicate parameter
+    /// is accepted for API compatibility but is not evaluated.
+    pub fn invalidate_where<F>(&self, _predicate: F)
     where
         F: Fn(&str) -> bool,
     {
-        // For now, just clear if the predicate matches any pattern
-        // A more sophisticated implementation would iterate and selectively remove
-        let mut cache = self.cache.write();
-
-        // Since we can't iterate over the LruCache, we use a simple heuristic:
-        // If the predicate would match an empty string (catch-all), clear everything
-        if predicate("") {
-            cache.clear();
-        }
-        // Otherwise, we'd need to track keys separately or add iteration to LruCache
+        // LruCache does not expose key iteration, so we cannot selectively
+        // remove matching entries. Clear everything as a safe fallback.
+        self.clear();
     }
 
     /// Invalidates all plans that reference the given table.
@@ -218,15 +213,37 @@ impl<P: Clone> PlanCache<P> {
     }
 }
 
-/// Normalizes SQL by removing extra whitespace and converting to lowercase.
+/// Normalizes SQL by removing extra whitespace and converting keywords to lowercase.
 ///
 /// This ensures that queries that are logically equivalent but formatted
-/// differently will share the same cache entry.
+/// differently will share the same cache entry. Characters inside single-quoted
+/// string literals (e.g. `'Alice'`) are **not** lowercased so that cache keys
+/// remain faithful to the original literal values.
 pub fn normalize_sql(sql: &str) -> String {
-    sql.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    // First, collapse whitespace while preserving content inside single quotes.
+    let collapsed = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Now lowercase only the portions outside of single-quoted strings.
+    let mut result = String::with_capacity(collapsed.len());
+    let mut in_quote = false;
+
+    let mut chars = collapsed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            in_quote = !in_quote;
+            result.push(ch);
+        } else if in_quote {
+            // Inside a string literal – preserve original case
+            result.push(ch);
+        } else {
+            // Outside a string literal – lowercase
+            for lower in ch.to_lowercase() {
+                result.push(lower);
+            }
+        }
+    }
+
+    result
 }
 
 /// Computes a hash for a SQL string for use as a cache key.

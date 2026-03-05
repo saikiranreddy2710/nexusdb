@@ -194,11 +194,21 @@ impl<R: Clone> ResultCache<R> {
     }
 
     /// Inserts a result into the cache.
+    ///
+    /// Lock ordering: `cache` first, then `table_index` (matching `get()`).
     pub fn insert(&self, key: ResultCacheKey, result: R, tables: Vec<String>) {
         let table_set: HashSet<String> = tables.into_iter().collect();
         let entry = CachedResult::new(result, table_set.clone());
 
-        // Add to table index
+        // Acquire cache lock first (same order as get()) to prevent deadlock
+        let len_before = {
+            let mut cache = self.cache.write();
+            let len_before = cache.len();
+            cache.insert(key.clone(), entry);
+            len_before
+        };
+
+        // Now acquire table_index lock
         {
             let mut index = self.table_index.write();
             for table in &table_set {
@@ -209,7 +219,11 @@ impl<R: Clone> ResultCache<R> {
             }
         }
 
-        self.cache.write().insert(key, entry);
+        // If an eviction may have occurred, trim stale entries from table_index
+        let len_after = self.cache.read().len();
+        if len_after <= len_before {
+            self.trim_stale_entries();
+        }
     }
 
     /// Removes a result from the cache.
@@ -280,20 +294,38 @@ impl<R: Clone> ResultCache<R> {
         self.cache.read().stats().clone()
     }
 
-    /// Removes stale entries (expired based on TTL).
+    /// Attempts to remove expired entries from the cache.
     ///
-    /// Note: Due to LruCache API limitations, this is currently a no-op.
-    /// Expired entries are checked and removed lazily on get().
-    /// A production implementation would add iteration support to LruCache
-    /// for periodic background eviction.
+    /// **Limitation:** The underlying `LruCache` does not support iteration
+    /// over its entries, so this method cannot scan for expired items.
+    /// Expired entries are instead **lazily evicted** in [`get()`](Self::get):
+    /// when a caller retrieves an entry whose age exceeds `default_ttl_secs`,
+    /// it is removed at that point.
+    ///
+    /// Calling this method is therefore a no-op. It is retained for API
+    /// compatibility and to document the lazy-eviction strategy. If
+    /// proactive eviction is needed, consider calling [`clear()`](Self::clear)
+    /// or switching to an LRU implementation that supports iteration.
     pub fn evict_expired(&self) {
-        // For now, this is a no-op since we check TTL on get()
-        // Expired entries are lazily evicted when accessed
-        // A future improvement would be to add iteration support to LruCache
-        // for periodic background scanning and eviction
-        //
-        // Skip if TTL is disabled (default_ttl_secs == 0)
-        let _ = self.config.default_ttl_secs;
+        // No-op: expired entries are lazily evicted on get().
+        // See doc comment above for rationale.
+    }
+
+    /// Removes keys from `table_index` that no longer exist in `cache`.
+    ///
+    /// Called periodically from `insert()` to clean up stale entries left
+    /// behind when the LRU evicts an entry (since LruCache has no eviction
+    /// callback).
+    fn trim_stale_entries(&self) {
+        let cache = self.cache.read();
+        let mut index = self.table_index.write();
+
+        for (_table, keys) in index.iter_mut() {
+            keys.retain(|k| cache.contains(k));
+        }
+
+        // Remove table entries that have no remaining keys
+        index.retain(|_table, keys| !keys.is_empty());
     }
 
     /// Removes a key from the table index.

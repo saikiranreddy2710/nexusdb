@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 use nexus_common::types::PageId;
@@ -31,7 +31,7 @@ use super::node::{InternalNode, LeafNode, NodeType};
 const FILE_PAGE_SIZE: usize = 8192;
 
 /// Per-page envelope: [node_type: 1][data_len: 4][data: N][padding]
-const ENVELOPE_HEADER: usize = 5; // 1 + 4
+const ENVELOPE_HEADER: usize = 9; // 1 (type) + 4 (len) + 4 (crc32)
 
 /// Magic indicating an unused (free) page on disk.
 const FREE_PAGE_MARKER: u8 = 0x00;
@@ -242,8 +242,8 @@ impl FilePager {
             let offset = page_idx * FILE_PAGE_SIZE as u64;
             file.seek(SeekFrom::Start(offset))?;
 
-            let bytes_read = file.read(&mut buf)?;
-            if bytes_read < ENVELOPE_HEADER {
+            if let Err(_) = file.read_exact(&mut buf) {
+                // Short read (partial page at end of file), skip
                 continue;
             }
 
@@ -262,7 +262,17 @@ impl FilePager {
                 continue; // Corrupted or empty, skip
             }
 
+            let stored_crc = u32::from_le_bytes(buf[5..9].try_into().unwrap());
             let data = &buf[ENVELOPE_HEADER..ENVELOPE_HEADER + data_len];
+            let computed_crc = crc32fast::hash(data);
+            if stored_crc != computed_crc {
+                // CRC mismatch — page is corrupt, treat as free
+                self.free_pages
+                    .get_mut()
+                    .unwrap()
+                    .push(PageId::new(page_idx));
+                continue;
+            }
             let page_id = PageId::new(page_idx);
 
             match NodeType::from_byte(node_type_byte) {
@@ -310,6 +320,8 @@ impl FilePager {
         let mut page_buf = vec![0u8; FILE_PAGE_SIZE];
         page_buf[0] = node_type.as_byte();
         page_buf[1..5].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        let crc = crc32fast::hash(data);
+        page_buf[5..9].copy_from_slice(&crc.to_le_bytes());
         page_buf[ENVELOPE_HEADER..ENVELOPE_HEADER + data.len()].copy_from_slice(data);
 
         let offset = page_id.as_u64() * FILE_PAGE_SIZE as u64;
@@ -317,6 +329,7 @@ impl FilePager {
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(&page_buf)?;
+        file.sync_data()?;
 
         Ok(())
     }
@@ -329,6 +342,7 @@ impl FilePager {
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(&page_buf)?;
+        file.sync_data()?;
 
         Ok(())
     }

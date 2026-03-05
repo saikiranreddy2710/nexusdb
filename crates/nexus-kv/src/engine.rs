@@ -215,9 +215,9 @@ impl LsmEngine {
     pub fn put(&self, key: Bytes, value: Bytes) -> KvResult<()> {
         self.check_running()?;
         self.check_key_value_size(&key, &value)?;
-        self.maybe_freeze_memtable()?;
 
         let _guard = self.write_mutex.lock();
+        self.maybe_freeze_memtable()?;
 
         // Write to WAL first (write-ahead)
         {
@@ -240,9 +240,9 @@ impl LsmEngine {
     /// Delete a key.
     pub fn delete(&self, key: Bytes) -> KvResult<()> {
         self.check_running()?;
-        self.maybe_freeze_memtable()?;
 
         let _guard = self.write_mutex.lock();
+        self.maybe_freeze_memtable()?;
 
         // Write to WAL first
         {
@@ -267,9 +267,9 @@ impl LsmEngine {
         if batch.is_empty() {
             return Ok(());
         }
-        self.maybe_freeze_memtable()?;
 
         let _guard = self.write_mutex.lock();
+        self.maybe_freeze_memtable()?;
 
         // Write all batch entries to WAL first
         {
@@ -506,9 +506,10 @@ impl LsmEngine {
     /// Also rotates the WAL: closes the old WAL and opens a new one for
     /// the new active memtable. The old WAL file number is recorded so it
     /// can be deleted after the memtable is flushed to an SSTable.
+    ///
+    /// SAFETY: Caller MUST hold `write_mutex` (or be in shutdown where
+    /// no concurrent writers exist).
     fn freeze_memtable(&self) -> KvResult<()> {
-        let _guard = self.write_mutex.lock();
-
         // Track the WAL number of the frozen memtable so we can delete it after flush
         let old_wal_number = self.wal_file_number.load(Ordering::Relaxed);
 
@@ -567,8 +568,10 @@ impl LsmEngine {
             let _ = wal::delete_wal(&self.data_dir, old_wal_number);
         }
 
-        // Try to flush immutable memtables
-        drop(_guard); // Release write lock before flush
+        // Try to flush immutable memtables.
+        // Note: the caller's write_mutex guard will be released after this
+        // returns. flush_immutable_memtables only needs the immutable_memtables
+        // RwLock, not the write_mutex.
         self.flush_immutable_memtables()?;
 
         Ok(())
@@ -666,6 +669,14 @@ impl LsmEngine {
 
         let result = writer.finish()?;
 
+        // Fsync the SSTable file to ensure it is durable on disk before
+        // we delete the WAL. Without this, a crash after WAL deletion but
+        // before the OS flushes the SSTable could lose data.
+        {
+            let sst_file = fs::File::open(&file_path)?;
+            sst_file.sync_all()?;
+        }
+
         // Create SSTable info
         let sst_info = SSTableInfo {
             id: file_number,
@@ -718,8 +729,10 @@ impl LsmEngine {
 
     /// Execute a compaction job.
     fn execute_compaction(&self, job: &crate::compaction::CompactionJob) -> KvResult<()> {
-        // Collect all input file IDs
-        let mut input_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // Collect all entries tagged with their source file's max_sequence
+        // so we can properly resolve duplicates by keeping the newest version.
+        // Format: (key, value, max_sequence_of_source_file)
+        let mut input_entries: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
 
         // Read all entries from input files (input level)
         for file_info in &job.input_files {
@@ -730,7 +743,7 @@ impl LsmEngine {
                 let mut iter = reader.iter()?;
                 while iter.is_valid() {
                     if let (Some(k), Some(v)) = (iter.key(), iter.value()) {
-                        input_entries.push((k.to_vec(), v.to_vec()));
+                        input_entries.push((k.to_vec(), v.to_vec(), file_info.max_sequence));
                     }
                     iter.next();
                 }
@@ -746,19 +759,25 @@ impl LsmEngine {
                 let mut iter = reader.iter()?;
                 while iter.is_valid() {
                     if let (Some(k), Some(v)) = (iter.key(), iter.value()) {
-                        input_entries.push((k.to_vec(), v.to_vec()));
+                        input_entries.push((k.to_vec(), v.to_vec(), file_info.max_sequence));
                     }
                     iter.next();
                 }
             }
         }
 
-        // Sort entries by key (merge sort)
-        input_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sort entries by (key ASC, sequence DESC) so that for duplicate keys
+        // the newest entry (highest sequence) comes first and survives dedup.
+        input_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)));
 
-        // Deduplicate: for same key, keep the newest (first occurrence after sort
-        // since entries from newer files come first)
+        // Deduplicate: for same key, keep the first (newest due to sort order)
         input_entries.dedup_by(|b, a| a.0 == b.0);
+
+        // Strip the sequence tag before writing output SSTables
+        let merged_entries: Vec<(Vec<u8>, Vec<u8>)> = input_entries
+            .into_iter()
+            .map(|(k, v, _seq)| (k, v))
+            .collect();
 
         // Write the merged entries to new SSTable(s)
         let target_size = self.compaction_strategy.target_file_size(job.output_level);
@@ -766,7 +785,7 @@ impl LsmEngine {
         let mut current_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut current_size = 0u64;
 
-        for entry in &input_entries {
+        for entry in &merged_entries {
             current_size += (entry.0.len() + entry.1.len()) as u64;
             current_entries.push(entry.clone());
 
@@ -851,6 +870,12 @@ impl LsmEngine {
             writer.add(k, v)?;
         }
         let result = writer.finish()?;
+
+        // Fsync the compaction output SSTable before updating the manifest.
+        {
+            let sst_file = fs::File::open(&file_path)?;
+            sst_file.sync_all()?;
+        }
 
         Ok(SSTableInfo {
             id: file_number,
@@ -959,8 +984,9 @@ fn run_compaction_job(
     let sst_dir = data_dir.join("sst");
     let sst_path = |id: u64| sst_dir.join(format!("{:06}.sst", id));
 
-    // Read all entries from input files
-    let mut input_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    // Read all entries from input files, tagged with source file's max_sequence
+    // so we can properly resolve duplicates by keeping the newest version.
+    let mut input_entries: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
 
     for file_info in job.input_files.iter().chain(job.output_files.iter()) {
         let path = sst_path(file_info.id);
@@ -970,15 +996,23 @@ fn run_compaction_job(
             let mut iter = reader.iter()?;
             while iter.is_valid() {
                 if let (Some(k), Some(v)) = (iter.key(), iter.value()) {
-                    input_entries.push((k.to_vec(), v.to_vec()));
+                    input_entries.push((k.to_vec(), v.to_vec(), file_info.max_sequence));
                 }
                 iter.next();
             }
         }
     }
 
-    input_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    // Sort by (key ASC, sequence DESC) so that for duplicate keys the newest
+    // entry (highest sequence) comes first and survives dedup.
+    input_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)));
     input_entries.dedup_by(|b, a| a.0 == b.0);
+
+    // Strip the sequence tag before writing output SSTables
+    let merged_entries: Vec<(Vec<u8>, Vec<u8>)> = input_entries
+        .into_iter()
+        .map(|(k, v, _seq)| (k, v))
+        .collect();
 
     // Write merged entries to new SSTable(s)
     let target_size = compaction_strategy.target_file_size(job.output_level);
@@ -1006,6 +1040,11 @@ fn run_compaction_job(
             writer.add(k, v)?;
         }
         let result = writer.finish()?;
+        // Fsync the compaction output SSTable before updating the manifest.
+        {
+            let sst_file = fs::File::open(&file_path)?;
+            sst_file.sync_all()?;
+        }
         Ok(SSTableInfo {
             id: file_number,
             level,
@@ -1019,7 +1058,7 @@ fn run_compaction_job(
         })
     };
 
-    for entry in &input_entries {
+    for entry in &merged_entries {
         current_size += (entry.0.len() + entry.1.len()) as u64;
         current_entries.push(entry.clone());
 
