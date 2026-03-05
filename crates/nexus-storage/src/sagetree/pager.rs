@@ -466,7 +466,7 @@ impl Pager for FilePager {
         self.free_pages.write().unwrap().clear();
         self.next_page.store(1, std::sync::atomic::Ordering::SeqCst);
         // Truncate the data file
-        let mut file = self.file.lock().unwrap();
+        let file = self.file.lock().unwrap();
         file.set_len(0)?;
         file.sync_all()?;
         Ok(())

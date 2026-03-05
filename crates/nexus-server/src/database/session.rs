@@ -444,7 +444,10 @@ impl Session {
             | Statement::DescribeTable(_)
             | Statement::UseDatabase(_) => nexus_security::AccessDecision::Allow,
 
-            // Deny any unrecognized statement types by default
+            // Deny any future unrecognized statement types by default.
+            // Currently unreachable (all variants handled above), but kept as
+            // a safety net for when new statement types are added to the parser.
+            #[allow(unreachable_patterns)]
             _ => nexus_security::AccessDecision::Deny("statement type not authorized".to_string()),
         };
 

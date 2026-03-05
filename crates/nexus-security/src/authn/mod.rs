@@ -168,7 +168,7 @@ impl Authenticator {
 
     /// Create an authenticator with reduced PBKDF2 iterations for tests.
     /// This keeps the test suite fast while still exercising the full code path.
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(test)]
     pub fn new_for_test(enforce: bool) -> Self {
         Self::new(enforce).with_iterations(TEST_PBKDF2_ITERATIONS)
     }
