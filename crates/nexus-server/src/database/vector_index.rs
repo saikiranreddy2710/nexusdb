@@ -65,8 +65,17 @@ impl VectorIndexManager {
         let config = HnswConfig::new(dimensions, metric)
             .with_m(m)
             .with_ef_construction(ef_construction);
+
+        let mut indexes = self.indexes.write();
+        if indexes.contains_key(&key) {
+            return Err(nexus_hnsw::HnswError::InvalidConfig(format!(
+                "vector index already exists: {}.{}.{}",
+                key.database, key.table, key.index_name
+            )));
+        }
+
         let index = HnswIndex::new(config)?;
-        self.indexes.write().insert(key, Arc::new(index));
+        indexes.insert(key, Arc::new(index));
         Ok(())
     }
 

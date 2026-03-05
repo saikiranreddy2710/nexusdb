@@ -54,6 +54,8 @@ pub enum WalRecordType {
     Put = 1,
     /// Key deletion (tombstone).
     Delete = 2,
+    /// Atomic batch of put/delete operations.
+    Batch = 3,
 }
 
 impl WalRecordType {
@@ -61,6 +63,7 @@ impl WalRecordType {
         match v {
             1 => Some(Self::Put),
             2 => Some(Self::Delete),
+            3 => Some(Self::Batch),
             _ => None,
         }
     }
@@ -114,6 +117,34 @@ impl WalWriter {
     /// Append a Delete record.
     pub fn log_delete(&mut self, key: &[u8]) -> KvResult<()> {
         self.append_record(WalRecordType::Delete, key, &[])
+    }
+
+    /// Append an atomic batch record containing multiple put/delete operations.
+    ///
+    /// All entries are serialized into a single WAL record so that replay is
+    /// all-or-nothing: either the entire batch is recovered or none of it is.
+    ///
+    /// Batch payload format:
+    /// ```text
+    /// [count:4][entry...]
+    /// entry = [type:1][key_len:4][key:N][value_len:4][value:M]
+    /// ```
+    pub fn log_batch(&mut self, entries: &[(WalRecordType, &[u8], &[u8])]) -> KvResult<()> {
+        // Build the batch payload: count(4) + entries...
+        let mut batch_payload = Vec::new();
+        batch_payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (entry_type, key, value) in entries {
+            batch_payload.push(*entry_type as u8);
+            batch_payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            batch_payload.extend_from_slice(key);
+            batch_payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            batch_payload.extend_from_slice(value);
+        }
+
+        // Write as a single WAL record with type Batch.
+        // The key is the batch_payload and value is empty -- but we use
+        // append_record's key/value slots to carry the batch blob.
+        self.append_record(WalRecordType::Batch, &batch_payload, &[])
     }
 
     /// Sync the WAL to disk.
@@ -271,9 +302,9 @@ impl WalReader {
                 break;
             }
 
-            // Parse record
+            // Parse record (may return multiple records for batch entries)
             match parse_record(&payload) {
-                Some(record) => records.push(record),
+                Some(parsed) => records.extend(parsed),
                 None => break, // Malformed record, stop
             }
         }
@@ -334,31 +365,96 @@ fn compute_crc(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-fn parse_record(payload: &[u8]) -> Option<WalRecord> {
+fn parse_record(payload: &[u8]) -> Option<Vec<WalRecord>> {
     if payload.len() < 9 {
         return None;
     }
     let record_type = WalRecordType::from_u8(payload[0])?;
 
-    let key_len = u32::from_le_bytes(payload[1..5].try_into().ok()?) as usize;
-    if 5 + key_len + 4 > payload.len() {
+    match record_type {
+        WalRecordType::Put | WalRecordType::Delete => {
+            let key_len = u32::from_le_bytes(payload[1..5].try_into().ok()?) as usize;
+            if 5 + key_len + 4 > payload.len() {
+                return None;
+            }
+            let key = payload[5..5 + key_len].to_vec();
+
+            let vl_start = 5 + key_len;
+            let value_len =
+                u32::from_le_bytes(payload[vl_start..vl_start + 4].try_into().ok()?) as usize;
+            let v_start = vl_start + 4;
+            if v_start + value_len > payload.len() {
+                return None;
+            }
+            let value = payload[v_start..v_start + value_len].to_vec();
+
+            Some(vec![WalRecord {
+                record_type,
+                key,
+                value,
+            }])
+        }
+        WalRecordType::Batch => {
+            // Batch payload is stored in the "key" portion of the record:
+            // payload[0] = Batch type (already matched)
+            // payload[1..5] = key_len (batch_payload length)
+            // payload[5..5+key_len] = batch_payload
+            let batch_blob_len = u32::from_le_bytes(payload[1..5].try_into().ok()?) as usize;
+            if 5 + batch_blob_len + 4 > payload.len() {
+                return None;
+            }
+            let batch_blob = &payload[5..5 + batch_blob_len];
+            parse_batch_payload(batch_blob)
+        }
+    }
+}
+
+/// Parse the inner batch payload into individual WalRecords.
+///
+/// Format: [count:4][entry...]
+/// entry = [type:1][key_len:4][key:N][value_len:4][value:M]
+fn parse_batch_payload(data: &[u8]) -> Option<Vec<WalRecord>> {
+    if data.len() < 4 {
         return None;
     }
-    let key = payload[5..5 + key_len].to_vec();
+    let count = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let mut pos = 4;
+    let mut records = Vec::with_capacity(count);
 
-    let vl_start = 5 + key_len;
-    let value_len = u32::from_le_bytes(payload[vl_start..vl_start + 4].try_into().ok()?) as usize;
-    let v_start = vl_start + 4;
-    if v_start + value_len > payload.len() {
-        return None;
+    for _ in 0..count {
+        if pos + 1 + 4 > data.len() {
+            return None;
+        }
+        let entry_type = WalRecordType::from_u8(data[pos])?;
+        pos += 1;
+
+        let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        if pos + key_len > data.len() {
+            return None;
+        }
+        let key = data[pos..pos + key_len].to_vec();
+        pos += key_len;
+
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let value_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        if pos + value_len > data.len() {
+            return None;
+        }
+        let value = data[pos..pos + value_len].to_vec();
+        pos += value_len;
+
+        records.push(WalRecord {
+            record_type: entry_type,
+            key,
+            value,
+        });
     }
-    let value = payload[v_start..v_start + value_len].to_vec();
 
-    Some(WalRecord {
-        record_type,
-        key,
-        value,
-    })
+    Some(records)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

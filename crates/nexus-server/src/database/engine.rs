@@ -862,7 +862,8 @@ mod tests {
                     database: DEFAULT_DATABASE_NAME.to_string(),
                     privilege: nexus_security::Privilege::Select,
                 },
-            ));
+            ))
+            .unwrap();
 
         // Authenticate as the reader
         let cred = make_test_credential("reader", "reader");
@@ -1002,7 +1003,8 @@ mod tests {
                     table: "products".to_string(),
                     privilege: nexus_security::Privilege::Select,
                 },
-            ));
+            ))
+            .unwrap();
 
         // Authenticate as viewer
         let cred = make_test_credential("viewer", "viewer");

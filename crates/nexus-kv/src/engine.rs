@@ -125,8 +125,17 @@ impl LsmEngine {
             let wal_files = wal::find_wal_files(&data_dir)?;
             let memtable = MemTable::new(1, config.memtable_size, versions.last_sequence() + 1);
 
+            // Skip WAL files that have already been flushed to SSTables.
+            // The manifest records the WAL number at each flush; any WAL
+            // with a number strictly less than that has been persisted.
+            let min_wal = versions.log_number();
+
             let mut recovered_keys = 0u64;
             for (wal_num, wal_path) in &wal_files {
+                if *wal_num < min_wal {
+                    debug!(wal_number = wal_num, "skipping already-flushed WAL");
+                    continue;
+                }
                 let reader = wal::WalReader::open(wal_path.clone());
                 let records = reader.replay()?;
                 for record in &records {
@@ -141,6 +150,11 @@ impl LsmEngine {
                         WalRecordType::Delete => {
                             memtable.delete(Bytes::copy_from_slice(&record.key))?;
                             recovered_keys += 1;
+                        }
+                        WalRecordType::Batch => {
+                            // Batch records are expanded into individual
+                            // Put/Delete records during WAL replay, so this
+                            // arm should not be reached. Skip if it is.
                         }
                     }
                 }
@@ -271,16 +285,21 @@ impl LsmEngine {
         let _guard = self.write_mutex.lock();
         self.maybe_freeze_memtable()?;
 
-        // Write all batch entries to WAL first
+        // Write all batch entries to WAL as a single atomic record
         {
             let mut wal_guard = self.wal_writer.lock();
             if let Some(ref mut w) = *wal_guard {
-                for entry in batch.iter() {
-                    match entry.value_type {
-                        ValueType::Value => w.log_put(&entry.key, &entry.value)?,
-                        ValueType::Deletion => w.log_delete(&entry.key)?,
-                    }
-                }
+                let entries: Vec<(WalRecordType, &[u8], &[u8])> = batch
+                    .iter()
+                    .map(|entry| {
+                        let rt = match entry.value_type {
+                            ValueType::Value => WalRecordType::Put,
+                            ValueType::Deletion => WalRecordType::Delete,
+                        };
+                        (rt, entry.key.as_ref(), entry.value.as_ref())
+                    })
+                    .collect();
+                w.log_batch(&entries)?;
             }
         }
 
@@ -695,6 +714,9 @@ impl LsmEngine {
         edit.add_file(0, sst_info);
         edit.set_last_sequence(self.versions.last_sequence());
         edit.set_next_file_number(self.versions.next_file_number());
+        // Record the current WAL number so recovery can skip already-flushed WALs
+        let current_wal = self.wal_file_number.load(Ordering::Relaxed);
+        edit.log_number = Some(current_wal);
         self.versions.apply_edit(&edit)?;
 
         imm.mark_flushed();

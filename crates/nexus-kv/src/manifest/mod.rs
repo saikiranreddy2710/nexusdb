@@ -500,6 +500,8 @@ pub struct VersionSet {
     config: LsmConfig,
     /// Manifest file log number.
     manifest_number: AtomicU64,
+    /// WAL log number: WALs with numbers <= this have been flushed to SSTables.
+    log_number: AtomicU64,
     /// Manifest writer for persistent edits (None in memory-only mode).
     manifest_writer: Mutex<Option<ManifestWriter>>,
 }
@@ -514,6 +516,7 @@ impl VersionSet {
             last_sequence: AtomicU64::new(0),
             config,
             manifest_number: AtomicU64::new(0),
+            log_number: AtomicU64::new(0),
             manifest_writer: Mutex::new(None),
         }
     }
@@ -530,6 +533,7 @@ impl VersionSet {
         let mut version = Version::new(&config);
         let mut last_seq = 0u64;
         let mut next_file = 1u64;
+        let mut log_number = 0u64;
 
         for edit in &edits {
             version = version.apply(edit);
@@ -538,6 +542,9 @@ impl VersionSet {
             }
             if let Some(n) = edit.next_file_number {
                 next_file = next_file.max(n);
+            }
+            if let Some(n) = edit.log_number {
+                log_number = log_number.max(n);
             }
         }
 
@@ -574,6 +581,7 @@ impl VersionSet {
             last_sequence: AtomicU64::new(last_seq),
             config,
             manifest_number: AtomicU64::new(0),
+            log_number: AtomicU64::new(log_number),
             manifest_writer: Mutex::new(Some(writer)),
         })
     }
@@ -620,6 +628,9 @@ impl VersionSet {
         if let Some(num) = edit.next_file_number {
             self.next_file_number.store(num, Ordering::Release);
         }
+        if let Some(num) = edit.log_number {
+            self.log_number.store(num, Ordering::Release);
+        }
 
         // Install the new version
         *self.current.write() = new_version.clone();
@@ -645,6 +656,11 @@ impl VersionSet {
     /// Get the next file number (without allocating).
     pub fn next_file_number(&self) -> u64 {
         self.next_file_number.load(Ordering::Relaxed)
+    }
+
+    /// Get the WAL log number. WALs with numbers <= this have been flushed.
+    pub fn log_number(&self) -> u64 {
+        self.log_number.load(Ordering::Acquire)
     }
 
     /// Get the configuration.

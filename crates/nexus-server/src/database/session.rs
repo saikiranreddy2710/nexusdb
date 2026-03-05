@@ -633,6 +633,8 @@ impl Session {
             }
             Statement::UseDatabase(name) => {
                 self.set_current_database(name);
+                self.plan_cache.clear();
+                self.result_cache.clear();
                 Ok(StatementResult::transaction("USE"))
             }
 
@@ -1108,7 +1110,7 @@ impl Session {
     ) -> DatabaseResult<StatementResult> {
         // ── Result cache lookup (only outside transactions) ─────
         let cache_key = if !self.in_transaction() {
-            let key = ResultCacheKey::from_sql(sql);
+            let key = ResultCacheKey::new(sql, &[&self.current_database]);
             if let Some(cached) = self.result_cache.get(&key) {
                 // Cache hit - return the cached result directly
                 return Ok(StatementResult::Query((*cached).clone()));

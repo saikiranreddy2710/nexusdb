@@ -769,8 +769,10 @@ impl SageTree {
         count
     }
 
-    /// Clears all entries from the tree.
+    /// Clears all entries from the tree, freeing all pager pages.
     pub fn clear(&self) {
+        // Free all pages from the pager before resetting tree state
+        let _ = self.pager.clear();
         {
             let mut root = self.root.write().unwrap();
             *root = None;
@@ -779,6 +781,10 @@ impl SageTree {
         {
             let mut stats = self.stats.write().unwrap();
             *stats = TreeStats::default();
+        }
+        {
+            let mut bloom = self.bloom_filter.write().unwrap();
+            bloom.clear();
         }
     }
 }

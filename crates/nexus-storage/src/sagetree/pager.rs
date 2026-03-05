@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::RwLock;
 
 use nexus_common::types::PageId;
 
@@ -78,27 +77,33 @@ pub trait Pager: Send + Sync + std::fmt::Debug {
 
     /// Flush all dirty data to disk (no-op for memory pager).
     fn flush(&self) -> SageTreeResult<()>;
+
+    /// Clear all pages, releasing resources. Resets the pager to an empty state.
+    fn clear(&self) -> SageTreeResult<()>;
 }
 
 // ── MemoryPager ─────────────────────────────────────────────────────────────
 
 /// In-memory pager using HashMaps. No disk I/O, no persistence.
+///
+/// Uses `parking_lot::RwLock` instead of `std::sync::RwLock` to avoid
+/// lock poisoning and improve performance under contention.
 #[derive(Debug)]
 pub struct MemoryPager {
-    leaves: RwLock<HashMap<PageId, DeltaNode>>,
-    internals: RwLock<HashMap<PageId, InternalNode>>,
+    leaves: parking_lot::RwLock<HashMap<PageId, DeltaNode>>,
+    internals: parking_lot::RwLock<HashMap<PageId, InternalNode>>,
     next_page: std::sync::atomic::AtomicU64,
-    free_pages: RwLock<Vec<PageId>>,
+    free_pages: parking_lot::RwLock<Vec<PageId>>,
 }
 
 impl MemoryPager {
     /// Create a new empty memory pager.
     pub fn new() -> Self {
         Self {
-            leaves: RwLock::new(HashMap::new()),
-            internals: RwLock::new(HashMap::new()),
+            leaves: parking_lot::RwLock::new(HashMap::new()),
+            internals: parking_lot::RwLock::new(HashMap::new()),
             next_page: std::sync::atomic::AtomicU64::new(1),
-            free_pages: RwLock::new(Vec::new()),
+            free_pages: parking_lot::RwLock::new(Vec::new()),
         }
     }
 }
@@ -111,7 +116,7 @@ impl Default for MemoryPager {
 
 impl Pager for MemoryPager {
     fn get_leaf(&self, page_id: PageId) -> SageTreeResult<DeltaNode> {
-        let leaves = self.leaves.read().unwrap();
+        let leaves = self.leaves.read();
         leaves
             .get(&page_id)
             .cloned()
@@ -119,19 +124,19 @@ impl Pager for MemoryPager {
     }
 
     fn put_leaf(&self, page_id: PageId, node: &DeltaNode) -> SageTreeResult<()> {
-        let mut leaves = self.leaves.write().unwrap();
+        let mut leaves = self.leaves.write();
         leaves.insert(page_id, node.clone());
         Ok(())
     }
 
     fn remove_leaf(&self, page_id: PageId) -> SageTreeResult<()> {
-        let mut leaves = self.leaves.write().unwrap();
+        let mut leaves = self.leaves.write();
         leaves.remove(&page_id);
         Ok(())
     }
 
     fn get_internal(&self, page_id: PageId) -> SageTreeResult<InternalNode> {
-        let internals = self.internals.read().unwrap();
+        let internals = self.internals.read();
         internals
             .get(&page_id)
             .cloned()
@@ -139,23 +144,23 @@ impl Pager for MemoryPager {
     }
 
     fn put_internal(&self, page_id: PageId, node: &InternalNode) -> SageTreeResult<()> {
-        let mut internals = self.internals.write().unwrap();
+        let mut internals = self.internals.write();
         internals.insert(page_id, node.clone());
         Ok(())
     }
 
     fn remove_internal(&self, page_id: PageId) -> SageTreeResult<()> {
-        let mut internals = self.internals.write().unwrap();
+        let mut internals = self.internals.write();
         internals.remove(&page_id);
         Ok(())
     }
 
     fn allocate_page(&self) -> PageId {
-        if let Ok(mut free) = self.free_pages.write() {
-            if let Some(page) = free.pop() {
-                return page;
-            }
+        let mut free = self.free_pages.write();
+        if let Some(page) = free.pop() {
+            return page;
         }
+        drop(free);
         PageId::new(
             self.next_page
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
@@ -163,13 +168,20 @@ impl Pager for MemoryPager {
     }
 
     fn free_page(&self, page_id: PageId) {
-        if let Ok(mut free) = self.free_pages.write() {
-            free.push(page_id);
-        }
+        let mut free = self.free_pages.write();
+        free.push(page_id);
     }
 
     fn flush(&self) -> SageTreeResult<()> {
         Ok(()) // No-op for memory
+    }
+
+    fn clear(&self) -> SageTreeResult<()> {
+        self.leaves.write().clear();
+        self.internals.write().clear();
+        self.free_pages.write().clear();
+        self.next_page.store(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -189,12 +201,12 @@ pub struct FilePager {
     /// File handle (protected by Mutex for positioned writes).
     file: std::sync::Mutex<File>,
     /// In-memory cache for leaf nodes.
-    leaf_cache: RwLock<HashMap<PageId, DeltaNode>>,
+    leaf_cache: std::sync::RwLock<HashMap<PageId, DeltaNode>>,
     /// In-memory cache for internal nodes.
-    internal_cache: RwLock<HashMap<PageId, InternalNode>>,
+    internal_cache: std::sync::RwLock<HashMap<PageId, InternalNode>>,
     /// Page allocator state.
     next_page: std::sync::atomic::AtomicU64,
-    free_pages: RwLock<Vec<PageId>>,
+    free_pages: std::sync::RwLock<Vec<PageId>>,
 }
 
 impl FilePager {
@@ -213,10 +225,10 @@ impl FilePager {
         let mut pager = Self {
             path,
             file: std::sync::Mutex::new(file),
-            leaf_cache: RwLock::new(HashMap::new()),
-            internal_cache: RwLock::new(HashMap::new()),
+            leaf_cache: std::sync::RwLock::new(HashMap::new()),
+            internal_cache: std::sync::RwLock::new(HashMap::new()),
             next_page: std::sync::atomic::AtomicU64::new(1),
-            free_pages: RwLock::new(Vec::new()),
+            free_pages: std::sync::RwLock::new(Vec::new()),
         };
 
         // Load existing pages from the file into cache
@@ -439,6 +451,18 @@ impl Pager for FilePager {
     fn flush(&self) -> SageTreeResult<()> {
         let mut file = self.file.lock().unwrap();
         file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn clear(&self) -> SageTreeResult<()> {
+        self.leaf_cache.write().unwrap().clear();
+        self.internal_cache.write().unwrap().clear();
+        self.free_pages.write().unwrap().clear();
+        self.next_page.store(1, std::sync::atomic::Ordering::SeqCst);
+        // Truncate the data file
+        let mut file = self.file.lock().unwrap();
+        file.set_len(0)?;
         file.sync_all()?;
         Ok(())
     }

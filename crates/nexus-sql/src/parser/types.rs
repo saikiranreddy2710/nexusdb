@@ -182,6 +182,11 @@ impl DataType {
                             ))
                         })?
                     };
+                    if dim == 0 {
+                        return Err(ParseError::InvalidLiteral(
+                            "VECTOR dimension must be greater than 0".to_string(),
+                        ));
+                    }
                     Ok(DataType::Vector(dim))
                 } else {
                     Err(ParseError::Unsupported(format!(

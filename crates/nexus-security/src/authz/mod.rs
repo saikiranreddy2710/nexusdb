@@ -135,15 +135,17 @@ impl Authorizer {
     }
 
     /// Define a new role.
-    pub fn create_role(&self, role: Role) {
+    ///
+    /// Returns an error if the role name collides with a built-in role.
+    pub fn create_role(&self, role: Role) -> Result<(), String> {
         let mut roles = self.roles.write();
         if let Some(existing) = roles.get(&role.name) {
             if existing.builtin {
-                tracing::warn!("cannot overwrite built-in role: {}", role.name);
-                return;
+                return Err(format!("cannot overwrite built-in role: {}", role.name));
             }
         }
         roles.insert(role.name.clone(), role);
+        Ok(())
     }
 
     /// Drop a role.
@@ -162,24 +164,54 @@ impl Authorizer {
     }
 
     /// Grant a permission to a role.
-    pub fn grant(&self, role_name: &str, perm: Permission) -> bool {
+    ///
+    /// Only a superuser is allowed to grant permissions. Returns an error
+    /// if the caller is not a superuser, or `Ok(false)` if the role does
+    /// not exist.
+    pub fn grant(
+        &self,
+        role_name: &str,
+        perm: Permission,
+        caller: &Identity,
+    ) -> Result<bool, String> {
+        if !caller.is_superuser() {
+            return Err(format!(
+                "user '{}' is not authorized to grant permissions",
+                caller.username
+            ));
+        }
         let mut roles = self.roles.write();
         if let Some(role) = roles.get_mut(role_name) {
             role.permissions.insert(perm);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
     /// Revoke a permission from a role.
-    pub fn revoke(&self, role_name: &str, perm: &Permission) -> bool {
+    ///
+    /// Only a superuser is allowed to revoke permissions. Returns an error
+    /// if the caller is not a superuser, or `Ok(false)` if the role does
+    /// not exist.
+    pub fn revoke(
+        &self,
+        role_name: &str,
+        perm: &Permission,
+        caller: &Identity,
+    ) -> Result<bool, String> {
+        if !caller.is_superuser() {
+            return Err(format!(
+                "user '{}' is not authorized to revoke permissions",
+                caller.username
+            ));
+        }
         let mut roles = self.roles.write();
         if let Some(role) = roles.get_mut(role_name) {
             role.permissions.remove(perm);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -351,6 +383,10 @@ mod tests {
         }
     }
 
+    fn superuser_caller() -> Identity {
+        Identity::system()
+    }
+
     #[test]
     fn test_superuser_always_allowed() {
         let authz = Authorizer::new(true);
@@ -362,15 +398,19 @@ mod tests {
     #[test]
     fn test_grant_table_select() {
         let authz = Authorizer::new(true);
-        authz.create_role(Role::new("analyst"));
-        authz.grant(
-            "analyst",
-            Permission::Table {
-                database: "analytics".into(),
-                table: "events".into(),
-                privilege: Privilege::Select,
-            },
-        );
+        let su = superuser_caller();
+        authz.create_role(Role::new("analyst")).unwrap();
+        authz
+            .grant(
+                "analyst",
+                Permission::Table {
+                    database: "analytics".into(),
+                    table: "events".into(),
+                    privilege: Privilege::Select,
+                },
+                &su,
+            )
+            .unwrap();
 
         let id = analyst_identity();
         assert!(authz
@@ -387,14 +427,18 @@ mod tests {
     #[test]
     fn test_database_wide_grant() {
         let authz = Authorizer::new(true);
-        authz.create_role(Role::new("analyst"));
-        authz.grant(
-            "analyst",
-            Permission::Database {
-                database: "analytics".into(),
-                privilege: Privilege::Select,
-            },
-        );
+        let su = superuser_caller();
+        authz.create_role(Role::new("analyst")).unwrap();
+        authz
+            .grant(
+                "analyst",
+                Permission::Database {
+                    database: "analytics".into(),
+                    privilege: Privilege::Select,
+                },
+                &su,
+            )
+            .unwrap();
 
         let id = analyst_identity();
         assert!(authz
@@ -407,23 +451,27 @@ mod tests {
         let authz = Authorizer::new(true);
 
         // base_reader can SELECT on public.*
-        authz.create_role(
-            Role::new("base_reader").with_permission(Permission::Database {
-                database: "public".into(),
-                privilege: Privilege::Select,
-            }),
-        );
+        authz
+            .create_role(
+                Role::new("base_reader").with_permission(Permission::Database {
+                    database: "public".into(),
+                    privilege: Privilege::Select,
+                }),
+            )
+            .unwrap();
 
         // analyst inherits base_reader and can also INSERT on analytics.events
-        authz.create_role(
-            Role::new("analyst")
-                .with_inherit("base_reader")
-                .with_permission(Permission::Table {
-                    database: "analytics".into(),
-                    table: "events".into(),
-                    privilege: Privilege::Insert,
-                }),
-        );
+        authz
+            .create_role(
+                Role::new("analyst")
+                    .with_inherit("base_reader")
+                    .with_permission(Permission::Table {
+                        database: "analytics".into(),
+                        table: "events".into(),
+                        privilege: Privilege::Insert,
+                    }),
+            )
+            .unwrap();
 
         let id = analyst_identity();
 
@@ -450,20 +498,21 @@ mod tests {
     #[test]
     fn test_revoke() {
         let authz = Authorizer::new(true);
+        let su = superuser_caller();
         let perm = Permission::Table {
             database: "db".into(),
             table: "t".into(),
             privilege: Privilege::Select,
         };
-        authz.create_role(Role::new("analyst"));
-        authz.grant("analyst", perm.clone());
+        authz.create_role(Role::new("analyst")).unwrap();
+        authz.grant("analyst", perm.clone(), &su).unwrap();
 
         let id = analyst_identity();
         assert!(authz
             .check_table(&id, "db", "t", Privilege::Select)
             .is_allowed());
 
-        authz.revoke("analyst", &perm);
+        authz.revoke("analyst", &perm, &su).unwrap();
         assert!(!authz
             .check_table(&id, "db", "t", Privilege::Select)
             .is_allowed());
@@ -484,9 +533,19 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_role_cannot_be_overwritten() {
+        let authz = Authorizer::new(true);
+
+        // Attempting to overwrite the built-in superuser role should return an error
+        let result = authz.create_role(Role::new("superuser"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("built-in"));
+    }
+
+    #[test]
     fn test_custom_role_can_be_dropped() {
         let authz = Authorizer::new(true);
-        authz.create_role(Role::new("temp_role"));
+        authz.create_role(Role::new("temp_role")).unwrap();
         assert!(authz.drop_role("temp_role"));
     }
 
@@ -499,5 +558,49 @@ mod tests {
 
         let limited = analyst_identity();
         assert!(!authz.check_global(&limited, Privilege::Create).is_allowed());
+    }
+
+    #[test]
+    fn test_grant_requires_superuser() {
+        let authz = Authorizer::new(true);
+        authz.create_role(Role::new("analyst")).unwrap();
+
+        let non_su = analyst_identity();
+        let result = authz.grant(
+            "analyst",
+            Permission::Global {
+                privilege: Privilege::All,
+            },
+            &non_su,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not authorized"));
+    }
+
+    #[test]
+    fn test_revoke_requires_superuser() {
+        let authz = Authorizer::new(true);
+        let su = superuser_caller();
+        authz.create_role(Role::new("analyst")).unwrap();
+        authz
+            .grant(
+                "analyst",
+                Permission::Global {
+                    privilege: Privilege::Select,
+                },
+                &su,
+            )
+            .unwrap();
+
+        let non_su = analyst_identity();
+        let result = authz.revoke(
+            "analyst",
+            &Permission::Global {
+                privilege: Privilege::Select,
+            },
+            &non_su,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not authorized"));
     }
 }

@@ -106,12 +106,19 @@ struct UserRecord {
     failed_attempts: u32,
     /// Whether the account is locked.
     locked: bool,
+    /// Epoch timestamp until which the account is locked.
+    /// `None` means not time-locked; `Some(t)` means locked until epoch `t`.
+    locked_until: Option<u64>,
     /// API key (if assigned).
     api_key: Option<String>,
 }
 
 /// Maximum failed attempts before account lockout.
 const MAX_FAILED_ATTEMPTS: u32 = 5;
+
+/// Duration (in seconds) for which an account remains locked after exceeding
+/// the maximum number of failed attempts.
+const LOCKOUT_DURATION_SECS: u64 = 300;
 
 /// PBKDF2 iteration count. Higher = more resistant to brute-force but slower.
 /// OWASP (2023) recommends >= 600,000 for PBKDF2-HMAC-SHA256.
@@ -205,6 +212,7 @@ impl Authenticator {
                 roles,
                 failed_attempts: 0,
                 locked: false,
+                locked_until: None,
                 api_key: None,
             },
         );
@@ -290,8 +298,24 @@ impl Authenticator {
             .get_mut(username)
             .ok_or(AuthError::InvalidCredentials)?;
 
+        // Check lockout: if locked, see if the timeout has expired.
         if user.locked {
-            return Err(AuthError::AccountLocked(username.to_string()));
+            if let Some(until) = user.locked_until {
+                if now_epoch() >= until {
+                    // Lockout period expired — auto-unlock
+                    user.locked = false;
+                    user.locked_until = None;
+                    user.failed_attempts = 0;
+                    tracing::info!(
+                        user = username,
+                        "account auto-unlocked after lockout timeout"
+                    );
+                } else {
+                    return Err(AuthError::AccountLocked(username.to_string()));
+                }
+            } else {
+                return Err(AuthError::AccountLocked(username.to_string()));
+            }
         }
 
         let hash = pbkdf2_hmac_sha256(password.as_bytes(), &user.salt, self.pbkdf2_iterations);
@@ -301,9 +325,11 @@ impl Authenticator {
             user.failed_attempts += 1;
             if user.failed_attempts >= MAX_FAILED_ATTEMPTS {
                 user.locked = true;
+                user.locked_until = Some(now_epoch() + LOCKOUT_DURATION_SECS);
                 tracing::warn!(
                     user = username,
                     attempts = user.failed_attempts,
+                    lockout_secs = LOCKOUT_DURATION_SECS,
                     "account locked after too many failed attempts"
                 );
             }
@@ -332,8 +358,13 @@ impl Authenticator {
             .get(username.as_str())
             .ok_or(AuthError::InvalidCredentials)?;
 
-        // Double-check the key still matches (guard against stale index)
-        if user.api_key.as_deref() != Some(key) {
+        // Double-check the key still matches (guard against stale index).
+        // Use constant-time comparison to prevent timing side-channel attacks.
+        let key_matches = match user.api_key.as_deref() {
+            Some(stored) => constant_time_eq(stored.as_bytes(), key.as_bytes()),
+            None => false,
+        };
+        if !key_matches {
             return Err(AuthError::InvalidCredentials);
         }
 
@@ -445,6 +476,7 @@ impl Authenticator {
             .get_mut(username)
             .ok_or_else(|| AuthError::UserNotFound(username.to_string()))?;
         user.locked = false;
+        user.locked_until = None;
         user.failed_attempts = 0;
         tracing::info!(user = username, "account unlocked");
         Ok(())

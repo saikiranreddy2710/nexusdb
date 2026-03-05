@@ -95,9 +95,14 @@ impl Value {
         let values: Result<Vec<f32>, String> = s
             .split(',')
             .map(|v| {
-                v.trim()
+                let val = v
+                    .trim()
                     .parse::<f32>()
-                    .map_err(|e| format!("invalid vector element '{}': {}", v.trim(), e))
+                    .map_err(|e| format!("invalid vector element '{}': {}", v.trim(), e))?;
+                if val.is_nan() || val.is_infinite() {
+                    return Err(format!("vector element must be finite, got '{}'", v.trim()));
+                }
+                Ok(val)
             })
             .collect();
 
@@ -331,7 +336,7 @@ impl PartialEq for Value {
                 a.len() == b.len()
                     && a.iter()
                         .zip(b.iter())
-                        .all(|(x, y)| (x - y).abs() < f32::EPSILON)
+                        .all(|(x, y)| x.to_bits() == y.to_bits())
             }
             // Cross-type numeric comparisons
             (a, b) => {

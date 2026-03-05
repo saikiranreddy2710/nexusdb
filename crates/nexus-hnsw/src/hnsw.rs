@@ -551,11 +551,16 @@ impl HnswIndex {
                     if !inner.id_to_index.contains_key(&inner.nodes[nb_b].id) {
                         continue;
                     }
-                    // Add connection if not already present and under capacity
+                    // Add bidirectional connection if not already present and under capacity
                     if !inner.nodes[nb_a].neighbors[lc].contains(&nb_b)
                         && inner.nodes[nb_a].neighbors[lc].len() < max_conn
                     {
                         inner.nodes[nb_a].neighbors[lc].push(nb_b);
+                    }
+                    if !inner.nodes[nb_b].neighbors[lc].contains(&nb_a)
+                        && inner.nodes[nb_b].neighbors[lc].len() < max_conn
+                    {
+                        inner.nodes[nb_b].neighbors[lc].push(nb_a);
                     }
                 }
             }
@@ -679,19 +684,82 @@ impl HnswIndex {
             })
             .collect();
 
+        let inner = HnswInner {
+            nodes,
+            id_to_index: data.id_to_index,
+            entry_point: data.entry_point,
+            max_level: data.max_level,
+            rng,
+        };
+
+        // Validate deserialized data
+        Self::validate_inner(&data.config, &inner)?;
+
         Ok(Self {
             config: data.config,
-            inner: RwLock::new(HnswInner {
-                nodes,
-                id_to_index: data.id_to_index,
-                entry_point: data.entry_point,
-                max_level: data.max_level,
-                rng,
-            }),
+            inner: RwLock::new(inner),
         })
     }
 
     // ── Private helpers ─────────────────────────────────────────────
+
+    /// Validates the internal state after deserialization.
+    fn validate_inner(config: &HnswConfig, inner: &HnswInner) -> HnswResult<()> {
+        let num_nodes = inner.nodes.len();
+
+        // Validate entry point
+        if let Some(ep) = inner.entry_point {
+            if ep >= num_nodes {
+                return Err(HnswError::SerializationError(format!(
+                    "entry_point index {} out of bounds (num_nodes={})",
+                    ep, num_nodes
+                )));
+            }
+        }
+
+        // Validate each node
+        for (i, node) in inner.nodes.iter().enumerate() {
+            // Check vector dimensions match config
+            if node.vector.len() != config.dimensions as usize {
+                return Err(HnswError::SerializationError(format!(
+                    "node {} has {} dimensions, expected {}",
+                    i,
+                    node.vector.len(),
+                    config.dimensions
+                )));
+            }
+
+            // Check all neighbor indices are in bounds
+            for (layer, neighbors) in node.neighbors.iter().enumerate() {
+                for &nb_idx in neighbors {
+                    if nb_idx >= num_nodes {
+                        return Err(HnswError::SerializationError(format!(
+                            "node {} layer {} has neighbor index {} out of bounds (num_nodes={})",
+                            i, layer, nb_idx, num_nodes
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Validate id_to_index consistency
+        for (&id, &idx) in &inner.id_to_index {
+            if idx >= num_nodes {
+                return Err(HnswError::SerializationError(format!(
+                    "id_to_index maps id {} to index {} out of bounds (num_nodes={})",
+                    id, idx, num_nodes
+                )));
+            }
+            if inner.nodes[idx].id != id {
+                return Err(HnswError::SerializationError(format!(
+                    "id_to_index maps id {} to index {}, but node at that index has id {}",
+                    id, idx, inner.nodes[idx].id
+                )));
+            }
+        }
+
+        Ok(())
+    }
 
     /// Generates a random level for a new node using the exponential distribution.
     fn random_level(&self, rng: &mut rand::rngs::StdRng) -> usize {
