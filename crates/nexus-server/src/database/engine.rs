@@ -1041,6 +1041,62 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn test_security_alter_table_authorization_denied() {
+        let config = DatabaseConfig {
+            auth_enabled: true,
+            authz_enabled: true,
+            pbkdf2_iterations: 1_000,
+            ..DatabaseConfig::in_memory()
+        };
+        let db = Arc::new(Database::open(config).unwrap());
+
+        // Create a table as system user first
+        let admin_sid = db.create_session(DEFAULT_DATABASE_NAME);
+        {
+            let s = db.get_session(admin_sid).unwrap();
+            let mut session = s.write().unwrap();
+            session
+                .execute("CREATE TABLE alter_test (id INT PRIMARY KEY, name TEXT)")
+                .unwrap();
+        }
+        db.close_session(admin_sid);
+
+        // Create a user with only Select privilege
+        let sel_pw = test_password("selector");
+        db.authenticator()
+            .create_user("selector", &sel_pw, vec!["selector".into()])
+            .unwrap();
+        db.authorizer()
+            .create_role(nexus_security::Role::new("selector").with_permission(
+                nexus_security::Permission::Table {
+                    database: DEFAULT_DATABASE_NAME.to_string(),
+                    table: "alter_test".to_string(),
+                    privilege: nexus_security::Privilege::Select,
+                },
+            ))
+            .unwrap();
+
+        // Authenticate as the select-only user
+        let cred = make_test_credential("selector", "selector");
+        let identity = db.authenticator().authenticate(&cred).unwrap();
+        let sid = db.create_authenticated_session(DEFAULT_DATABASE_NAME, identity);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        // SELECT should work
+        let result = session.execute("SELECT * FROM alter_test");
+        assert!(result.is_ok(), "SELECT should succeed for selector user");
+
+        // ALTER TABLE should be denied (requires Alter privilege)
+        let result = session.execute("ALTER TABLE alter_test ADD COLUMN age INT");
+        assert!(
+            matches!(result, Err(DatabaseError::AuthorizationError(_))),
+            "ALTER TABLE should be denied for selector user, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_vector_create_table_with_vector_column() {
         let db = Arc::new(Database::open_memory().unwrap());
         let sid = db.create_session(DEFAULT_DATABASE_NAME);
@@ -1157,5 +1213,107 @@ mod tests {
         // Should error without IF EXISTS
         let result = session.execute("DROP INDEX nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vector_insert_populates_hnsw_index() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        // Create table with VECTOR(3) column and INT primary key
+        session
+            .execute("CREATE TABLE vec_test (id INT PRIMARY KEY, embedding VECTOR(3))")
+            .unwrap();
+
+        // Create HNSW index on the vector column
+        session
+            .execute("CREATE INDEX idx_vec ON vec_test (embedding)")
+            .unwrap();
+
+        // Insert several rows with vector data
+        session
+            .execute("INSERT INTO vec_test VALUES (1, '[1.0, 0.0, 0.0]')")
+            .unwrap();
+        session
+            .execute("INSERT INTO vec_test VALUES (2, '[0.0, 1.0, 0.0]')")
+            .unwrap();
+        session
+            .execute("INSERT INTO vec_test VALUES (3, '[0.0, 0.0, 1.0]')")
+            .unwrap();
+        session
+            .execute("INSERT INTO vec_test VALUES (4, '[0.5, 0.5, 0.0]')")
+            .unwrap();
+
+        // Verify the HNSW index was populated by searching directly
+        let vim = db.vector_index_manager();
+        let key =
+            crate::database::VectorIndexKey::new(DEFAULT_DATABASE_NAME, "vec_test", "idx_vec");
+
+        // Search for vector closest to [1.0, 0.0, 0.0] — should return id=1
+        let results = vim.search(&key, &[0.9, 0.1, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, 1, "closest vector should be id=1 ([1,0,0])");
+
+        // Search for vector closest to [0.0, 0.0, 1.0] — should return id=3
+        let results = vim.search(&key, &[0.0, 0.0, 0.95], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 3, "closest vector should be id=3 ([0,0,1])");
+
+        // Search for all 4 vectors
+        let results = vim.search(&key, &[0.5, 0.5, 0.5], 4).unwrap();
+        assert_eq!(results.len(), 4, "should find all 4 inserted vectors");
+
+        // Verify each inserted id appears in the results
+        let mut ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_vector_dimension_mismatch_on_insert() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        // Create table with VECTOR(3) column
+        session
+            .execute("CREATE TABLE dim_test (id INT PRIMARY KEY, vec VECTOR(3))")
+            .unwrap();
+
+        // Insert a valid 3D vector should succeed
+        session
+            .execute("INSERT INTO dim_test VALUES (1, '[1.0, 2.0, 3.0]')")
+            .unwrap();
+
+        // Insert a 2D vector into a 3D column should fail with dimension mismatch
+        let result = session.execute("INSERT INTO dim_test VALUES (2, '[1.0, 2.0]')");
+        assert!(result.is_err(), "2D vector in 3D column should fail");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("dimension mismatch"),
+            "error should mention dimension mismatch, got: {}",
+            err_msg
+        );
+
+        // Insert a 4D vector into a 3D column should also fail
+        let result = session.execute("INSERT INTO dim_test VALUES (3, '[1.0, 2.0, 3.0, 4.0]')");
+        assert!(result.is_err(), "4D vector in 3D column should fail");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("dimension mismatch"),
+            "error should mention dimension mismatch, got: {}",
+            err_msg
+        );
+
+        // Verify only the valid row was inserted
+        let result = session.execute("SELECT * FROM dim_test").unwrap();
+        if let StatementResult::Query(query) = result {
+            assert_eq!(query.total_rows, 1, "only the valid 3D vector should exist");
+        } else {
+            panic!("expected Query result");
+        }
     }
 }

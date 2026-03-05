@@ -579,4 +579,68 @@ mod tests {
         assert_eq!(records[0].key, big_key);
         assert_eq!(records[0].value, big_value);
     }
+
+    #[test]
+    fn test_wal_batch_atomic_write_and_replay() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Write a batch with multiple entries
+        {
+            let mut w = WalWriter::create(dir, 1, false).unwrap();
+
+            // Also write a non-batch record before to ensure interleaving works
+            w.log_put(b"before_batch", b"value0").unwrap();
+
+            let entries: Vec<(WalRecordType, &[u8], &[u8])> = vec![
+                (WalRecordType::Put, b"key1", b"val1"),
+                (WalRecordType::Put, b"key2", b"val2"),
+                (WalRecordType::Delete, b"key3", b""),
+                (WalRecordType::Put, b"key4", b"val4"),
+            ];
+            w.log_batch(&entries).unwrap();
+
+            // Write another record after the batch
+            w.log_delete(b"after_batch").unwrap();
+            w.close().unwrap();
+        }
+
+        // Replay and verify all entries are recovered
+        let reader = WalReader::open(wal_path(dir, 1));
+        let records = reader.replay().unwrap();
+
+        // Should have: 1 (before) + 4 (batch expanded) + 1 (after) = 6 records
+        assert_eq!(
+            records.len(),
+            6,
+            "expected 6 records total, got {}",
+            records.len()
+        );
+
+        // Record 0: the pre-batch Put
+        assert_eq!(records[0].record_type, WalRecordType::Put);
+        assert_eq!(records[0].key, b"before_batch");
+        assert_eq!(records[0].value, b"value0");
+
+        // Records 1-4: the batch entries (expanded)
+        assert_eq!(records[1].record_type, WalRecordType::Put);
+        assert_eq!(records[1].key, b"key1");
+        assert_eq!(records[1].value, b"val1");
+
+        assert_eq!(records[2].record_type, WalRecordType::Put);
+        assert_eq!(records[2].key, b"key2");
+        assert_eq!(records[2].value, b"val2");
+
+        assert_eq!(records[3].record_type, WalRecordType::Delete);
+        assert_eq!(records[3].key, b"key3");
+        assert!(records[3].value.is_empty());
+
+        assert_eq!(records[4].record_type, WalRecordType::Put);
+        assert_eq!(records[4].key, b"key4");
+        assert_eq!(records[4].value, b"val4");
+
+        // Record 5: the post-batch Delete
+        assert_eq!(records[5].record_type, WalRecordType::Delete);
+        assert_eq!(records[5].key, b"after_batch");
+    }
 }

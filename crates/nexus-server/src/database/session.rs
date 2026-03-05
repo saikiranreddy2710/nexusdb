@@ -951,6 +951,17 @@ impl Session {
                     let col_idx = column_order[i];
                     let val = self.eval_literal(expr)?;
 
+                    // Auto-coerce string values to vectors for VECTOR columns
+                    let val = if matches!(
+                        &schema.fields()[col_idx].data_type,
+                        nexus_sql::parser::DataType::Vector(_)
+                    ) {
+                        val.cast(&schema.fields()[col_idx].data_type)
+                            .map_err(|e| DatabaseError::ExecutionError(e))?
+                    } else {
+                        val
+                    };
+
                     // Validate vector dimension against the column's declared dimension
                     if let Value::Vector(ref vec_data) = val {
                         if let nexus_sql::parser::DataType::Vector(expected_dim) =

@@ -184,6 +184,11 @@ impl Authenticator {
         self.enforce
     }
 
+    /// Returns the configured PBKDF2 iteration count.
+    pub fn iterations(&self) -> u32 {
+        self.pbkdf2_iterations
+    }
+
     /// Register a new user with a password and roles.
     pub fn create_user(
         &self,
@@ -922,5 +927,69 @@ mod tests {
         assert_eq!(encoded, "deadbeef");
         let decoded = hex::decode(&encoded).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_pbkdf2_default_600k_iterations() {
+        // `Authenticator::new(true)` should use DEFAULT_PBKDF2_ITERATIONS (600,000).
+        let auth = Authenticator::new(true);
+        assert_eq!(
+            auth.iterations(),
+            600_000,
+            "default PBKDF2 iteration count must be 600,000 (OWASP 2023)"
+        );
+
+        // Also verify that `new_for_test` uses the reduced count.
+        let test_auth = Authenticator::new_for_test(true);
+        assert_eq!(
+            test_auth.iterations(),
+            TEST_PBKDF2_ITERATIONS,
+            "test authenticator should use reduced iterations"
+        );
+    }
+
+    #[test]
+    fn test_account_lockout_auto_unlock_after_timeout() {
+        let auth = Authenticator::new_for_test(true);
+        let pw = test_pw("lockauto");
+        auth.create_user("lockauto", &pw, vec![]).unwrap();
+
+        let bad_cred = Credential::Password {
+            username: "lockauto".into(),
+            password: test_pw("wrong_guess"),
+        };
+
+        // Fail MAX_FAILED_ATTEMPTS times to lock the account
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            let _ = auth.authenticate(&bad_cred);
+        }
+
+        // Account should be locked now
+        assert!(auth.is_locked("lockauto").unwrap());
+        let good_cred = make_cred("lockauto", "lockauto");
+        assert!(matches!(
+            auth.authenticate(&good_cred),
+            Err(AuthError::AccountLocked(_))
+        ));
+
+        // Simulate lockout timeout by setting locked_until to a time in the past
+        {
+            let mut users = auth.users.write();
+            let user = users.get_mut("lockauto").unwrap();
+            // Set locked_until to 1 second ago (already expired)
+            user.locked_until = Some(now_epoch().saturating_sub(1));
+        }
+
+        // The next authentication attempt should auto-unlock and succeed
+        let result = auth.authenticate(&good_cred);
+        assert!(
+            result.is_ok(),
+            "account should auto-unlock after lockout timeout, got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap().username, "lockauto");
+
+        // Verify the account is no longer locked
+        assert!(!auth.is_locked("lockauto").unwrap());
     }
 }

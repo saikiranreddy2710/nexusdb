@@ -625,4 +625,64 @@ mod tests {
         let p2 = pager.allocate_page();
         assert_eq!(p1, p2);
     }
+
+    #[test]
+    fn test_file_pager_crc32_corruption_detection() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("corrupt.db");
+
+        let pid;
+        // Step 1: Create a FilePager and write a leaf node
+        {
+            let pager = FilePager::open(&path).unwrap();
+            pid = pager.allocate_page();
+            let node = make_leaf(pid, &["alpha", "beta", "gamma"]);
+            pager.put_leaf(pid, &node).unwrap();
+            pager.flush().unwrap();
+        }
+
+        // Verify the page can be read before corruption
+        {
+            let pager = FilePager::open(&path).unwrap();
+            let loaded = pager.get_leaf(pid).unwrap();
+            assert_eq!(loaded.base.len(), 3);
+        }
+
+        // Step 2: Open the raw file and corrupt a byte in the data portion
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+
+            let page_offset = pid.as_u64() * FILE_PAGE_SIZE as u64;
+            // The data starts at ENVELOPE_HEADER (9 bytes) into the page.
+            // Corrupt a byte in the data area (e.g., offset +20 from page start).
+            let corrupt_offset = page_offset + 20;
+            file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+
+            let mut byte = [0u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            // Flip bits to ensure the byte changes
+            byte[0] ^= 0xFF;
+            file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+            file.write_all(&byte).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Step 3: Re-open the FilePager — the corrupted page should be
+        // treated as free (CRC mismatch), so get_leaf should return an error
+        {
+            let pager = FilePager::open(&path).unwrap();
+            let result = pager.get_leaf(pid);
+            assert!(
+                result.is_err(),
+                "corrupted page should not be loadable, but got: {:?}",
+                result.unwrap().base.len()
+            );
+        }
+    }
 }

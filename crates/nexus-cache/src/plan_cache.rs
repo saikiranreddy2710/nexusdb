@@ -325,6 +325,35 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_sql_preserves_string_literal_case() {
+        // String literals inside single quotes must NOT be lowercased,
+        // so different-cased literals produce different cache keys.
+        let upper = normalize_sql("SELECT * FROM t WHERE name = 'Alice'");
+        let lower = normalize_sql("SELECT * FROM t WHERE name = 'alice'");
+        assert_ne!(
+            upper, lower,
+            "normalize_sql must preserve case inside string literals"
+        );
+
+        // Keywords outside quotes ARE lowercased.
+        assert_eq!(
+            normalize_sql("SELECT"),
+            normalize_sql("select"),
+            "keywords outside quotes should be case-insensitive"
+        );
+
+        // Mixed: keywords lowercased, literals preserved.
+        assert_eq!(
+            normalize_sql("SELECT * FROM t WHERE name = 'Alice'"),
+            "select * from t where name = 'Alice'"
+        );
+        assert_eq!(
+            normalize_sql("select * from t where name = 'alice'"),
+            "select * from t where name = 'alice'"
+        );
+    }
+
+    #[test]
     fn test_use_count() {
         let cache: PlanCache<String> = PlanCache::new(PlanCacheConfig::default());
 
