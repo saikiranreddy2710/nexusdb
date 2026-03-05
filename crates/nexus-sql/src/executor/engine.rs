@@ -89,6 +89,72 @@ impl QueryExecutor {
         })
     }
 
+    /// Executes a physical plan and collects per-operator metrics for EXPLAIN ANALYZE.
+    ///
+    /// Returns both the query result and a map of operator ID to stats,
+    /// where operator IDs are assigned in pre-order DFS traversal matching
+    /// the order used by `explain_rich`.
+    pub fn execute_with_metrics(
+        &self,
+        plan: &PhysicalPlan,
+    ) -> Result<(QueryResult, HashMap<usize, super::OperatorStats>), ExecutionError> {
+        let start = Instant::now();
+
+        // Build operator tree
+        let mut root = self.build_operator(&plan.root)?;
+
+        // Collect all batches
+        let mut batches = Vec::new();
+        let mut total_rows = 0;
+
+        while let Some(batch) = root.next_batch()? {
+            total_rows += batch.num_rows();
+            batches.push(batch);
+        }
+
+        let elapsed = start.elapsed();
+        let batches_count = batches.len();
+
+        // Walk the operator tree and collect stats in pre-order DFS
+        let mut op_metrics = HashMap::new();
+        let mut op_id = 0;
+        Self::collect_operator_stats(&*root, &mut op_id, &mut op_metrics);
+
+        let result = QueryResult {
+            schema: root.schema(),
+            batches,
+            total_rows,
+            execution_time_ms: elapsed.as_millis() as u64,
+            metrics: ExecutionMetrics {
+                rows_processed: total_rows,
+                batches_processed: batches_count,
+                execution_time_us: elapsed.as_micros() as u64,
+                ..Default::default()
+            },
+        };
+
+        Ok((result, op_metrics))
+    }
+
+    /// Recursively collects operator stats in pre-order DFS,
+    /// matching the traversal order of `explain_rich_recursive`.
+    fn collect_operator_stats(
+        op: &dyn Operator,
+        op_id: &mut usize,
+        metrics: &mut HashMap<usize, super::OperatorStats>,
+    ) {
+        let current_id = *op_id;
+        *op_id += 1;
+
+        if let Some(s) = op.stats() {
+            metrics.insert(current_id, s);
+        }
+
+        for child in op.children() {
+            Self::collect_operator_stats(child, op_id, metrics);
+        }
+    }
+
     /// Executes and returns a streaming iterator over batches.
     pub fn execute_stream(&self, plan: &PhysicalPlan) -> Result<Box<dyn Operator>, ExecutionError> {
         self.build_operator(&plan.root)
@@ -437,6 +503,10 @@ impl Operator for SetOperationExec {
         self.left.reset();
         self.right.reset();
         self.state = SetOpState::Left;
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.left, &*self.right]
     }
 }
 

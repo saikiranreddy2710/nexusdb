@@ -172,8 +172,12 @@ fn build_statement(stmt: &Statement, ctx: &mut PlanContext) -> PlanResult<Arc<Lo
         Statement::Insert(insert) => build_insert(insert, ctx),
         Statement::Update(update) => build_update(update, ctx),
         Statement::Delete(delete) => build_delete(delete, ctx),
-        Statement::Explain(inner) => build_statement(inner, ctx),
-        Statement::ExplainAnalyze(inner) => build_statement(inner, ctx),
+        Statement::Explain {
+            statement: inner, ..
+        } => build_statement(inner, ctx),
+        Statement::ExplainAnalyze {
+            statement: inner, ..
+        } => build_statement(inner, ctx),
         _ => Err(PlanError::Unsupported(format!(
             "Statement type: {:?}",
             std::mem::discriminant(stmt)

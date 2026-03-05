@@ -7,6 +7,17 @@ use sqlparser::ast as sql_ast;
 
 use super::{ColumnRef, DataType, Expr, JoinType, OrderByExpr, ParseError, ParseResult, TableRef};
 
+/// EXPLAIN format options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExplainFormat {
+    /// Plain text output (default).
+    Text,
+    /// Verbose text output with additional details.
+    Verbose,
+    /// JSON structured output.
+    Json,
+}
+
 /// A parsed SQL statement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Statement {
@@ -35,9 +46,19 @@ pub enum Statement {
     /// ROLLBACK transaction.
     Rollback,
     /// EXPLAIN query.
-    Explain(Box<Statement>),
+    Explain {
+        /// The statement being explained.
+        statement: Box<Statement>,
+        /// Output format.
+        format: ExplainFormat,
+    },
     /// EXPLAIN ANALYZE query.
-    ExplainAnalyze(Box<Statement>),
+    ExplainAnalyze {
+        /// The statement being explained.
+        statement: Box<Statement>,
+        /// Output format.
+        format: ExplainFormat,
+    },
     /// SHOW TABLES statement.
     ShowTables,
     /// SHOW DATABASES statement.
@@ -149,13 +170,32 @@ impl Statement {
             sql_ast::Statement::Commit { .. } => Ok(Statement::Commit),
             sql_ast::Statement::Rollback { .. } => Ok(Statement::Rollback),
             sql_ast::Statement::Explain {
-                statement, analyze, ..
+                statement,
+                analyze,
+                verbose,
+                format,
+                ..
             } => {
                 let inner = Statement::from_sql_ast(*statement)?;
-                if analyze {
-                    Ok(Statement::ExplainAnalyze(Box::new(inner)))
+                let fmt = if verbose {
+                    ExplainFormat::Verbose
                 } else {
-                    Ok(Statement::Explain(Box::new(inner)))
+                    match format {
+                        Some(sql_ast::AnalyzeFormat::JSON) => ExplainFormat::Json,
+                        Some(sql_ast::AnalyzeFormat::TEXT) => ExplainFormat::Text,
+                        _ => ExplainFormat::Text,
+                    }
+                };
+                if analyze {
+                    Ok(Statement::ExplainAnalyze {
+                        statement: Box::new(inner),
+                        format: fmt,
+                    })
+                } else {
+                    Ok(Statement::Explain {
+                        statement: Box::new(inner),
+                        format: fmt,
+                    })
                 }
             }
             sql_ast::Statement::ShowTables { .. } => Ok(Statement::ShowTables),
@@ -177,10 +217,7 @@ impl Statement {
                 ..
             } if names.len() == 1 => {
                 let name = object_name_to_single_ident(&names[0])?;
-                Ok(Statement::DropDatabase {
-                    name,
-                    if_exists,
-                })
+                Ok(Statement::DropDatabase { name, if_exists })
             }
             sql_ast::Statement::Use { db_name } => {
                 Ok(Statement::UseDatabase(db_name.value.clone()))
@@ -213,8 +250,8 @@ impl Statement {
         matches!(
             self,
             Statement::Select(_)
-                | Statement::Explain(_)
-                | Statement::ExplainAnalyze(_)
+                | Statement::Explain { .. }
+                | Statement::ExplainAnalyze { .. }
                 | Statement::ShowTables
                 | Statement::ShowDatabases
                 | Statement::DescribeTable(_)

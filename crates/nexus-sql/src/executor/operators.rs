@@ -5,11 +5,23 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::{evaluate_expr, Accumulator, Column, EvalError, RecordBatch, Row, Value};
 use crate::logical::{Field, JoinType, Schema};
 use crate::parser::DataType;
 use crate::physical::{PhysicalAggregateExpr, PhysicalExpr, PhysicalSortExpr, SeqScanOperator};
+
+/// Per-operator execution statistics for EXPLAIN ANALYZE.
+#[derive(Debug, Default, Clone)]
+pub struct OperatorStats {
+    /// Number of rows produced by this operator.
+    pub rows_produced: usize,
+    /// Total wall-clock time spent in this operator in nanoseconds.
+    pub time_ns: u64,
+    /// Number of times next_batch was called.
+    pub calls: usize,
+}
 
 /// Trait for executable operators.
 pub trait Operator: std::fmt::Debug {
@@ -21,6 +33,16 @@ pub trait Operator: std::fmt::Debug {
 
     /// Resets the operator to its initial state.
     fn reset(&mut self);
+
+    /// Returns per-operator execution statistics, if tracked.
+    fn stats(&self) -> Option<OperatorStats> {
+        None
+    }
+
+    /// Returns references to child operators (for recursive stat collection).
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![]
+    }
 }
 
 /// Sequential scan operator that reads from a data source.
@@ -39,6 +61,8 @@ pub struct SeqScanExec {
     projection: Option<Vec<usize>>,
     /// Filters to apply during scan.
     filters: Vec<PhysicalExpr>,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl SeqScanExec {
@@ -51,6 +75,7 @@ impl SeqScanExec {
             current_batch: 0,
             projection: None,
             filters: Vec::new(),
+            stats: OperatorStats::default(),
         }
     }
 
@@ -87,58 +112,73 @@ impl Operator for SeqScanExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        while self.current_batch < self.data.len() {
-            let batch = &self.data[self.current_batch];
-            self.current_batch += 1;
+        self.stats.calls += 1;
+        let start = Instant::now();
 
-            // Apply filters first (before projection, since filters reference original schema)
-            let filtered_batch = if self.filters.is_empty() {
-                batch.clone()
-            } else {
-                // Get the table schema (before projection) from the batch
-                let batch_schema = batch.schema();
-                let mut mask = Vec::with_capacity(batch.num_rows());
+        let result = (|| {
+            while self.current_batch < self.data.len() {
+                let batch = &self.data[self.current_batch];
+                self.current_batch += 1;
 
-                for row in batch.rows() {
-                    // Evaluate all filter predicates
-                    let passes = self.filters.iter().all(|filter| {
-                        match evaluate_expr(filter, &row, batch_schema) {
-                            Ok(val) => val.to_bool().unwrap_or(false),
-                            Err(_) => false,
-                        }
-                    });
-                    mask.push(passes);
-                }
+                // Apply filters first (before projection, since filters reference original schema)
+                let filtered_batch = if self.filters.is_empty() {
+                    batch.clone()
+                } else {
+                    // Get the table schema (before projection) from the batch
+                    let batch_schema = batch.schema();
+                    let mut mask = Vec::with_capacity(batch.num_rows());
 
-                // If no rows pass, continue to next batch
-                if !mask.iter().any(|&b| b) {
+                    for row in batch.rows() {
+                        // Evaluate all filter predicates
+                        let passes = self.filters.iter().all(|filter| {
+                            match evaluate_expr(filter, &row, batch_schema) {
+                                Ok(val) => val.to_bool().unwrap_or(false),
+                                Err(_) => false,
+                            }
+                        });
+                        mask.push(passes);
+                    }
+
+                    // If no rows pass, continue to next batch
+                    if !mask.iter().any(|&b| b) {
+                        continue;
+                    }
+
+                    batch.filter(&mask).map_err(ExecutionError::Internal)?
+                };
+
+                // Skip empty batches after filtering
+                if filtered_batch.is_empty() {
                     continue;
                 }
 
-                batch.filter(&mask).map_err(ExecutionError::Internal)?
-            };
-
-            // Skip empty batches after filtering
-            if filtered_batch.is_empty() {
-                continue;
+                // Apply projection if specified
+                if let Some(ref indices) = self.projection {
+                    return filtered_batch
+                        .project(indices)
+                        .map(Some)
+                        .map_err(ExecutionError::Internal);
+                } else {
+                    return Ok(Some(filtered_batch));
+                }
             }
 
-            // Apply projection if specified
-            if let Some(ref indices) = self.projection {
-                return filtered_batch
-                    .project(indices)
-                    .map(Some)
-                    .map_err(ExecutionError::Internal);
-            } else {
-                return Ok(Some(filtered_batch));
-            }
+            Ok(None)
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
         }
-
-        Ok(None)
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
         self.current_batch = 0;
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
     }
 }
 
@@ -149,12 +189,18 @@ pub struct FilterExec {
     child: Box<dyn Operator>,
     /// Filter predicate.
     predicate: PhysicalExpr,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl FilterExec {
     /// Creates a new filter operator.
     pub fn new(child: Box<dyn Operator>, predicate: PhysicalExpr) -> Self {
-        Self { child, predicate }
+        Self {
+            child,
+            predicate,
+            stats: OperatorStats::default(),
+        }
     }
 }
 
@@ -164,33 +210,52 @@ impl Operator for FilterExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        while let Some(batch) = self.child.next_batch()? {
-            if batch.is_empty() {
-                continue;
-            }
+        self.stats.calls += 1;
+        let start = Instant::now();
 
-            let schema = batch.schema();
-            let mut mask = Vec::with_capacity(batch.num_rows());
+        let result = (|| {
+            while let Some(batch) = self.child.next_batch()? {
+                if batch.is_empty() {
+                    continue;
+                }
 
-            for row in batch.rows() {
-                let result = evaluate_expr(&self.predicate, &row, schema)?;
-                mask.push(result.to_bool().unwrap_or(false));
-            }
+                let schema = batch.schema();
+                let mut mask = Vec::with_capacity(batch.num_rows());
 
-            // Check if any rows pass the filter
-            if mask.iter().any(|&b| b) {
-                let filtered = batch.filter(&mask).map_err(ExecutionError::Internal)?;
-                if !filtered.is_empty() {
-                    return Ok(Some(filtered));
+                for row in batch.rows() {
+                    let result = evaluate_expr(&self.predicate, &row, schema)?;
+                    mask.push(result.to_bool().unwrap_or(false));
+                }
+
+                // Check if any rows pass the filter
+                if mask.iter().any(|&b| b) {
+                    let filtered = batch.filter(&mask).map_err(ExecutionError::Internal)?;
+                    if !filtered.is_empty() {
+                        return Ok(Some(filtered));
+                    }
                 }
             }
-        }
 
-        Ok(None)
+            Ok(None)
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
+        }
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
         self.child.reset();
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.child]
     }
 }
 
@@ -203,6 +268,8 @@ pub struct ProjectionExec {
     exprs: Vec<PhysicalExpr>,
     /// Output schema.
     schema: Arc<Schema>,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl ProjectionExec {
@@ -212,6 +279,7 @@ impl ProjectionExec {
             child,
             exprs,
             schema,
+            stats: OperatorStats::default(),
         }
     }
 }
@@ -222,35 +290,54 @@ impl Operator for ProjectionExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        if let Some(batch) = self.child.next_batch()? {
-            let input_schema = batch.schema();
-            let mut columns = Vec::with_capacity(self.exprs.len());
+        self.stats.calls += 1;
+        let start = Instant::now();
 
-            for expr in &self.exprs {
-                let mut values = Vec::with_capacity(batch.num_rows());
-                for row in batch.rows() {
-                    let value = evaluate_expr(expr, &row, input_schema)?;
-                    values.push(value);
+        let result = (|| {
+            if let Some(batch) = self.child.next_batch()? {
+                let input_schema = batch.schema();
+                let mut columns = Vec::with_capacity(self.exprs.len());
+
+                for expr in &self.exprs {
+                    let mut values = Vec::with_capacity(batch.num_rows());
+                    for row in batch.rows() {
+                        let value = evaluate_expr(expr, &row, input_schema)?;
+                        values.push(value);
+                    }
+                    let data_type = self
+                        .schema
+                        .fields()
+                        .get(columns.len())
+                        .map(|f| f.data_type.clone())
+                        .unwrap_or(DataType::Text);
+                    columns.push(Column::new(data_type, values));
                 }
-                let data_type = self
-                    .schema
-                    .fields()
-                    .get(columns.len())
-                    .map(|f| f.data_type.clone())
-                    .unwrap_or(DataType::Text);
-                columns.push(Column::new(data_type, values));
-            }
 
-            let result =
-                RecordBatch::new(self.schema.clone(), columns).map_err(ExecutionError::Internal)?;
-            Ok(Some(result))
-        } else {
-            Ok(None)
+                let result = RecordBatch::new(self.schema.clone(), columns)
+                    .map_err(ExecutionError::Internal)?;
+                Ok(Some(result))
+            } else {
+                Ok(None)
+            }
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
         }
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
         self.child.reset();
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.child]
     }
 }
 
@@ -267,6 +354,8 @@ pub struct LimitExec {
     emitted: usize,
     /// Rows skipped so far.
     skipped: usize,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl LimitExec {
@@ -278,6 +367,7 @@ impl LimitExec {
             offset,
             emitted: 0,
             skipped: 0,
+            stats: OperatorStats::default(),
         }
     }
 }
@@ -288,42 +378,61 @@ impl Operator for LimitExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        while self.emitted < self.limit {
-            if let Some(batch) = self.child.next_batch()? {
-                // Handle offset
-                let skip_in_batch = (self.offset - self.skipped).min(batch.num_rows());
-                self.skipped += skip_in_batch;
+        self.stats.calls += 1;
+        let start = Instant::now();
 
-                if skip_in_batch >= batch.num_rows() {
-                    continue;
+        let result = (|| {
+            while self.emitted < self.limit {
+                if let Some(batch) = self.child.next_batch()? {
+                    // Handle offset
+                    let skip_in_batch = (self.offset - self.skipped).min(batch.num_rows());
+                    self.skipped += skip_in_batch;
+
+                    if skip_in_batch >= batch.num_rows() {
+                        continue;
+                    }
+
+                    // Calculate how many rows to take
+                    let remaining = self.limit - self.emitted;
+                    let take = (batch.num_rows() - skip_in_batch).min(remaining);
+
+                    if take == 0 {
+                        continue;
+                    }
+
+                    let result = batch
+                        .slice(skip_in_batch, take)
+                        .map_err(ExecutionError::Internal)?;
+                    self.emitted += result.num_rows();
+
+                    return Ok(Some(result));
+                } else {
+                    break;
                 }
-
-                // Calculate how many rows to take
-                let remaining = self.limit - self.emitted;
-                let take = (batch.num_rows() - skip_in_batch).min(remaining);
-
-                if take == 0 {
-                    continue;
-                }
-
-                let result = batch
-                    .slice(skip_in_batch, take)
-                    .map_err(ExecutionError::Internal)?;
-                self.emitted += result.num_rows();
-
-                return Ok(Some(result));
-            } else {
-                break;
             }
-        }
 
-        Ok(None)
+            Ok(None)
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
+        }
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
         self.child.reset();
         self.emitted = 0;
         self.skipped = 0;
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.child]
     }
 }
 
@@ -352,6 +461,8 @@ pub struct HashJoinExec {
     probe_finished: bool,
     /// Whether we've emitted unmatched rows for RIGHT/FULL join.
     unmatched_emitted: bool,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl HashJoinExec {
@@ -376,6 +487,7 @@ impl HashJoinExec {
             output_pos: 0,
             probe_finished: false,
             unmatched_emitted: false,
+            stats: OperatorStats::default(),
         }
     }
 
@@ -485,44 +597,55 @@ impl Operator for HashJoinExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        // Build hash table on first call
-        if self.hash_table.is_none() {
-            self.build_hash_table()?;
+        self.stats.calls += 1;
+        let start = Instant::now();
+
+        let result = (|| {
+            // Build hash table on first call
+            if self.hash_table.is_none() {
+                self.build_hash_table()?;
+            }
+
+            // Return buffered output if available
+            if self.output_pos < self.output_buffer.len() {
+                let batch_size = 1024.min(self.output_buffer.len() - self.output_pos);
+                let rows: Vec<Row> =
+                    self.output_buffer[self.output_pos..self.output_pos + batch_size].to_vec();
+                self.output_pos += batch_size;
+
+                let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
+                    .map_err(ExecutionError::Internal)?;
+                return Ok(Some(batch));
+            }
+
+            // If probe is finished, we're done
+            if self.probe_finished && self.unmatched_emitted {
+                return Ok(None);
+            }
+
+            // Probe right side
+            self.output_buffer.clear();
+            self.output_pos = 0;
+
+            if self.probe()? {
+                // Return first batch of results
+                let batch_size = 1024.min(self.output_buffer.len());
+                let rows: Vec<Row> = self.output_buffer[..batch_size].to_vec();
+                self.output_pos = batch_size;
+
+                let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
+                    .map_err(ExecutionError::Internal)?;
+                return Ok(Some(batch));
+            }
+
+            Ok(None)
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
         }
-
-        // Return buffered output if available
-        if self.output_pos < self.output_buffer.len() {
-            let batch_size = 1024.min(self.output_buffer.len() - self.output_pos);
-            let rows: Vec<Row> =
-                self.output_buffer[self.output_pos..self.output_pos + batch_size].to_vec();
-            self.output_pos += batch_size;
-
-            let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
-                .map_err(ExecutionError::Internal)?;
-            return Ok(Some(batch));
-        }
-
-        // If probe is finished, we're done
-        if self.probe_finished && self.unmatched_emitted {
-            return Ok(None);
-        }
-
-        // Probe right side
-        self.output_buffer.clear();
-        self.output_pos = 0;
-
-        if self.probe()? {
-            // Return first batch of results
-            let batch_size = 1024.min(self.output_buffer.len());
-            let rows: Vec<Row> = self.output_buffer[..batch_size].to_vec();
-            self.output_pos = batch_size;
-
-            let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
-                .map_err(ExecutionError::Internal)?;
-            return Ok(Some(batch));
-        }
-
-        Ok(None)
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
@@ -533,6 +656,14 @@ impl Operator for HashJoinExec {
         self.output_pos = 0;
         self.probe_finished = false;
         self.unmatched_emitted = false;
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.left, &*self.right]
     }
 }
 
@@ -565,6 +696,8 @@ pub struct NestedLoopJoinExec {
     left_matched: Vec<bool>,
     /// Whether we've emitted unmatched left rows.
     left_unmatched_emitted: bool,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl NestedLoopJoinExec {
@@ -590,6 +723,7 @@ impl NestedLoopJoinExec {
             output_pos: 0,
             left_matched: Vec::new(),
             left_unmatched_emitted: false,
+            stats: OperatorStats::default(),
         }
     }
 
@@ -678,26 +812,37 @@ impl Operator for NestedLoopJoinExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        // Materialize inputs on first call
-        if self.left_rows.is_none() {
-            self.materialize_left()?;
-            self.materialize_right()?;
-            self.join_rows()?;
+        self.stats.calls += 1;
+        let start = Instant::now();
+
+        let result = (|| {
+            // Materialize inputs on first call
+            if self.left_rows.is_none() {
+                self.materialize_left()?;
+                self.materialize_right()?;
+                self.join_rows()?;
+            }
+
+            // Return buffered output
+            if self.output_pos < self.output_buffer.len() {
+                let batch_size = 1024.min(self.output_buffer.len() - self.output_pos);
+                let rows: Vec<Row> =
+                    self.output_buffer[self.output_pos..self.output_pos + batch_size].to_vec();
+                self.output_pos += batch_size;
+
+                let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
+                    .map_err(ExecutionError::Internal)?;
+                return Ok(Some(batch));
+            }
+
+            Ok(None)
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
         }
-
-        // Return buffered output
-        if self.output_pos < self.output_buffer.len() {
-            let batch_size = 1024.min(self.output_buffer.len() - self.output_pos);
-            let rows: Vec<Row> =
-                self.output_buffer[self.output_pos..self.output_pos + batch_size].to_vec();
-            self.output_pos += batch_size;
-
-            let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
-                .map_err(ExecutionError::Internal)?;
-            return Ok(Some(batch));
-        }
-
-        Ok(None)
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
@@ -711,6 +856,14 @@ impl Operator for NestedLoopJoinExec {
         self.output_pos = 0;
         self.left_matched.clear();
         self.left_unmatched_emitted = false;
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.left, &*self.right]
     }
 }
 
@@ -729,6 +882,8 @@ pub struct HashAggregateExec {
     groups: Option<HashMap<Vec<Value>, Vec<Accumulator>>>,
     /// Results iterator.
     results: Option<std::vec::IntoIter<Row>>,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl HashAggregateExec {
@@ -746,6 +901,7 @@ impl HashAggregateExec {
             schema,
             groups: None,
             results: None,
+            stats: OperatorStats::default(),
         }
     }
 
@@ -820,32 +976,51 @@ impl Operator for HashAggregateExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        // Aggregate all input on first call (check results instead of groups,
-        // since build_results() takes ownership of groups)
-        if self.results.is_none() {
-            self.aggregate()?;
-            let results = self.build_results();
-            self.results = Some(results.into_iter());
+        self.stats.calls += 1;
+        let start = Instant::now();
+
+        let result = (|| {
+            // Aggregate all input on first call (check results instead of groups,
+            // since build_results() takes ownership of groups)
+            if self.results.is_none() {
+                self.aggregate()?;
+                let results = self.build_results();
+                self.results = Some(results.into_iter());
+            }
+
+            // Return results
+            let results = self.results.as_mut().unwrap();
+            let batch_size = 1024;
+            let rows: Vec<Row> = results.take(batch_size).collect();
+
+            if rows.is_empty() {
+                return Ok(None);
+            }
+
+            let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
+                .map_err(ExecutionError::Internal)?;
+            Ok(Some(batch))
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
         }
-
-        // Return results
-        let results = self.results.as_mut().unwrap();
-        let batch_size = 1024;
-        let rows: Vec<Row> = results.take(batch_size).collect();
-
-        if rows.is_empty() {
-            return Ok(None);
-        }
-
-        let batch =
-            RecordBatch::from_rows(self.schema.clone(), &rows).map_err(ExecutionError::Internal)?;
-        Ok(Some(batch))
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
         self.child.reset();
         self.groups = None;
         self.results = None;
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.child]
     }
 }
 
@@ -860,6 +1035,8 @@ pub struct SortExec {
     sorted_rows: Option<Vec<Row>>,
     /// Current position.
     current_pos: usize,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl SortExec {
@@ -870,6 +1047,7 @@ impl SortExec {
             sort_exprs,
             sorted_rows: None,
             current_pos: 0,
+            stats: OperatorStats::default(),
         }
     }
 
@@ -915,29 +1093,49 @@ impl Operator for SortExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        // Sort on first call
-        if self.sorted_rows.is_none() {
-            self.sort()?;
+        self.stats.calls += 1;
+        let start = Instant::now();
+
+        let result = (|| {
+            // Sort on first call
+            if self.sorted_rows.is_none() {
+                self.sort()?;
+            }
+
+            let rows = self.sorted_rows.as_ref().unwrap();
+            if self.current_pos >= rows.len() {
+                return Ok(None);
+            }
+
+            let batch_size = 1024.min(rows.len() - self.current_pos);
+            let batch_rows: Vec<Row> =
+                rows[self.current_pos..self.current_pos + batch_size].to_vec();
+            self.current_pos += batch_size;
+
+            let batch = RecordBatch::from_rows(self.child.schema(), &batch_rows)
+                .map_err(ExecutionError::Internal)?;
+            Ok(Some(batch))
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
         }
-
-        let rows = self.sorted_rows.as_ref().unwrap();
-        if self.current_pos >= rows.len() {
-            return Ok(None);
-        }
-
-        let batch_size = 1024.min(rows.len() - self.current_pos);
-        let batch_rows: Vec<Row> = rows[self.current_pos..self.current_pos + batch_size].to_vec();
-        self.current_pos += batch_size;
-
-        let batch = RecordBatch::from_rows(self.child.schema(), &batch_rows)
-            .map_err(ExecutionError::Internal)?;
-        Ok(Some(batch))
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
         self.child.reset();
         self.sorted_rows = None;
         self.current_pos = 0;
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.child]
     }
 }
 
@@ -954,6 +1152,8 @@ pub struct TopNExec {
     top_rows: Option<Vec<Row>>,
     /// Current position.
     current_pos: usize,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl TopNExec {
@@ -965,6 +1165,7 @@ impl TopNExec {
             limit,
             top_rows: None,
             current_pos: 0,
+            stats: OperatorStats::default(),
         }
     }
 
@@ -1036,27 +1237,46 @@ impl Operator for TopNExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        if self.top_rows.is_none() {
-            self.collect_top()?;
+        self.stats.calls += 1;
+        let start = Instant::now();
+
+        let result = (|| {
+            if self.top_rows.is_none() {
+                self.collect_top()?;
+            }
+
+            let rows = self.top_rows.as_ref().unwrap();
+            if self.current_pos >= rows.len() {
+                return Ok(None);
+            }
+
+            let batch_rows: Vec<Row> = rows[self.current_pos..].to_vec();
+            self.current_pos = rows.len();
+
+            let batch = RecordBatch::from_rows(self.child.schema(), &batch_rows)
+                .map_err(ExecutionError::Internal)?;
+            Ok(Some(batch))
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
         }
-
-        let rows = self.top_rows.as_ref().unwrap();
-        if self.current_pos >= rows.len() {
-            return Ok(None);
-        }
-
-        let batch_rows: Vec<Row> = rows[self.current_pos..].to_vec();
-        self.current_pos = rows.len();
-
-        let batch = RecordBatch::from_rows(self.child.schema(), &batch_rows)
-            .map_err(ExecutionError::Internal)?;
-        Ok(Some(batch))
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
         self.child.reset();
         self.top_rows = None;
         self.current_pos = 0;
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.child]
     }
 }
 
@@ -1067,6 +1287,8 @@ pub struct DistinctExec {
     child: Box<dyn Operator>,
     /// Seen rows.
     seen: std::collections::HashSet<Row>,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl DistinctExec {
@@ -1075,6 +1297,7 @@ impl DistinctExec {
         Self {
             child,
             seen: std::collections::HashSet::new(),
+            stats: OperatorStats::default(),
         }
     }
 }
@@ -1085,28 +1308,47 @@ impl Operator for DistinctExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        while let Some(batch) = self.child.next_batch()? {
-            let mut unique_rows = Vec::new();
+        self.stats.calls += 1;
+        let start = Instant::now();
 
-            for row in batch.rows() {
-                if self.seen.insert(row.clone()) {
-                    unique_rows.push(row);
+        let result = (|| {
+            while let Some(batch) = self.child.next_batch()? {
+                let mut unique_rows = Vec::new();
+
+                for row in batch.rows() {
+                    if self.seen.insert(row.clone()) {
+                        unique_rows.push(row);
+                    }
+                }
+
+                if !unique_rows.is_empty() {
+                    let batch = RecordBatch::from_rows(self.child.schema(), &unique_rows)
+                        .map_err(ExecutionError::Internal)?;
+                    return Ok(Some(batch));
                 }
             }
 
-            if !unique_rows.is_empty() {
-                let batch = RecordBatch::from_rows(self.child.schema(), &unique_rows)
-                    .map_err(ExecutionError::Internal)?;
-                return Ok(Some(batch));
-            }
-        }
+            Ok(None)
+        })();
 
-        Ok(None)
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
+        }
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
         self.child.reset();
         self.seen.clear();
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.child]
     }
 }
 
@@ -1202,6 +1444,8 @@ pub struct WindowExec {
     results: Vec<Row>,
     /// Current position in results.
     position: usize,
+    /// Execution statistics.
+    stats: OperatorStats,
 }
 
 impl WindowExec {
@@ -1219,13 +1463,14 @@ impl WindowExec {
             computed: false,
             results: Vec::new(),
             position: 0,
+            stats: OperatorStats::default(),
         }
     }
 
     /// Computes window functions over accumulated rows.
     fn compute_windows(&mut self, rows: Vec<Row>) -> Result<Vec<Row>, ExecutionError> {
         use crate::physical::WindowFunc;
-        
+
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1327,8 +1572,7 @@ impl WindowExec {
                     WindowFunc::FirstValue => {
                         // FIRST_VALUE(expr)
                         if let Some(arg_expr) = window_expr.args.first() {
-                            evaluate_expr(arg_expr, &rows[0], &input_schema)
-                                .unwrap_or(Value::Null)
+                            evaluate_expr(arg_expr, &rows[0], &input_schema).unwrap_or(Value::Null)
                         } else {
                             Value::Null
                         }
@@ -1393,31 +1637,42 @@ impl Operator for WindowExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        // First, accumulate all input rows
-        if !self.computed {
-            let mut all_rows = Vec::new();
-            while let Some(batch) = self.child.next_batch()? {
-                all_rows.extend(batch.rows());
+        self.stats.calls += 1;
+        let start = Instant::now();
+
+        let result = (|| {
+            // First, accumulate all input rows
+            if !self.computed {
+                let mut all_rows = Vec::new();
+                while let Some(batch) = self.child.next_batch()? {
+                    all_rows.extend(batch.rows());
+                }
+
+                // Compute window functions
+                self.results = self.compute_windows(all_rows)?;
+                self.computed = true;
             }
-            
-            // Compute window functions
-            self.results = self.compute_windows(all_rows)?;
-            self.computed = true;
+
+            // Return results in batches
+            if self.position >= self.results.len() {
+                return Ok(None);
+            }
+
+            let batch_size = 1000;
+            let end = (self.position + batch_size).min(self.results.len());
+            let batch_rows: Vec<_> = self.results[self.position..end].to_vec();
+            self.position = end;
+
+            let batch = RecordBatch::from_rows(self.schema.clone(), &batch_rows)
+                .map_err(ExecutionError::Internal)?;
+            Ok(Some(batch))
+        })();
+
+        if let Ok(Some(ref batch)) = result {
+            self.stats.rows_produced += batch.num_rows();
         }
-
-        // Return results in batches
-        if self.position >= self.results.len() {
-            return Ok(None);
-        }
-
-        let batch_size = 1000;
-        let end = (self.position + batch_size).min(self.results.len());
-        let batch_rows: Vec<_> = self.results[self.position..end].to_vec();
-        self.position = end;
-
-        let batch = RecordBatch::from_rows(self.schema.clone(), &batch_rows)
-            .map_err(ExecutionError::Internal)?;
-        Ok(Some(batch))
+        self.stats.time_ns += start.elapsed().as_nanos() as u64;
+        result
     }
 
     fn reset(&mut self) {
@@ -1426,6 +1681,14 @@ impl Operator for WindowExec {
         self.computed = false;
         self.results.clear();
         self.position = 0;
+    }
+
+    fn stats(&self) -> Option<OperatorStats> {
+        Some(self.stats.clone())
+    }
+
+    fn children(&self) -> Vec<&dyn Operator> {
+        vec![&*self.child]
     }
 }
 

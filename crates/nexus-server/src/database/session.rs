@@ -431,7 +431,12 @@ impl Session {
             ),
 
             // EXPLAIN / EXPLAIN ANALYZE: authorize the inner statement
-            Statement::Explain(inner) | Statement::ExplainAnalyze(inner) => {
+            Statement::Explain {
+                statement: inner, ..
+            }
+            | Statement::ExplainAnalyze {
+                statement: inner, ..
+            } => {
                 return self.authorize_statement(inner);
             }
 
@@ -621,6 +626,16 @@ impl Session {
             Statement::ShowTables => self.execute_show_tables(),
             Statement::ShowDatabases => self.execute_show_databases(),
             Statement::DescribeTable(table_name) => self.execute_describe_table(table_name),
+
+            // EXPLAIN / EXPLAIN ANALYZE
+            Statement::Explain {
+                statement: inner,
+                format,
+            } => self.execute_explain(inner, format, false, start),
+            Statement::ExplainAnalyze {
+                statement: inner,
+                format,
+            } => self.execute_explain(inner, format, true, start),
 
             // Multi-database
             Statement::CreateDatabase {
@@ -1215,6 +1230,175 @@ impl Session {
         Ok(StatementResult::Query(execute_result))
     }
 
+    /// Executes EXPLAIN or EXPLAIN ANALYZE for a statement.
+    ///
+    /// Builds the logical and physical plans for the inner statement and
+    /// formats the plan tree. For EXPLAIN ANALYZE, the query is actually
+    /// executed and runtime metrics are collected.
+    fn execute_explain(
+        &self,
+        inner: &Statement,
+        format: &nexus_sql::parser::ExplainFormat,
+        analyze: bool,
+        start: Instant,
+    ) -> DatabaseResult<StatementResult> {
+        use nexus_sql::parser::ExplainFormat;
+
+        // Build a catalog from current storage
+        let mut catalog = MemoryCatalog::new();
+        let storage = self.storage();
+        for table_name in storage.list_tables() {
+            if let Some(table_info) = storage.get_table_info(&table_name) {
+                let meta = nexus_sql::logical::TableMeta::new(
+                    table_name.clone(),
+                    (*table_info.schema).clone(),
+                );
+                catalog.add_table(meta);
+            }
+        }
+
+        // Build logical plan from inner statement
+        let logical_plan =
+            build_plan(inner, &catalog).map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        // Optimize with stats collection
+        let optimizer = Optimizer::new(OptimizerConfig::default());
+        let (optimized, opt_stats) = optimizer
+            .optimize_with_stats(logical_plan)
+            .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        // Create physical plan
+        let ctx = ExecutionContext::default();
+        let physical_planner = PhysicalPlanner::new(&ctx);
+        let physical_plan = physical_planner
+            .create_physical_plan(&optimized.root)
+            .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        // Attach cost estimates from the logical plan
+        let stats = nexus_sql::optimizer::Statistics::default();
+        let physical_plan = physical_plan.with_cost_estimates(&optimized.root, &stats);
+        let planning_time_us = start.elapsed().as_micros() as u64;
+        let physical_plan = physical_plan.with_planning_time(planning_time_us);
+
+        // For EXPLAIN ANALYZE, actually execute and collect per-operator metrics
+        let analyze_metrics = if analyze {
+            let ctx = ExecutionContext::default();
+            let mut executor = nexus_sql::executor::QueryExecutor::new(ctx);
+            for table_name in storage.list_tables() {
+                if let Ok(batches) = storage.execute_scan(&table_name) {
+                    executor.register_table(table_name, batches);
+                }
+            }
+            let (_result, metrics) = executor.execute_with_metrics(&physical_plan)?;
+            Some(metrics)
+        } else {
+            None
+        };
+
+        // Format output
+        let explain_text = match format {
+            ExplainFormat::Text => {
+                physical_plan.explain_rich(analyze_metrics.as_ref(), Some(&opt_stats))
+            }
+            ExplainFormat::Verbose => {
+                let mut text = String::from("=== Logical Plan ===\n");
+                text.push_str(&optimized.explain());
+                text.push_str("\n=== Physical Plan ===\n");
+                text.push_str(
+                    &physical_plan.explain_rich(analyze_metrics.as_ref(), Some(&opt_stats)),
+                );
+                text
+            }
+            ExplainFormat::Json => {
+                // Build enhanced JSON with warnings and suggestions
+                let (warnings, suggestions) = self.analyze_plan_issues(&physical_plan);
+                physical_plan.explain_json_llm(
+                    analyze_metrics.as_ref(),
+                    Some(&opt_stats),
+                    &warnings,
+                    &suggestions,
+                )
+            }
+        };
+
+        // Build result: one row per line for TEXT/VERBOSE, one row for JSON
+        let schema = Arc::new(Schema::new(vec![Field::not_null(
+            "plan",
+            nexus_sql::parser::DataType::Text,
+        )]));
+
+        let rows: Vec<Row> = if matches!(format, ExplainFormat::Json) {
+            vec![Row::new(vec![Value::String(explain_text)])]
+        } else {
+            explain_text
+                .lines()
+                .map(|line| Row::new(vec![Value::String(line.to_string())]))
+                .collect()
+        };
+
+        let total_rows = rows.len();
+        let batch = nexus_sql::executor::RecordBatch::from_rows(schema.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+
+        let elapsed = start.elapsed();
+        let result = ExecuteResult {
+            schema,
+            batches: vec![batch],
+            total_rows,
+            execution_time: elapsed,
+        };
+
+        Ok(StatementResult::Query(result))
+    }
+
+    /// Analyzes the physical plan for potential issues and optimization suggestions.
+    ///
+    /// Returns `(warnings, suggestions)` for inclusion in JSON explain output.
+    fn analyze_plan_issues(&self, plan: &PhysicalPlan) -> (Vec<String>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut suggestions = Vec::new();
+
+        // Check for sequential scans with filters (could benefit from indexes)
+        let seq_scans = plan
+            .find_operators(|op| matches!(op, nexus_sql::physical::PhysicalOperator::SeqScan(_)));
+        for op in &seq_scans {
+            if let nexus_sql::physical::PhysicalOperator::SeqScan(scan) = op {
+                if !scan.filters.is_empty() {
+                    warnings.push(format!(
+                        "Sequential scan with filter on table '{}' — consider an index",
+                        scan.table_name
+                    ));
+                    for filter in &scan.filters {
+                        suggestions.push(format!(
+                            "Consider CREATE INDEX on '{}' for filter: {}",
+                            scan.table_name, filter
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Check for nested loop joins (potentially expensive)
+        let nl_joins = plan.find_operators(|op| {
+            matches!(op, nexus_sql::physical::PhysicalOperator::NestedLoopJoin(_))
+        });
+        for op in &nl_joins {
+            if let nexus_sql::physical::PhysicalOperator::NestedLoopJoin(join) = op {
+                if join.condition.is_some() {
+                    warnings.push(
+                        "Nested loop join detected — may be expensive for large tables".to_string(),
+                    );
+                    suggestions.push(
+                        "Consider rewriting the query to use equi-join conditions for hash join"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        (warnings, suggestions)
+    }
+
     /// Extract table names referenced in a statement (for cache dependency tracking).
     fn extract_table_names(statement: &Statement) -> Vec<String> {
         let mut tables = Vec::new();
@@ -1803,6 +1987,207 @@ mod tests {
             assert_eq!(
                 query_result.total_rows, 1,
                 "HAVING should filter to 1 group"
+            );
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_explain() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+
+        // EXPLAIN should return a plan description as a query result
+        let result = session.execute("EXPLAIN SELECT * FROM users").unwrap();
+
+        if let StatementResult::Query(query_result) = result {
+            assert!(query_result.total_rows > 0, "EXPLAIN should produce output");
+            let rows = query_result.rows();
+            // The plan column should be "plan"
+            assert_eq!(query_result.schema.fields()[0].name(), "plan");
+            // Should contain SeqScan reference
+            let plan_text: String = rows
+                .iter()
+                .filter_map(|r| match r.get(0) {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                plan_text.contains("SeqScan"),
+                "EXPLAIN output should mention SeqScan, got: {}",
+                plan_text
+            );
+        } else {
+            panic!("expected Query result for EXPLAIN");
+        }
+    }
+
+    #[test]
+    fn test_session_explain_analyze() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (2, 'Bob')")
+            .unwrap();
+
+        // EXPLAIN ANALYZE should execute the query and include actual metrics
+        let result = session
+            .execute("EXPLAIN ANALYZE SELECT * FROM users")
+            .unwrap();
+
+        if let StatementResult::Query(query_result) = result {
+            assert!(
+                query_result.total_rows > 0,
+                "EXPLAIN ANALYZE should produce output"
+            );
+            let plan_text: String = query_result
+                .rows()
+                .iter()
+                .filter_map(|r| match r.get(0) {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Should contain actual runtime info
+            assert!(
+                plan_text.contains("actual"),
+                "EXPLAIN ANALYZE output should contain actual metrics, got: {}",
+                plan_text
+            );
+        } else {
+            panic!("expected Query result for EXPLAIN ANALYZE");
+        }
+    }
+
+    #[test]
+    fn test_session_explain_verbose() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        let result = session
+            .execute("EXPLAIN VERBOSE SELECT * FROM users")
+            .unwrap();
+
+        if let StatementResult::Query(query_result) = result {
+            let plan_text: String = query_result
+                .rows()
+                .iter()
+                .filter_map(|r| match r.get(0) {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Verbose includes both logical and physical plan
+            assert!(
+                plan_text.contains("Logical Plan"),
+                "VERBOSE should include logical plan, got: {}",
+                plan_text
+            );
+            assert!(
+                plan_text.contains("Physical Plan"),
+                "VERBOSE should include physical plan, got: {}",
+                plan_text
+            );
+        } else {
+            panic!("expected Query result for EXPLAIN VERBOSE");
+        }
+    }
+
+    #[test]
+    fn test_session_explain_json() {
+        // Test the JSON explain format by directly calling execute_explain
+        // with ExplainFormat::Json, since the EXPLAIN (FORMAT JSON) syntax
+        // may not be supported by the underlying sqlparser version.
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        // Parse the inner statement, then call execute_explain directly
+        let inner = nexus_sql::parser::Parser::parse_one("SELECT * FROM users").unwrap();
+        let format = nexus_sql::parser::ExplainFormat::Json;
+        let start = std::time::Instant::now();
+        let result = session
+            .execute_explain(&inner, &format, false, start)
+            .unwrap();
+
+        if let StatementResult::Query(query_result) = result {
+            assert_eq!(query_result.total_rows, 1, "JSON should be a single row");
+            let json_str = match query_result.rows()[0].get(0) {
+                Some(Value::String(s)) => s.clone(),
+                _ => panic!("expected string value"),
+            };
+            // Should look like valid JSON with plan key
+            assert!(
+                json_str.contains("\"plan\""),
+                "JSON output should contain 'plan' key, got: {}",
+                json_str
+            );
+            assert!(
+                json_str.starts_with('{'),
+                "JSON output should start with '{{', got: {}",
+                json_str
+            );
+            assert!(
+                json_str.contains("\"operator\""),
+                "JSON output should contain operator info, got: {}",
+                json_str
+            );
+        } else {
+            panic!("expected Query result for EXPLAIN JSON");
+        }
+    }
+
+    #[test]
+    fn test_session_explain_with_filter() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (1, 'Alice', 30)")
+            .unwrap();
+
+        let result = session
+            .execute("EXPLAIN SELECT * FROM users WHERE age > 25")
+            .unwrap();
+
+        if let StatementResult::Query(query_result) = result {
+            let plan_text: String = query_result
+                .rows()
+                .iter()
+                .filter_map(|r| match r.get(0) {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                plan_text.contains("SeqScan"),
+                "Plan should include SeqScan, got: {}",
+                plan_text
             );
         } else {
             panic!("expected Query result");

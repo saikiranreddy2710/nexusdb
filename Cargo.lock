@@ -1392,6 +1392,7 @@ dependencies = [
  "nexus-storage",
  "proptest",
  "serde",
+ "serde_json",
  "sqlparser",
  "thiserror",
 ]

@@ -3,11 +3,15 @@
 //! A PhysicalPlan wraps a tree of PhysicalOperators and provides
 //! methods for displaying, explaining, and analyzing the plan.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use super::context::ExecutionMetrics;
 use super::operator::PhysicalOperator;
+use crate::executor::OperatorStats;
+use crate::logical::LogicalOperator;
+use crate::optimizer::{CostModel, OptimizationStats, SimpleCostModel, Statistics};
 
 /// A physical execution plan.
 ///
@@ -83,6 +87,397 @@ impl PhysicalPlan {
     /// Returns the output schema.
     pub fn schema(&self) -> super::operator::SchemaRef {
         self.root.schema()
+    }
+
+    /// Computes cost estimates from the logical plan and statistics,
+    /// storing them in the plan metadata.
+    pub fn with_cost_estimates(mut self, logical: &LogicalOperator, stats: &Statistics) -> Self {
+        let cost_model = SimpleCostModel::default();
+        let cost = cost_model.estimate_cost(logical, stats);
+        self.metadata.estimated_rows = Some(cost.rows as usize);
+        self.metadata.estimated_cost = Some(cost.total());
+        self
+    }
+
+    /// Generates a rich PostgreSQL-style EXPLAIN output.
+    ///
+    /// When `analyze_metrics` is provided (from EXPLAIN ANALYZE), actual
+    /// runtime statistics are included alongside the estimated values.
+    /// When `optimizer_stats` is provided, planning and optimizer info is
+    /// appended at the bottom.
+    pub fn explain_rich(
+        &self,
+        analyze_metrics: Option<&HashMap<usize, OperatorStats>>,
+        optimizer_stats: Option<&OptimizationStats>,
+    ) -> String {
+        let mut output = String::new();
+        let mut op_id = 0;
+        self.explain_rich_recursive(
+            &self.root,
+            0,
+            false,
+            analyze_metrics,
+            &mut op_id,
+            &mut output,
+        );
+
+        // Planning time
+        if self.metadata.planning_time_us > 0 {
+            output.push_str(&format!(
+                "\nPlanning Time: {:.3} ms\n",
+                self.metadata.planning_time_us as f64 / 1000.0
+            ));
+        }
+
+        // Optimizer stats
+        if let Some(stats) = optimizer_stats {
+            output.push_str(&format!(
+                "Optimizer: {} iterations, {} rules applied\n",
+                stats.iterations, stats.rules_applied
+            ));
+            for (rule, count) in &stats.rule_applications {
+                output.push_str(&format!("  - {}: {}\n", rule, count));
+            }
+        }
+
+        output
+    }
+
+    /// Recursively builds the rich explain output.
+    fn explain_rich_recursive(
+        &self,
+        op: &PhysicalOperator,
+        indent: usize,
+        is_child: bool,
+        analyze_metrics: Option<&HashMap<usize, OperatorStats>>,
+        op_id: &mut usize,
+        output: &mut String,
+    ) {
+        let current_id = *op_id;
+        *op_id += 1;
+
+        // Indentation with arrow prefix for children
+        if is_child {
+            let prefix = "  ".repeat(indent.saturating_sub(1));
+            output.push_str(&prefix);
+            output.push_str("-> ");
+        }
+
+        // Operator name + key parameters
+        output.push_str(op.name());
+        self.append_operator_details(op, output);
+
+        // Cost estimates
+        if let (Some(rows), Some(cost)) =
+            (self.metadata.estimated_rows, self.metadata.estimated_cost)
+        {
+            output.push_str(&format!("  (cost=0.00..{:.2} rows={})", cost, rows));
+        }
+
+        // Actual runtime stats from EXPLAIN ANALYZE
+        if let Some(metrics) = analyze_metrics {
+            if let Some(op_stats) = metrics.get(&current_id) {
+                let time_ms = op_stats.time_ns as f64 / 1_000_000.0;
+                output.push_str(&format!(
+                    " (actual rows={} time={:.3}ms loops={})",
+                    op_stats.rows_produced, time_ms, op_stats.calls
+                ));
+            }
+        }
+
+        output.push('\n');
+
+        // Additional operator detail lines (e.g. Filter predicates)
+        self.append_operator_extra_lines(op, indent, is_child, output);
+
+        // Recurse into children
+        for child in op.children() {
+            self.explain_rich_recursive(child, indent + 1, true, analyze_metrics, op_id, output);
+        }
+    }
+
+    /// Appends operator-specific inline details (parenthetical).
+    fn append_operator_details(&self, op: &PhysicalOperator, output: &mut String) {
+        match op {
+            PhysicalOperator::SeqScan(scan) => {
+                output.push_str(&format!(" on {}", scan.table_name));
+            }
+            PhysicalOperator::IndexScan(scan) => {
+                output.push_str(&format!(
+                    " on {} using {}",
+                    scan.table_name, scan.index_name
+                ));
+            }
+            PhysicalOperator::HashJoin(join) => {
+                output.push_str(&format!(
+                    " ({:?}, equi_keys: {})",
+                    join.join_type,
+                    join.left_keys.len()
+                ));
+            }
+            PhysicalOperator::MergeJoin(join) => {
+                output.push_str(&format!(" ({:?})", join.join_type));
+            }
+            PhysicalOperator::NestedLoopJoin(join) => {
+                output.push_str(&format!(" ({:?})", join.join_type));
+            }
+            PhysicalOperator::HashAggregate(agg) => {
+                output.push_str(&format!(
+                    " (groups={}, aggs={}, mode={:?})",
+                    agg.group_by.len(),
+                    agg.aggregates.len(),
+                    agg.mode
+                ));
+            }
+            PhysicalOperator::SortAggregate(agg) => {
+                output.push_str(&format!(
+                    " (groups={}, aggs={})",
+                    agg.group_by.len(),
+                    agg.aggregates.len()
+                ));
+            }
+            PhysicalOperator::Sort(sort) => {
+                output.push_str(&format!(" (cols={})", sort.order_by.len()));
+            }
+            PhysicalOperator::TopN(topn) => {
+                output.push_str(&format!(" (n={})", topn.n));
+            }
+            PhysicalOperator::Limit(limit) => {
+                let mut parts = Vec::new();
+                if limit.offset > 0 {
+                    parts.push(format!("offset={}", limit.offset));
+                }
+                if let Some(fetch) = limit.fetch {
+                    parts.push(format!("fetch={}", fetch));
+                }
+                if !parts.is_empty() {
+                    output.push_str(&format!(" ({})", parts.join(", ")));
+                }
+            }
+            PhysicalOperator::Projection(proj) => {
+                output.push_str(&format!(" (cols={})", proj.exprs.len()));
+            }
+            PhysicalOperator::Values(vals) => {
+                output.push_str(&format!(" (rows={})", vals.values.len()));
+            }
+            PhysicalOperator::Window(window) => {
+                output.push_str(&format!(" (exprs={})", window.window_exprs.len()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Appends extra detail lines below the operator line (e.g. Filter expression).
+    fn append_operator_extra_lines(
+        &self,
+        op: &PhysicalOperator,
+        indent: usize,
+        _is_child: bool,
+        output: &mut String,
+    ) {
+        let pad = "  ".repeat(indent + 1);
+        match op {
+            PhysicalOperator::Filter(filter) => {
+                output.push_str(&format!("{}Filter: ({})\n", pad, filter.predicate));
+            }
+            PhysicalOperator::SeqScan(scan) if !scan.filters.is_empty() => {
+                for f in &scan.filters {
+                    output.push_str(&format!("{}Filter: ({})\n", pad, f));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Generates a JSON-structured EXPLAIN output.
+    ///
+    /// Produces a nested JSON object with operator details, cost estimates,
+    /// and optionally actual runtime metrics.
+    pub fn explain_json(
+        &self,
+        analyze_metrics: Option<&HashMap<usize, OperatorStats>>,
+        optimizer_stats: Option<&OptimizationStats>,
+    ) -> String {
+        let mut op_id = 0;
+        let plan_json = self.build_json_node(&self.root, analyze_metrics, &mut op_id);
+
+        let mut root = serde_json::Map::new();
+        root.insert("plan".to_string(), plan_json);
+
+        if self.metadata.planning_time_us > 0 {
+            root.insert(
+                "planning_time_ms".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(self.metadata.planning_time_us as f64 / 1000.0)
+                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
+            );
+        }
+
+        if let Some(stats) = optimizer_stats {
+            let mut opt = serde_json::Map::new();
+            opt.insert(
+                "iterations".to_string(),
+                serde_json::Value::Number(stats.iterations.into()),
+            );
+            opt.insert(
+                "rules_applied".to_string(),
+                serde_json::Value::Number(stats.rules_applied.into()),
+            );
+            let rules: serde_json::Map<String, serde_json::Value> = stats
+                .rule_applications
+                .iter()
+                .map(|(name, count)| (name.clone(), serde_json::Value::Number((*count).into())))
+                .collect();
+            opt.insert("rules".to_string(), serde_json::Value::Object(rules));
+            root.insert("optimizer".to_string(), serde_json::Value::Object(opt));
+        }
+
+        serde_json::to_string_pretty(&serde_json::Value::Object(root))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Builds a JSON value for a single operator node.
+    fn build_json_node(
+        &self,
+        op: &PhysicalOperator,
+        analyze_metrics: Option<&HashMap<usize, OperatorStats>>,
+        op_id: &mut usize,
+    ) -> serde_json::Value {
+        let current_id = *op_id;
+        *op_id += 1;
+
+        let mut node = serde_json::Map::new();
+        node.insert(
+            "operator".to_string(),
+            serde_json::Value::String(op.name().to_string()),
+        );
+
+        // Details string
+        let mut details = String::new();
+        self.append_operator_details(op, &mut details);
+        let details = details.trim().to_string();
+        if !details.is_empty() {
+            node.insert("details".to_string(), serde_json::Value::String(details));
+        }
+
+        // Estimated cost
+        if let Some(rows) = self.metadata.estimated_rows {
+            node.insert(
+                "estimated_rows".to_string(),
+                serde_json::Value::Number(rows.into()),
+            );
+        }
+        if let Some(cost) = self.metadata.estimated_cost {
+            node.insert(
+                "estimated_cost".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(cost)
+                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
+            );
+        }
+
+        // Actual metrics
+        if let Some(metrics) = analyze_metrics {
+            if let Some(op_stats) = metrics.get(&current_id) {
+                node.insert(
+                    "actual_rows".to_string(),
+                    serde_json::Value::Number(op_stats.rows_produced.into()),
+                );
+                node.insert(
+                    "actual_time_ms".to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(op_stats.time_ns as f64 / 1_000_000.0)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ),
+                );
+                node.insert(
+                    "loops".to_string(),
+                    serde_json::Value::Number(op_stats.calls.into()),
+                );
+            }
+        }
+
+        // Children
+        let children: Vec<serde_json::Value> = op
+            .children()
+            .iter()
+            .map(|child| self.build_json_node(child, analyze_metrics, op_id))
+            .collect();
+        if !children.is_empty() {
+            node.insert("children".to_string(), serde_json::Value::Array(children));
+        }
+
+        serde_json::Value::Object(node)
+    }
+
+    /// Generates an enhanced JSON EXPLAIN output with LLM-friendly metadata.
+    ///
+    /// Includes warnings about potential performance issues and optimization
+    /// suggestions in addition to the standard plan tree.
+    pub fn explain_json_llm(
+        &self,
+        analyze_metrics: Option<&HashMap<usize, OperatorStats>>,
+        optimizer_stats: Option<&OptimizationStats>,
+        warnings: &[String],
+        suggestions: &[String],
+    ) -> String {
+        let mut op_id = 0;
+        let plan_json = self.build_json_node(&self.root, analyze_metrics, &mut op_id);
+
+        let mut root = serde_json::Map::new();
+        root.insert("plan".to_string(), plan_json);
+
+        if self.metadata.planning_time_us > 0 {
+            root.insert(
+                "planning_time_ms".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(self.metadata.planning_time_us as f64 / 1000.0)
+                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
+            );
+        }
+
+        if let Some(stats) = optimizer_stats {
+            let mut opt = serde_json::Map::new();
+            opt.insert(
+                "iterations".to_string(),
+                serde_json::Value::Number(stats.iterations.into()),
+            );
+            opt.insert(
+                "rules_applied".to_string(),
+                serde_json::Value::Number(stats.rules_applied.into()),
+            );
+            let rules: serde_json::Map<String, serde_json::Value> = stats
+                .rule_applications
+                .iter()
+                .map(|(name, count)| (name.clone(), serde_json::Value::Number((*count).into())))
+                .collect();
+            opt.insert("rules".to_string(), serde_json::Value::Object(rules));
+            root.insert("optimizer".to_string(), serde_json::Value::Object(opt));
+        }
+
+        // Warnings
+        if !warnings.is_empty() {
+            let w: Vec<serde_json::Value> = warnings
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect();
+            root.insert("warnings".to_string(), serde_json::Value::Array(w));
+        }
+
+        // Suggestions
+        if !suggestions.is_empty() {
+            let s: Vec<serde_json::Value> = suggestions
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect();
+            root.insert("suggestions".to_string(), serde_json::Value::Array(s));
+        }
+
+        serde_json::to_string_pretty(&serde_json::Value::Object(root))
+            .unwrap_or_else(|_| "{}".to_string())
     }
 
     /// Generates an EXPLAIN output for the plan.
