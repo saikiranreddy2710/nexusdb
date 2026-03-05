@@ -60,9 +60,26 @@ pub struct LruCache<K, V> {
     stats: CacheStats,
 }
 
-// Safety: LruCache manages its own memory and can be sent between threads
+// Safety: LruCache manages its own memory and can be sent between threads.
+// Sync is needed because LruCache is used behind RwLock in PlanCache/ResultCache.
 unsafe impl<K: Send, V: Send> Send for LruCache<K, V> {}
-unsafe impl<K: Send + Sync, V: Send + Sync> Sync for LruCache<K, V> {}
+unsafe impl<K: Send, V: Send> Sync for LruCache<K, V> {}
+
+impl<K, V> LruCache<K, V> {
+    /// Walk the linked list and free all heap-allocated nodes.
+    /// Resets head/tail but does NOT clear the HashMap (callers must do that).
+    fn free_nodes(&mut self) {
+        let mut current = self.head;
+        while let Some(node_ptr) = current {
+            unsafe {
+                current = (*node_ptr.as_ptr()).next;
+                drop(Box::from_raw(node_ptr.as_ptr()));
+            }
+        }
+        self.head = None;
+        self.tail = None;
+    }
+}
 
 impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     /// Creates a new LRU cache with the given capacity.
@@ -195,17 +212,8 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
 
     /// Clears all entries from the cache.
     pub fn clear(&mut self) {
-        // Drop all nodes
-        let mut current = self.head;
-        while let Some(node_ptr) = current {
-            unsafe {
-                current = (*node_ptr.as_ptr()).next;
-                drop(Box::from_raw(node_ptr.as_ptr()));
-            }
-        }
+        self.free_nodes();
         self.map.clear();
-        self.head = None;
-        self.tail = None;
     }
 
     /// Returns cache statistics.
@@ -280,13 +288,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
 
 impl<K, V> Drop for LruCache<K, V> {
     fn drop(&mut self) {
-        let mut current = self.head;
-        while let Some(node_ptr) = current {
-            unsafe {
-                current = (*node_ptr.as_ptr()).next;
-                drop(Box::from_raw(node_ptr.as_ptr()));
-            }
-        }
+        self.free_nodes();
     }
 }
 

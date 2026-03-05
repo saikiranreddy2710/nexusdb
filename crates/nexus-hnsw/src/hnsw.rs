@@ -764,7 +764,7 @@ impl HnswIndex {
     /// Generates a random level for a new node using the exponential distribution.
     fn random_level(&self, rng: &mut rand::rngs::StdRng) -> usize {
         let ml = self.config.ml();
-        let r: f64 = rng.gen();
+        let r: f64 = rng.gen::<f64>().max(f64::MIN_POSITIVE);
         // level = floor(-ln(uniform) * mL)
         let level = (-r.ln() * ml).floor() as usize;
         // Cap at a reasonable max to prevent extreme outliers

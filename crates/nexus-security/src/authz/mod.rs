@@ -144,6 +144,27 @@ impl Authorizer {
                 return Err(format!("cannot overwrite built-in role: {}", role.name));
             }
         }
+
+        // Check for inheritance cycles: walk from each parent back through
+        // the inheritance graph. If we reach the new role's name, reject.
+        for parent_name in &role.inherits {
+            let mut visited = HashSet::new();
+            let mut stack = vec![parent_name.clone()];
+            while let Some(current) = stack.pop() {
+                if current == role.name {
+                    return Err(format!(
+                        "role '{}' would create an inheritance cycle via '{}'",
+                        role.name, parent_name
+                    ));
+                }
+                if visited.insert(current.clone()) {
+                    if let Some(current_role) = roles.get(&current) {
+                        stack.extend(current_role.inherits.iter().cloned());
+                    }
+                }
+            }
+        }
+
         roles.insert(role.name.clone(), role);
         Ok(())
     }

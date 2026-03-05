@@ -32,6 +32,8 @@ pub enum AuthError {
     AuthRequired,
     #[error("password must not be empty")]
     EmptyPassword,
+    #[error("password must be at least 8 characters")]
+    PasswordTooShort,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -189,9 +191,12 @@ impl Authenticator {
         password: &str,
         roles: Vec<String>,
     ) -> AuthResult<()> {
-        // Validate password (must be non-empty)
+        // Validate password (must be non-empty and at least 8 characters)
         if password.is_empty() {
             return Err(AuthError::EmptyPassword);
+        }
+        if password.len() < 8 {
+            return Err(AuthError::PasswordTooShort);
         }
 
         let mut users = self.users.write();

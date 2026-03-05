@@ -949,7 +949,25 @@ impl Session {
             for (i, expr) in value_row.iter().enumerate() {
                 if i < column_order.len() {
                     let col_idx = column_order[i];
-                    row_values[col_idx] = self.eval_literal(expr)?;
+                    let val = self.eval_literal(expr)?;
+
+                    // Validate vector dimension against the column's declared dimension
+                    if let Value::Vector(ref vec_data) = val {
+                        if let nexus_sql::parser::DataType::Vector(expected_dim) =
+                            &schema.fields()[col_idx].data_type
+                        {
+                            if vec_data.len() != *expected_dim as usize {
+                                return Err(DatabaseError::ExecutionError(format!(
+                                    "vector dimension mismatch for column '{}': expected {}, got {}",
+                                    schema.fields()[col_idx].name(),
+                                    expected_dim,
+                                    vec_data.len()
+                                )));
+                            }
+                        }
+                    }
+
+                    row_values[col_idx] = val;
                 }
             }
 
@@ -1343,7 +1361,7 @@ impl Session {
                 // Handle negative numbers
                 if let UnaryOperator::Minus = op {
                     if let Expr::Literal(Literal::Integer(n)) = expr.as_ref() {
-                        return Ok(Value::Int((-n) as i32));
+                        return Ok(Value::BigInt(-n));
                     }
                     if let Expr::Literal(Literal::Float(f)) = expr.as_ref() {
                         return Ok(Value::Double(-f));

@@ -482,7 +482,7 @@ impl LsmEngine {
 
     /// Check if the engine is running.
     fn check_running(&self) -> KvResult<()> {
-        if !self.is_running.load(Ordering::Relaxed) {
+        if !self.is_running.load(Ordering::Acquire) {
             Err(KvError::Shutdown)
         } else {
             Ok(())

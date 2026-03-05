@@ -210,6 +210,11 @@ pub struct FilePager {
 }
 
 impl FilePager {
+    /// Returns the path to the data file.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Create or open a file pager at the given path.
     ///
     /// If the file exists, all pages are loaded into the cache. If it

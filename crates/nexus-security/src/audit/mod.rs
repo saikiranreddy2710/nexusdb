@@ -41,6 +41,27 @@ pub enum AuditAction {
     Disconnect,
 }
 
+impl AuditAction {
+    /// Returns a stable string representation for each variant.
+    ///
+    /// Unlike `Debug`, this is guaranteed to be consistent across compiler
+    /// versions and is safe to use in hashing and serialization contexts.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuditAction::AuthSuccess => "AuthSuccess",
+            AuditAction::AuthFailure => "AuthFailure",
+            AuditAction::AccountLocked => "AccountLocked",
+            AuditAction::Query => "Query",
+            AuditAction::SchemaChange => "SchemaChange",
+            AuditAction::DataModification => "DataModification",
+            AuditAction::PermissionChange => "PermissionChange",
+            AuditAction::UserChange => "UserChange",
+            AuditAction::Connect => "Connect",
+            AuditAction::Disconnect => "Disconnect",
+        }
+    }
+}
+
 /// A single audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -73,7 +94,7 @@ impl AuditEntry {
         hasher.update(self.sequence.to_le_bytes());
         hasher.update(self.timestamp_ms.to_le_bytes());
         hasher.update(self.username.as_bytes());
-        hasher.update(format!("{:?}", self.action).as_bytes());
+        hasher.update(self.action.as_str().as_bytes());
         if let Some(ref t) = self.target {
             hasher.update(t.as_bytes());
         }
