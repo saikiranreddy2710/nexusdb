@@ -435,8 +435,13 @@ impl LsmEngine {
             }
         }
 
-        // Flush any remaining data
-        if let Err(e) = self.flush() {
+        // Flush any remaining data — call internal methods directly
+        // because flush() calls check_running() which fails after
+        // is_running has been set to false.
+        if let Err(e) = self.freeze_memtable() {
+            warn!("error during shutdown freeze: {}", e);
+        }
+        if let Err(e) = self.flush_immutable_memtables() {
             warn!("error during shutdown flush: {}", e);
         }
 
@@ -536,13 +541,9 @@ impl LsmEngine {
 
         // Only add to immutables if it has data
         if !old_memtable.is_empty() {
-            // Convert Arc<MemTable> to MemTable, then to ImmutableMemTable
-            let memtable = Arc::try_unwrap(old_memtable).unwrap_or_else(|_arc| {
-                warn!("memtable has multiple references during freeze");
-                MemTable::new(0, 0, 0)
-            });
-
-            let immutable = Arc::new(ImmutableMemTable::from(memtable));
+            // Convert Arc<MemTable> to ImmutableMemTable. Use from_arc to
+            // avoid data loss when concurrent readers still hold Arc refs.
+            let immutable = Arc::new(ImmutableMemTable::from_arc(old_memtable));
 
             let mut imm_tables = self.immutable_memtables.write();
             imm_tables.push_back(immutable);

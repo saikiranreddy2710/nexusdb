@@ -80,6 +80,10 @@ impl AuditEntry {
         if let Some(ref d) = self.detail {
             hasher.update(d.as_bytes());
         }
+        match &self.client_ip {
+            Some(ip) => hasher.update(ip.as_bytes()),
+            None => hasher.update(b"<no-ip>"),
+        }
         hasher.update(if self.success { &[1u8] } else { &[0u8] });
         hasher.update(self.prev_hash.as_bytes());
 

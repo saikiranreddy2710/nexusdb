@@ -137,6 +137,12 @@ impl Authorizer {
     /// Define a new role.
     pub fn create_role(&self, role: Role) {
         let mut roles = self.roles.write();
+        if let Some(existing) = roles.get(&role.name) {
+            if existing.builtin {
+                tracing::warn!("cannot overwrite built-in role: {}", role.name);
+                return;
+            }
+        }
         roles.insert(role.name.clone(), role);
     }
 

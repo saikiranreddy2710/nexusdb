@@ -368,19 +368,21 @@ impl Authenticator {
             .ok_or(AuthError::InvalidToken)?
             .to_string();
         let exp = payload["exp"].as_u64().unwrap_or(0);
-
-        if exp > 0 && exp < now_epoch() {
+        if exp == 0 {
+            return Err(AuthError::InvalidToken); // Reject tokens without expiration
+        }
+        if exp < now_epoch() {
             return Err(AuthError::TokenExpired);
         }
 
-        let roles = payload["roles"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Look up the user in server-side store for authoritative roles
+        let users = self.users.read();
+        let roles = if let Some(user) = users.get(&username) {
+            user.roles.clone()
+        } else {
+            // User not found in store — reject the token
+            return Err(AuthError::UserNotFound(username));
+        };
 
         Ok(Identity {
             username,

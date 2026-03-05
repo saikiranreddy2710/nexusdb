@@ -290,6 +290,12 @@ impl HnswIndex {
     /// Returns an error if the vector dimensions don't match or the ID
     /// already exists.
     pub fn insert(&self, id: VectorId, vector: &[f32]) -> HnswResult<()> {
+        if vector.iter().any(|&v| v.is_nan() || v.is_infinite()) {
+            return Err(HnswError::InvalidConfig(
+                "vector contains NaN or Infinity".into(),
+            ));
+        }
+
         if vector.len() != self.config.dimensions as usize {
             return Err(HnswError::DimensionMismatch {
                 expected: self.config.dimensions as usize,
@@ -512,8 +518,11 @@ impl HnswIndex {
 
         let &node_idx = inner.id_to_index.get(&id).ok_or(HnswError::NotFound(id))?;
 
-        // Remove from all neighbor lists
+        // Save neighbor lists before clearing
         let max_layer = inner.nodes[node_idx].max_layer;
+        let saved_neighbors: Vec<Vec<usize>> = inner.nodes[node_idx].neighbors.clone();
+
+        // Remove from all neighbor lists
         for lc in 0..=max_layer {
             let neighbor_indices: Vec<usize> = inner.nodes[node_idx].neighbors[lc].clone();
             for &nb_idx in &neighbor_indices {
@@ -524,31 +533,43 @@ impl HnswIndex {
             inner.nodes[node_idx].neighbors[lc].clear();
         }
 
-        // Re-connect orphaned neighbors at each layer using nearest remaining neighbors
-        // (simplified repair: connect each pair of former neighbors)
+        // Repair: connect former neighbors to each other at each layer
         for lc in 0..=max_layer {
-            let neighbor_indices: Vec<usize> = {
-                // We already cleared the deleted node's neighbors, but we saved them above.
-                // We need to re-read from the original list... but we already cleared it.
-                // The neighbor_indices from the loop above are per-layer, but we lose scope.
-                // Let's skip the repair in this simplified version —
-                // the graph degrades gracefully with soft-deletes.
-                Vec::new()
-            };
-            let _ = (lc, neighbor_indices);
+            let former = &saved_neighbors[lc];
+            let max_conn = self.config.max_connections(lc);
+            for &nb_a in former {
+                if !inner.id_to_index.contains_key(&inner.nodes[nb_a].id) {
+                    continue;
+                }
+                for &nb_b in former {
+                    if nb_a == nb_b {
+                        continue;
+                    }
+                    if !inner.id_to_index.contains_key(&inner.nodes[nb_b].id) {
+                        continue;
+                    }
+                    // Add connection if not already present and under capacity
+                    if !inner.nodes[nb_a].neighbors[lc].contains(&nb_b)
+                        && inner.nodes[nb_a].neighbors[lc].len() < max_conn
+                    {
+                        inner.nodes[nb_a].neighbors[lc].push(nb_b);
+                    }
+                }
+            }
         }
 
         // Remove from lookup
         inner.id_to_index.remove(&id);
 
-        // If this was the entry point, pick a neighbor as new EP
+        // If this was the entry point, find the active node with highest max_layer
         if inner.entry_point == Some(node_idx) {
-            inner.entry_point = inner.id_to_index.values().next().copied();
-            if let Some(new_ep) = inner.entry_point {
-                inner.max_level = inner.nodes[new_ep].max_layer;
-            } else {
-                inner.max_level = 0;
-            }
+            let best_ep = inner
+                .id_to_index
+                .values()
+                .copied()
+                .max_by_key(|&idx| inner.nodes[idx].max_layer);
+            inner.entry_point = best_ep;
+            inner.max_level = best_ep.map(|idx| inner.nodes[idx].max_layer).unwrap_or(0);
         }
 
         Ok(())
@@ -565,12 +586,10 @@ impl HnswIndex {
         let mut total_edges = 0usize;
         let mut level_counts = vec![0usize; max_level + 1];
 
-        for node in &inner.nodes {
-            if !inner
-                .id_to_index
-                .values()
-                .any(|&idx| idx < inner.nodes.len() && std::ptr::eq(&inner.nodes[idx], node))
-            {
+        let active_indices: std::collections::HashSet<usize> =
+            inner.id_to_index.values().copied().collect();
+        for (i, node) in inner.nodes.iter().enumerate() {
+            if !active_indices.contains(&i) {
                 continue; // skip deleted
             }
             for (l, neighbors) in node.neighbors.iter().enumerate() {

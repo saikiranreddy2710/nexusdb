@@ -17,6 +17,7 @@ pub mod skiplist;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub use skiplist::{InternalKey, SkipList, SkipListIterator, ValueType};
 
@@ -307,8 +308,9 @@ impl MemTable {
 /// via lock-free skip list traversal. The flush process iterates over
 /// all entries to produce an SSTable.
 pub struct ImmutableMemTable {
-    /// The frozen memtable.
-    inner: MemTable,
+    /// The frozen memtable (held in an Arc so freeze can succeed even
+    /// when concurrent readers still hold references to the old Arc).
+    inner: Arc<MemTable>,
     /// Whether this memtable has been flushed to disk.
     flushed: AtomicBool,
 }
@@ -316,6 +318,15 @@ pub struct ImmutableMemTable {
 impl ImmutableMemTable {
     /// Create an immutable memtable from a mutable one.
     pub fn from(memtable: MemTable) -> Self {
+        Self {
+            inner: Arc::new(memtable),
+            flushed: AtomicBool::new(false),
+        }
+    }
+
+    /// Create an immutable memtable directly from an `Arc<MemTable>`,
+    /// avoiding the need to unwrap or clone the inner data.
+    pub fn from_arc(memtable: Arc<MemTable>) -> Self {
         Self {
             inner: memtable,
             flushed: AtomicBool::new(false),

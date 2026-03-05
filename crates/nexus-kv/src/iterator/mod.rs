@@ -131,31 +131,27 @@ impl MergeIterator {
 
     /// Advance to the next unique user key, skipping duplicates.
     fn advance_to_next(&mut self) {
-        loop {
-            match self.heap.pop() {
-                None => {
-                    self.current = None;
-                    return;
-                }
-                Some(heap_entry) => {
-                    // Advance the source that produced this entry
-                    self.sources[heap_entry.source_idx].advance();
-                    if self.sources[heap_entry.source_idx].valid() {
-                        if let Some(next_entry) = self.sources[heap_entry.source_idx].current() {
-                            self.heap.push(HeapEntry {
-                                entry: next_entry,
-                                source_idx: heap_entry.source_idx,
-                            });
-                        }
+        match self.heap.pop() {
+            None => {
+                self.current = None;
+            }
+            Some(heap_entry) => {
+                // Advance the source that produced this entry
+                self.sources[heap_entry.source_idx].advance();
+                if self.sources[heap_entry.source_idx].valid() {
+                    if let Some(next_entry) = self.sources[heap_entry.source_idx].current() {
+                        self.heap.push(HeapEntry {
+                            entry: next_entry,
+                            source_idx: heap_entry.source_idx,
+                        });
                     }
-
-                    // Skip entries with the same user key from other sources
-                    // (they have lower priority / older data)
-                    self.skip_same_user_key(&heap_entry.entry.key.user_key);
-
-                    self.current = Some(heap_entry.entry);
-                    return;
                 }
+
+                // Skip entries with the same user key from other sources
+                // (they have lower priority / older data)
+                self.skip_same_user_key(&heap_entry.entry.key.user_key);
+
+                self.current = Some(heap_entry.entry);
             }
         }
     }
