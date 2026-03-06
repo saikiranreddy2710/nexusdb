@@ -329,7 +329,7 @@ impl Session {
         let db = &self.current_database;
 
         let decision = match statement {
-            // SELECT requires Select privilege
+            // SELECT / SET OPERATION requires Select privilege on all referenced tables
             Statement::Select(select) => {
                 let tables = Self::extract_table_names_from_statement(statement);
                 // Check all referenced tables; deny if any fails
@@ -352,6 +352,12 @@ impl Session {
                 } else {
                     nexus_security::AccessDecision::Allow
                 }
+            }
+            Statement::SetOperation { left, right, .. } => {
+                // Authorize both sides recursively
+                self.authorize_statement(left)?;
+                self.authorize_statement(right)?;
+                return Ok(());
             }
 
             // INSERT requires Insert privilege
@@ -471,6 +477,10 @@ impl Session {
             Statement::Select(select) => {
                 Self::collect_from_items(&select.from, &mut tables);
             }
+            Statement::SetOperation { left, right, .. } => {
+                tables.extend(Self::extract_table_names_from_statement(left));
+                tables.extend(Self::extract_table_names_from_statement(right));
+            }
             Statement::Insert(insert) => tables.push(insert.table.table.clone()),
             Statement::Update(update) => tables.push(update.table.table.clone()),
             Statement::Delete(delete) => tables.push(delete.table.table.clone()),
@@ -483,6 +493,7 @@ impl Session {
     fn statement_audit_action(statement: &Statement) -> AuditAction {
         match statement {
             Statement::Select(_)
+            | Statement::SetOperation { .. }
             | Statement::ShowTables
             | Statement::ShowDatabases
             | Statement::DescribeTable(_) => AuditAction::Query,
@@ -620,7 +631,9 @@ impl Session {
             }
 
             // Query - use plan cache
-            Statement::Select(_) => self.execute_query(statement, sql, start),
+            Statement::Select(_) | Statement::SetOperation { .. } => {
+                self.execute_query(statement, sql, start)
+            }
 
             // SHOW/DESCRIBE statements
             Statement::ShowTables => self.execute_show_tables(),
@@ -2434,5 +2447,325 @@ mod tests {
             .unwrap();
         let val = extract_single_value(result);
         assert_eq!(val, Value::BigInt(1));
+    }
+
+    // =========================================================================
+    // UNION / INTERSECT / EXCEPT end-to-end tests
+    // =========================================================================
+
+    /// Helper: collect all values from the first column, sorted for order-independent comparison.
+    fn collect_first_column_sorted(result: StatementResult) -> Vec<Value> {
+        if let StatementResult::Query(qr) = result {
+            let mut vals: Vec<Value> = qr
+                .rows()
+                .iter()
+                .map(|r| r.get(0).cloned().expect("row has no columns"))
+                .collect();
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            vals
+        } else {
+            panic!("expected Query result, got {:?}", result);
+        }
+    }
+
+    /// Helper: create two tables for set operation tests.
+    fn setup_set_op_tables(session: &mut Session) {
+        session
+            .execute("CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE t2 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        // t1: {1/Alice, 2/Bob, 3/Charlie}
+        session
+            .execute("INSERT INTO t1 VALUES (1, 'Alice')")
+            .unwrap();
+        session.execute("INSERT INTO t1 VALUES (2, 'Bob')").unwrap();
+        session
+            .execute("INSERT INTO t1 VALUES (3, 'Charlie')")
+            .unwrap();
+
+        // t2: {4/Bob, 5/Charlie, 6/Diana}
+        session.execute("INSERT INTO t2 VALUES (4, 'Bob')").unwrap();
+        session
+            .execute("INSERT INTO t2 VALUES (5, 'Charlie')")
+            .unwrap();
+        session
+            .execute("INSERT INTO t2 VALUES (6, 'Diana')")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_session_union_all() {
+        let mut session = create_session();
+        setup_set_op_tables(&mut session);
+
+        // UNION ALL: all rows from both sides (6 total)
+        let result = session
+            .execute("SELECT name FROM t1 UNION ALL SELECT name FROM t2")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 6, "UNION ALL should return all 6 rows");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_union_dedup() {
+        let mut session = create_session();
+        setup_set_op_tables(&mut session);
+
+        // UNION (without ALL): deduplicated. Bob+Charlie appear in both.
+        // Unique names: Alice, Bob, Charlie, Diana = 4
+        let result = session
+            .execute("SELECT name FROM t1 UNION SELECT name FROM t2")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(
+                qr.total_rows, 4,
+                "UNION should deduplicate to 4 unique names"
+            );
+            let names: Vec<String> = qr
+                .rows()
+                .iter()
+                .filter_map(|r| match r.get(0) {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(names.contains(&"Alice".to_string()));
+            assert!(names.contains(&"Bob".to_string()));
+            assert!(names.contains(&"Charlie".to_string()));
+            assert!(names.contains(&"Diana".to_string()));
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_intersect() {
+        let mut session = create_session();
+        setup_set_op_tables(&mut session);
+
+        // INTERSECT: names in both t1 AND t2 = {Bob, Charlie}
+        let result = session
+            .execute("SELECT name FROM t1 INTERSECT SELECT name FROM t2")
+            .unwrap();
+
+        let vals = collect_first_column_sorted(result);
+        assert_eq!(vals.len(), 2, "INTERSECT should return 2 rows");
+        assert_eq!(vals[0], Value::string("Bob"));
+        assert_eq!(vals[1], Value::string("Charlie"));
+    }
+
+    #[test]
+    fn test_session_except() {
+        let mut session = create_session();
+        setup_set_op_tables(&mut session);
+
+        // EXCEPT: names in t1 but NOT in t2 = {Alice}
+        let result = session
+            .execute("SELECT name FROM t1 EXCEPT SELECT name FROM t2")
+            .unwrap();
+
+        let vals = collect_first_column_sorted(result);
+        assert_eq!(vals.len(), 1, "EXCEPT should return 1 row");
+        assert_eq!(vals[0], Value::string("Alice"));
+    }
+
+    #[test]
+    fn test_session_except_reverse() {
+        let mut session = create_session();
+        setup_set_op_tables(&mut session);
+
+        // EXCEPT reversed: names in t2 but NOT in t1 = {Diana}
+        let result = session
+            .execute("SELECT name FROM t2 EXCEPT SELECT name FROM t1")
+            .unwrap();
+
+        let vals = collect_first_column_sorted(result);
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0], Value::string("Diana"));
+    }
+
+    #[test]
+    fn test_session_union_all_with_order_by_limit() {
+        let mut session = create_session();
+        setup_set_op_tables(&mut session);
+
+        // UNION ALL with ORDER BY and LIMIT
+        let result = session
+            .execute("SELECT name FROM t1 UNION ALL SELECT name FROM t2 ORDER BY name LIMIT 3")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 3, "LIMIT 3 should return 3 rows");
+            // Should be alphabetically first 3: Alice, Bob, Bob
+            let names: Vec<String> = qr
+                .rows()
+                .iter()
+                .filter_map(|r| match r.get(0) {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names[0], "Alice");
+            assert_eq!(names[1], "Bob");
+            assert_eq!(names[2], "Bob");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_intersect_all() {
+        let mut session = create_session();
+
+        // Setup tables with duplicates for INTERSECT ALL testing
+        session
+            .execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+
+        // a: val = {1, 1, 2, 3}  (via 4 rows)
+        session.execute("INSERT INTO a VALUES (1, 1)").unwrap();
+        session.execute("INSERT INTO a VALUES (2, 1)").unwrap();
+        session.execute("INSERT INTO a VALUES (3, 2)").unwrap();
+        session.execute("INSERT INTO a VALUES (4, 3)").unwrap();
+
+        // b: val = {1, 2, 2}  (via 3 rows)
+        session.execute("INSERT INTO b VALUES (1, 1)").unwrap();
+        session.execute("INSERT INTO b VALUES (2, 2)").unwrap();
+        session.execute("INSERT INTO b VALUES (3, 2)").unwrap();
+
+        // INTERSECT ALL: min(count_a, count_b) for each value
+        // val=1: min(2,1)=1, val=2: min(1,2)=1, val=3: min(1,0)=0
+        // Result: {1, 2} = 2 rows
+        let result = session
+            .execute("SELECT val FROM a INTERSECT ALL SELECT val FROM b")
+            .unwrap();
+
+        let vals = collect_first_column_sorted(result);
+        assert_eq!(vals.len(), 2, "INTERSECT ALL should return 2 rows");
+    }
+
+    #[test]
+    fn test_session_except_all() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+
+        // a: val = {1, 1, 2, 3}
+        session.execute("INSERT INTO a VALUES (1, 1)").unwrap();
+        session.execute("INSERT INTO a VALUES (2, 1)").unwrap();
+        session.execute("INSERT INTO a VALUES (3, 2)").unwrap();
+        session.execute("INSERT INTO a VALUES (4, 3)").unwrap();
+
+        // b: val = {1, 2}
+        session.execute("INSERT INTO b VALUES (1, 1)").unwrap();
+        session.execute("INSERT INTO b VALUES (2, 2)").unwrap();
+
+        // EXCEPT ALL: left_count - right_count for each value
+        // val=1: 2-1=1, val=2: 1-1=0, val=3: 1-0=1
+        // Result: {1, 3} = 2 rows
+        let result = session
+            .execute("SELECT val FROM a EXCEPT ALL SELECT val FROM b")
+            .unwrap();
+
+        let vals = collect_first_column_sorted(result);
+        assert_eq!(vals.len(), 2, "EXCEPT ALL should return 2 rows");
+    }
+
+    #[test]
+    fn test_session_union_empty_result() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE t2 (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+
+        // Both empty -> UNION returns 0 rows
+        let result = session
+            .execute("SELECT val FROM t1 UNION ALL SELECT val FROM t2")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 0);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_intersect_disjoint() {
+        let mut session = create_session();
+        setup_set_op_tables(&mut session);
+
+        // INTERSECT with disjoint id columns -> empty
+        let result = session
+            .execute("SELECT id FROM t1 INTERSECT SELECT id FROM t2")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(
+                qr.total_rows, 0,
+                "INTERSECT of disjoint sets should be empty"
+            );
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_except_identical() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+        // EXCEPT of identical queries -> empty
+        let result = session
+            .execute("SELECT val FROM t EXCEPT SELECT val FROM t")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 0, "EXCEPT of same set should be empty");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_union_multi_column() {
+        let mut session = create_session();
+        setup_set_op_tables(&mut session);
+
+        // UNION with multiple columns (id, name)
+        let result = session
+            .execute("SELECT id, name FROM t1 UNION ALL SELECT id, name FROM t2")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 6, "UNION ALL of 3+3 rows = 6");
+        } else {
+            panic!("expected Query result");
+        }
     }
 }

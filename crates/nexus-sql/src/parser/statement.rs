@@ -71,15 +71,28 @@ pub enum Statement {
     DropDatabase { name: String, if_exists: bool },
     /// USE database statement (switch current database).
     UseDatabase(String),
+    /// Set operation (UNION / INTERSECT / EXCEPT).
+    SetOperation {
+        /// Left side of the set operation.
+        left: Box<Statement>,
+        /// Right side of the set operation.
+        right: Box<Statement>,
+        /// The set operation type (UNION, UNION ALL, INTERSECT, etc.).
+        op: crate::logical::SetOpType,
+        /// ORDER BY applied to the combined result.
+        order_by: Vec<OrderByExpr>,
+        /// LIMIT applied to the combined result.
+        limit: Option<u64>,
+        /// OFFSET applied to the combined result.
+        offset: Option<u64>,
+    },
 }
 
 impl Statement {
     /// Converts from sqlparser's Statement.
     pub fn from_sql_ast(stmt: sql_ast::Statement) -> ParseResult<Self> {
         match stmt {
-            sql_ast::Statement::Query(query) => {
-                Ok(Statement::Select(SelectStatement::from_sql_ast(*query)?))
-            }
+            sql_ast::Statement::Query(query) => Self::convert_query(*query),
             sql_ast::Statement::Insert {
                 table_name,
                 columns,
@@ -245,11 +258,135 @@ impl Statement {
         }
     }
 
+    /// Converts a sqlparser `Query` into a `Statement`.
+    /// Handles both plain SELECTs and set operations (UNION/INTERSECT/EXCEPT).
+    fn convert_query(query: sql_ast::Query) -> ParseResult<Self> {
+        // Outer ORDER BY / LIMIT / OFFSET apply to the whole result
+        let order_by: ParseResult<Vec<_>> = query
+            .order_by
+            .iter()
+            .cloned()
+            .map(OrderByExpr::from_sql_ast)
+            .collect();
+        let order_by = order_by?;
+        let limit = query.limit.as_ref().and_then(|e| extract_limit(e));
+        let offset = query.offset.as_ref().and_then(|o| extract_limit(&o.value));
+
+        match *query.body {
+            sql_ast::SetExpr::Select(_) => {
+                // Plain SELECT — delegate to existing parser
+                Ok(Statement::Select(SelectStatement::from_sql_ast(query)?))
+            }
+            sql_ast::SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                let set_op = Self::convert_set_op_type(op, set_quantifier)?;
+
+                // Recursively convert both sides.
+                // Each side is a SetExpr which can be another SetOperation or a Select.
+                let left_stmt = Self::convert_set_expr(*left)?;
+                let right_stmt = Self::convert_set_expr(*right)?;
+
+                Ok(Statement::SetOperation {
+                    left: Box::new(left_stmt),
+                    right: Box::new(right_stmt),
+                    op: set_op,
+                    order_by,
+                    limit,
+                    offset,
+                })
+            }
+            _ => Err(ParseError::Unsupported(
+                "Non-SELECT set expression".to_string(),
+            )),
+        }
+    }
+
+    /// Converts a `SetExpr` into a `Statement` (recursive for nested set ops).
+    fn convert_set_expr(expr: sql_ast::SetExpr) -> ParseResult<Self> {
+        match expr {
+            sql_ast::SetExpr::Select(select) => {
+                // Wrap in a Query with no ORDER BY/LIMIT (those belong to the outer Query)
+                let query = sql_ast::Query {
+                    with: None,
+                    body: Box::new(sql_ast::SetExpr::Select(select)),
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                    fetch: None,
+                    locks: vec![],
+                    limit_by: vec![],
+                    for_clause: None,
+                };
+                Ok(Statement::Select(SelectStatement::from_sql_ast(query)?))
+            }
+            sql_ast::SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                let set_op = Self::convert_set_op_type(op, set_quantifier)?;
+                let left_stmt = Self::convert_set_expr(*left)?;
+                let right_stmt = Self::convert_set_expr(*right)?;
+
+                Ok(Statement::SetOperation {
+                    left: Box::new(left_stmt),
+                    right: Box::new(right_stmt),
+                    op: set_op,
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                })
+            }
+            sql_ast::SetExpr::Query(sub_query) => Self::convert_query(*sub_query),
+            _ => Err(ParseError::Unsupported(
+                "Unsupported set expression type".to_string(),
+            )),
+        }
+    }
+
+    /// Maps sqlparser's SetOperator + SetQuantifier to our SetOpType.
+    fn convert_set_op_type(
+        op: sql_ast::SetOperator,
+        quantifier: sql_ast::SetQuantifier,
+    ) -> ParseResult<crate::logical::SetOpType> {
+        use crate::logical::SetOpType;
+        let is_all = matches!(quantifier, sql_ast::SetQuantifier::All);
+        match op {
+            sql_ast::SetOperator::Union => {
+                if is_all {
+                    Ok(SetOpType::UnionAll)
+                } else {
+                    Ok(SetOpType::Union)
+                }
+            }
+            sql_ast::SetOperator::Intersect => {
+                if is_all {
+                    Ok(SetOpType::IntersectAll)
+                } else {
+                    Ok(SetOpType::Intersect)
+                }
+            }
+            sql_ast::SetOperator::Except => {
+                if is_all {
+                    Ok(SetOpType::ExceptAll)
+                } else {
+                    Ok(SetOpType::Except)
+                }
+            }
+        }
+    }
+
     /// Returns true if this is a read-only statement.
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
             Statement::Select(_)
+                | Statement::SetOperation { .. }
                 | Statement::Explain { .. }
                 | Statement::ExplainAnalyze { .. }
                 | Statement::ShowTables

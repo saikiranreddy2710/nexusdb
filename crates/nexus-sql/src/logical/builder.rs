@@ -172,6 +172,14 @@ fn build_statement(stmt: &Statement, ctx: &mut PlanContext) -> PlanResult<Arc<Lo
         Statement::Insert(insert) => build_insert(insert, ctx),
         Statement::Update(update) => build_update(update, ctx),
         Statement::Delete(delete) => build_delete(delete, ctx),
+        Statement::SetOperation {
+            left,
+            right,
+            op,
+            order_by,
+            limit,
+            offset,
+        } => build_set_operation(left, right, *op, order_by, *limit, *offset, ctx),
         Statement::Explain {
             statement: inner, ..
         } => build_statement(inner, ctx),
@@ -183,6 +191,67 @@ fn build_statement(stmt: &Statement, ctx: &mut PlanContext) -> PlanResult<Arc<Lo
             std::mem::discriminant(stmt)
         ))),
     }
+}
+
+/// Builds a logical plan for a set operation (UNION / INTERSECT / EXCEPT).
+fn build_set_operation(
+    left: &Statement,
+    right: &Statement,
+    op: SetOpType,
+    order_by: &[AstOrderBy],
+    limit: Option<u64>,
+    offset: Option<u64>,
+    ctx: &mut PlanContext,
+) -> PlanResult<Arc<LogicalOperator>> {
+    // Recursively build both sides
+    let left_plan = build_statement(left, ctx)?;
+    let right_plan = build_statement(right, ctx)?;
+
+    // Validate schema compatibility: same number of columns
+    let left_schema = left_plan.schema();
+    let right_schema = right_plan.schema();
+
+    if left_schema.fields().len() != right_schema.fields().len() {
+        return Err(PlanError::TypeError(format!(
+            "Set operation requires equal column counts: left has {}, right has {}",
+            left_schema.fields().len(),
+            right_schema.fields().len()
+        )));
+    }
+
+    // Build set operation node (schema comes from left side, per SQL standard)
+    let mut plan: Arc<LogicalOperator> =
+        Arc::new(LogicalOperator::SetOperation(SetOperationOperator {
+            left: left_plan,
+            right: right_plan,
+            op,
+        }));
+
+    // Apply ORDER BY if present
+    if !order_by.is_empty() {
+        let schema = plan.schema();
+        let sort_exprs: PlanResult<Vec<_>> = order_by
+            .iter()
+            .map(|o| build_order_by(o, &schema))
+            .collect();
+
+        plan = Arc::new(LogicalOperator::Sort(SortOperator {
+            input: plan,
+            order_by: sort_exprs?,
+            fetch: None,
+        }));
+    }
+
+    // Apply LIMIT/OFFSET if present
+    if limit.is_some() || offset.is_some() {
+        plan = Arc::new(LogicalOperator::Limit(LimitOperator {
+            input: plan,
+            fetch: limit.map(|l| l as usize),
+            offset: offset.unwrap_or(0) as usize,
+        }));
+    }
+
+    Ok(plan)
 }
 
 fn build_select(

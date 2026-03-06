@@ -438,18 +438,31 @@ impl QueryResult {
 }
 
 /// Set operation executor.
+///
+/// Implements all six set operation modes:
+/// - **UNION ALL**: concatenate both sides (no dedup)
+/// - **UNION**: concatenate + remove duplicate rows
+/// - **INTERSECT**: emit rows that appear in both sides
+/// - **INTERSECT ALL**: emit rows with min(left_count, right_count) copies
+/// - **EXCEPT**: emit left rows not in right side
+/// - **EXCEPT ALL**: emit left rows minus right occurrences
+///
+/// For non-ALL variants, we materialize both sides and use hash-based
+/// deduplication. For UNION ALL, we stream directly.
 #[derive(Debug)]
 struct SetOperationExec {
     left: Box<dyn Operator>,
     right: Box<dyn Operator>,
-    #[allow(dead_code)]
     op: crate::logical::SetOpType,
     schema: Arc<Schema>,
-    state: SetOpState,
+    /// Materialized result rows (for non-UNION ALL modes).
+    result: Option<std::vec::IntoIter<super::Row>>,
+    /// Streaming state for UNION ALL.
+    stream_state: SetOpStreamState,
 }
 
 #[derive(Debug)]
-enum SetOpState {
+enum SetOpStreamState {
     Left,
     Right,
     Done,
@@ -467,7 +480,117 @@ impl SetOperationExec {
             right,
             op,
             schema,
-            state: SetOpState::Left,
+            result: None,
+            stream_state: SetOpStreamState::Left,
+        }
+    }
+
+    /// Collects all rows from an operator into a Vec.
+    fn collect_all(op: &mut dyn Operator) -> Result<Vec<super::Row>, ExecutionError> {
+        let mut rows = Vec::new();
+        while let Some(batch) = op.next_batch()? {
+            rows.extend(batch.rows());
+        }
+        Ok(rows)
+    }
+
+    /// Materializes and computes the set operation result.
+    fn materialize(&mut self) -> Result<Vec<super::Row>, ExecutionError> {
+        use crate::logical::SetOpType;
+        use std::collections::HashMap;
+
+        let left_rows = Self::collect_all(&mut *self.left)?;
+        let right_rows = Self::collect_all(&mut *self.right)?;
+
+        match self.op {
+            SetOpType::Union => {
+                // Concatenate + deduplicate
+                let mut seen = std::collections::HashSet::new();
+                let mut result = Vec::new();
+                for row in left_rows.into_iter().chain(right_rows) {
+                    let values: Vec<Value> = row.iter().cloned().collect();
+                    if seen.insert(values) {
+                        result.push(row);
+                    }
+                }
+                Ok(result)
+            }
+            SetOpType::UnionAll => {
+                // Should use streaming path, not materialization
+                unreachable!("UNION ALL uses streaming path")
+            }
+            SetOpType::Intersect => {
+                // Rows in left that also appear in right (deduplicated)
+                let right_set: std::collections::HashSet<Vec<Value>> = right_rows
+                    .iter()
+                    .map(|r| r.iter().cloned().collect())
+                    .collect();
+                let mut seen = std::collections::HashSet::new();
+                let mut result = Vec::new();
+                for row in left_rows {
+                    let values: Vec<Value> = row.iter().cloned().collect();
+                    if right_set.contains(&values) && seen.insert(values) {
+                        result.push(row);
+                    }
+                }
+                Ok(result)
+            }
+            SetOpType::IntersectAll => {
+                // min(left_count, right_count) for each distinct row
+                let mut right_counts: HashMap<Vec<Value>, usize> = HashMap::new();
+                for row in &right_rows {
+                    let values: Vec<Value> = row.iter().cloned().collect();
+                    *right_counts.entry(values).or_insert(0) += 1;
+                }
+                let mut result = Vec::new();
+                for row in left_rows {
+                    let values: Vec<Value> = row.iter().cloned().collect();
+                    if let Some(count) = right_counts.get_mut(&values) {
+                        if *count > 0 {
+                            *count -= 1;
+                            result.push(row);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+            SetOpType::Except => {
+                // Rows in left that do NOT appear in right (deduplicated)
+                let right_set: std::collections::HashSet<Vec<Value>> = right_rows
+                    .iter()
+                    .map(|r| r.iter().cloned().collect())
+                    .collect();
+                let mut seen = std::collections::HashSet::new();
+                let mut result = Vec::new();
+                for row in left_rows {
+                    let values: Vec<Value> = row.iter().cloned().collect();
+                    if !right_set.contains(&values) && seen.insert(values) {
+                        result.push(row);
+                    }
+                }
+                Ok(result)
+            }
+            SetOpType::ExceptAll => {
+                // left_count - right_count for each distinct row (clamped to 0)
+                let mut right_counts: HashMap<Vec<Value>, usize> = HashMap::new();
+                for row in &right_rows {
+                    let values: Vec<Value> = row.iter().cloned().collect();
+                    *right_counts.entry(values).or_insert(0) += 1;
+                }
+                let mut result = Vec::new();
+                for row in left_rows {
+                    let values: Vec<Value> = row.iter().cloned().collect();
+                    let right_count = right_counts.get_mut(&values);
+                    if let Some(count) = right_count {
+                        if *count > 0 {
+                            *count -= 1;
+                            continue; // Skip this row (consumed by right side)
+                        }
+                    }
+                    result.push(row);
+                }
+                Ok(result)
+            }
         }
     }
 }
@@ -478,31 +601,55 @@ impl Operator for SetOperationExec {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecutionError> {
-        loop {
-            match self.state {
-                SetOpState::Left => {
-                    if let Some(batch) = self.left.next_batch()? {
-                        return Ok(Some(batch));
+        use crate::logical::SetOpType;
+
+        // UNION ALL: streaming mode (no materialization needed)
+        if matches!(self.op, SetOpType::UnionAll) {
+            loop {
+                match self.stream_state {
+                    SetOpStreamState::Left => {
+                        if let Some(batch) = self.left.next_batch()? {
+                            return Ok(Some(batch));
+                        }
+                        self.stream_state = SetOpStreamState::Right;
                     }
-                    self.state = SetOpState::Right;
-                }
-                SetOpState::Right => {
-                    if let Some(batch) = self.right.next_batch()? {
-                        return Ok(Some(batch));
+                    SetOpStreamState::Right => {
+                        if let Some(batch) = self.right.next_batch()? {
+                            return Ok(Some(batch));
+                        }
+                        self.stream_state = SetOpStreamState::Done;
                     }
-                    self.state = SetOpState::Done;
-                }
-                SetOpState::Done => {
-                    return Ok(None);
+                    SetOpStreamState::Done => {
+                        return Ok(None);
+                    }
                 }
             }
+        }
+
+        // All other modes: materialize on first call, then iterate
+        if self.result.is_none() {
+            let rows = self.materialize()?;
+            self.result = Some(rows.into_iter());
+        }
+
+        let iter = self.result.as_mut().unwrap();
+        let batch_size = 1024;
+        let rows: Vec<super::Row> = iter.take(batch_size).collect();
+
+        if rows.is_empty() {
+            Ok(None)
+        } else {
+            let batch = RecordBatch::from_rows(self.schema.clone(), &rows)
+                .map_err(ExecutionError::Internal)?;
+            Ok(Some(batch))
         }
     }
 
     fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
-        self.state = SetOpState::Left;
+        self.result = None;
+        self.stream_state = SetOpStreamState::Left;
     }
 
     fn children(&self) -> Vec<&dyn Operator> {
