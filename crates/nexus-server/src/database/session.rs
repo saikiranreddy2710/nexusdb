@@ -2193,4 +2193,246 @@ mod tests {
             panic!("expected Query result");
         }
     }
+
+    // =========================================================================
+    // DISTINCT aggregate end-to-end tests
+    // =========================================================================
+
+    /// Helper: extract the first column value from a single-row query result.
+    fn extract_single_value(result: StatementResult) -> Value {
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1, "expected 1 row, got {}", qr.total_rows);
+            qr.rows()[0].get(0).cloned().expect("row has no columns")
+        } else {
+            panic!("expected Query result, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_session_count_distinct_basic() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE items (id INT PRIMARY KEY, category TEXT, price INT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (1, 'A', 10)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (2, 'B', 20)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (3, 'A', 30)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (4, 'C', 10)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (5, 'A', 20)")
+            .unwrap();
+
+        // COUNT(DISTINCT category) should be 3 (A, B, C)
+        let result = session
+            .execute("SELECT COUNT(DISTINCT category) FROM items")
+            .unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::BigInt(3), "expected 3 distinct categories");
+
+        // COUNT(category) without DISTINCT should be 5
+        let result = session
+            .execute("SELECT COUNT(category) FROM items")
+            .unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::BigInt(5), "expected 5 total categories");
+    }
+
+    #[test]
+    fn test_session_count_distinct_with_nulls() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        session.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 'y')").unwrap();
+        session.execute("INSERT INTO t VALUES (4, NULL)").unwrap();
+        session.execute("INSERT INTO t VALUES (5, 'x')").unwrap();
+
+        // COUNT(DISTINCT val) should be 2 (x, y) — NULLs excluded
+        let result = session
+            .execute("SELECT COUNT(DISTINCT val) FROM t")
+            .unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::BigInt(2));
+    }
+
+    #[test]
+    fn test_session_sum_distinct() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE nums (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO nums VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO nums VALUES (2, 20)").unwrap();
+        session.execute("INSERT INTO nums VALUES (3, 10)").unwrap();
+        session.execute("INSERT INTO nums VALUES (4, 30)").unwrap();
+        session.execute("INSERT INTO nums VALUES (5, 20)").unwrap();
+
+        // SUM(DISTINCT val) = 10 + 20 + 30 = 60
+        let result = session
+            .execute("SELECT SUM(DISTINCT val) FROM nums")
+            .unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::Double(60.0));
+
+        // SUM(val) without DISTINCT = 10 + 20 + 10 + 30 + 20 = 90
+        let result = session.execute("SELECT SUM(val) FROM nums").unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::Double(90.0));
+    }
+
+    #[test]
+    fn test_session_avg_distinct() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE nums (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO nums VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO nums VALUES (2, 20)").unwrap();
+        session.execute("INSERT INTO nums VALUES (3, 10)").unwrap();
+
+        // AVG(DISTINCT val) = (10 + 20) / 2 = 15
+        let result = session
+            .execute("SELECT AVG(DISTINCT val) FROM nums")
+            .unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::Double(15.0));
+
+        // AVG(val) = (10 + 20 + 10) / 3 = 13.333...
+        let result = session.execute("SELECT AVG(val) FROM nums").unwrap();
+        if let Value::Double(d) = extract_single_value(result) {
+            assert!((d - 13.333333).abs() < 0.001);
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn test_session_count_distinct_with_group_by() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE orders (id INT PRIMARY KEY, dept TEXT, product TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO orders VALUES (1, 'Sales', 'Widget')")
+            .unwrap();
+        session
+            .execute("INSERT INTO orders VALUES (2, 'Sales', 'Gadget')")
+            .unwrap();
+        session
+            .execute("INSERT INTO orders VALUES (3, 'Sales', 'Widget')")
+            .unwrap();
+        session
+            .execute("INSERT INTO orders VALUES (4, 'Eng', 'Widget')")
+            .unwrap();
+        session
+            .execute("INSERT INTO orders VALUES (5, 'Eng', 'Widget')")
+            .unwrap();
+
+        // GROUP BY dept: Sales has 2 distinct products, Eng has 1
+        let result = session
+            .execute("SELECT dept, COUNT(DISTINCT product) FROM orders GROUP BY dept")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2);
+            // Collect into a map for order-independent assertion
+            let mut counts = std::collections::HashMap::new();
+            for row in qr.rows() {
+                let dept = match row.get(0) {
+                    Some(Value::String(s)) => s.clone(),
+                    other => panic!("unexpected dept value: {:?}", other),
+                };
+                let count = match row.get(1) {
+                    Some(Value::BigInt(n)) => *n,
+                    other => panic!("unexpected count value: {:?}", other),
+                };
+                counts.insert(dept, count);
+            }
+            assert_eq!(counts["Sales"], 2, "Sales should have 2 distinct products");
+            assert_eq!(counts["Eng"], 1, "Eng should have 1 distinct product");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_mixed_distinct_and_non_distinct() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 20)").unwrap();
+
+        // Mix COUNT(DISTINCT val) with COUNT(val) in same query
+        let result = session
+            .execute("SELECT COUNT(DISTINCT val), COUNT(val) FROM t")
+            .unwrap();
+
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1);
+            let row = &qr.rows()[0];
+            let distinct_count = row.get(0).cloned().unwrap();
+            let total_count = row.get(1).cloned().unwrap();
+            assert_eq!(
+                distinct_count,
+                Value::BigInt(2),
+                "COUNT(DISTINCT val) should be 2"
+            );
+            assert_eq!(total_count, Value::BigInt(3), "COUNT(val) should be 3");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_count_distinct_empty_table() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE empty (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+
+        let result = session
+            .execute("SELECT COUNT(DISTINCT val) FROM empty")
+            .unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::BigInt(0), "COUNT(DISTINCT) on empty table = 0");
+    }
+
+    #[test]
+    fn test_session_count_distinct_single_value() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 42)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 42)").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 42)").unwrap();
+
+        // All same value -> COUNT(DISTINCT) = 1
+        let result = session
+            .execute("SELECT COUNT(DISTINCT val) FROM t")
+            .unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::BigInt(1));
+    }
 }

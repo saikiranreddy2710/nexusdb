@@ -710,13 +710,17 @@ fn simple_like_match(value: &str, pattern: &str) -> bool {
 }
 
 /// Accumulator for aggregate functions.
+///
+/// When DISTINCT mode is active, a `HashSet<Value>` tracks already-seen values
+/// so that duplicates are skipped before accumulation. This correctly implements
+/// `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, `AVG(DISTINCT x)`, etc.
 #[derive(Debug, Clone)]
 pub struct Accumulator {
     /// The aggregate function.
     func: AggregateFunc,
-    /// Whether DISTINCT.
-    #[allow(dead_code)]
-    distinct: bool,
+    /// Set of already-seen values for DISTINCT deduplication.
+    /// `Some(set)` when DISTINCT mode is active, `None` otherwise.
+    seen: Option<std::collections::HashSet<Value>>,
     /// Accumulated state.
     state: AccumulatorState,
 }
@@ -765,9 +769,19 @@ impl Accumulator {
             },
         };
 
+        // DISTINCT deduplication is meaningful for Count, Sum, Avg,
+        // StringAgg, and ArrayAgg. For Min/Max it's a no-op (same result),
+        // and for CountStar it can't appear syntactically, but we support
+        // all of them uniformly for correctness.
+        let seen = if agg.distinct && !matches!(agg.func, AggregateFunc::CountStar) {
+            Some(std::collections::HashSet::new())
+        } else {
+            None
+        };
+
         Self {
             func: agg.func,
-            distinct: agg.distinct,
+            seen,
             state,
         }
     }
@@ -776,6 +790,13 @@ impl Accumulator {
     pub fn accumulate(&mut self, value: &Value) {
         if value.is_null() && !matches!(self.func, AggregateFunc::CountStar) {
             return; // Skip NULL values for most aggregates
+        }
+
+        // DISTINCT: skip values we've already seen.
+        if let Some(ref mut seen) = self.seen {
+            if !seen.insert(value.clone()) {
+                return; // Duplicate value — skip
+            }
         }
 
         match &mut self.state {
@@ -859,6 +880,11 @@ impl Accumulator {
 
     /// Resets the accumulator.
     pub fn reset(&mut self) {
+        // Clear DISTINCT tracking set if present.
+        if let Some(ref mut seen) = self.seen {
+            seen.clear();
+        }
+
         match &mut self.state {
             AccumulatorState::Count(count) => *count = 0,
             AccumulatorState::Sum(sum) => *sum = None,
@@ -1117,6 +1143,170 @@ mod tests {
         acc.accumulate(&Value::int(20));
 
         assert_eq!(acc.result(), Value::Int(30));
+    }
+
+    // =========================================================================
+    // DISTINCT aggregate tests
+    // =========================================================================
+
+    #[test]
+    fn test_accumulator_count_distinct() {
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Count, vec![], true, "count_distinct");
+        let mut acc = Accumulator::new(&agg);
+
+        // Feed duplicates: 1, 2, 1, 3, 2, 1
+        acc.accumulate(&Value::int(1));
+        acc.accumulate(&Value::int(2));
+        acc.accumulate(&Value::int(1)); // dup
+        acc.accumulate(&Value::int(3));
+        acc.accumulate(&Value::int(2)); // dup
+        acc.accumulate(&Value::int(1)); // dup
+
+        // Only 3 distinct values: {1, 2, 3}
+        assert_eq!(acc.result(), Value::BigInt(3));
+    }
+
+    #[test]
+    fn test_accumulator_count_distinct_nulls() {
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Count, vec![], true, "count_distinct");
+        let mut acc = Accumulator::new(&agg);
+
+        // NULLs are skipped before the DISTINCT check
+        acc.accumulate(&Value::int(1));
+        acc.accumulate(&Value::Null);
+        acc.accumulate(&Value::int(1)); // dup
+        acc.accumulate(&Value::Null);
+        acc.accumulate(&Value::int(2));
+
+        // Only 2 distinct non-null values: {1, 2}
+        assert_eq!(acc.result(), Value::BigInt(2));
+    }
+
+    #[test]
+    fn test_accumulator_count_distinct_all_nulls() {
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Count, vec![], true, "count_distinct");
+        let mut acc = Accumulator::new(&agg);
+
+        acc.accumulate(&Value::Null);
+        acc.accumulate(&Value::Null);
+
+        assert_eq!(acc.result(), Value::BigInt(0));
+    }
+
+    #[test]
+    fn test_accumulator_count_distinct_empty() {
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Count, vec![], true, "count_distinct");
+        let acc = Accumulator::new(&agg);
+
+        assert_eq!(acc.result(), Value::BigInt(0));
+    }
+
+    #[test]
+    fn test_accumulator_count_distinct_strings() {
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Count, vec![], true, "count_distinct");
+        let mut acc = Accumulator::new(&agg);
+
+        acc.accumulate(&Value::string("alice"));
+        acc.accumulate(&Value::string("bob"));
+        acc.accumulate(&Value::string("alice")); // dup
+        acc.accumulate(&Value::string("charlie"));
+        acc.accumulate(&Value::string("bob")); // dup
+
+        assert_eq!(acc.result(), Value::BigInt(3));
+    }
+
+    #[test]
+    fn test_accumulator_sum_distinct() {
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Sum, vec![], true, "sum_distinct");
+        let mut acc = Accumulator::new(&agg);
+
+        // Values: 10, 20, 10, 30, 20 -> distinct: {10, 20, 30} -> sum = 60
+        acc.accumulate(&Value::int(10));
+        acc.accumulate(&Value::int(20));
+        acc.accumulate(&Value::int(10)); // dup
+        acc.accumulate(&Value::int(30));
+        acc.accumulate(&Value::int(20)); // dup
+
+        assert_eq!(acc.result(), Value::Double(60.0));
+    }
+
+    #[test]
+    fn test_accumulator_sum_non_distinct() {
+        // Verify non-distinct still sums all values (including duplicates)
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Sum, vec![], false, "sum");
+        let mut acc = Accumulator::new(&agg);
+
+        acc.accumulate(&Value::int(10));
+        acc.accumulate(&Value::int(20));
+        acc.accumulate(&Value::int(10)); // included
+        acc.accumulate(&Value::int(30));
+        acc.accumulate(&Value::int(20)); // included
+
+        assert_eq!(acc.result(), Value::Double(90.0));
+    }
+
+    #[test]
+    fn test_accumulator_avg_distinct() {
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Avg, vec![], true, "avg_distinct");
+        let mut acc = Accumulator::new(&agg);
+
+        // Values: 10, 20, 10, 30, 20 -> distinct: {10, 20, 30} -> avg = 20
+        acc.accumulate(&Value::int(10));
+        acc.accumulate(&Value::int(20));
+        acc.accumulate(&Value::int(10)); // dup
+        acc.accumulate(&Value::int(30));
+        acc.accumulate(&Value::int(20)); // dup
+
+        assert_eq!(acc.result(), Value::Double(20.0));
+    }
+
+    #[test]
+    fn test_accumulator_string_agg_distinct() {
+        let agg =
+            PhysicalAggregateExpr::new(AggregateFunc::StringAgg, vec![], true, "string_agg_dist");
+        let mut acc = Accumulator::new(&agg);
+
+        acc.accumulate(&Value::string("a"));
+        acc.accumulate(&Value::string("b"));
+        acc.accumulate(&Value::string("a")); // dup
+        acc.accumulate(&Value::string("c"));
+
+        let result = acc.result();
+        if let Value::String(s) = result {
+            // Exactly 3 distinct values in insertion order
+            assert_eq!(s, "a,b,c");
+        } else {
+            panic!("expected String, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_accumulator_distinct_reset() {
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::Count, vec![], true, "count_distinct");
+        let mut acc = Accumulator::new(&agg);
+
+        acc.accumulate(&Value::int(1));
+        acc.accumulate(&Value::int(1));
+        assert_eq!(acc.result(), Value::BigInt(1));
+
+        // After reset, the seen set is cleared
+        acc.reset();
+        acc.accumulate(&Value::int(1)); // should count again
+        acc.accumulate(&Value::int(2));
+        assert_eq!(acc.result(), Value::BigInt(2));
+    }
+
+    #[test]
+    fn test_accumulator_count_star_ignores_distinct() {
+        // COUNT(*) should never use DISTINCT tracking (it counts rows, not values)
+        let agg = PhysicalAggregateExpr::new(AggregateFunc::CountStar, vec![], true, "count_star");
+        let acc = Accumulator::new(&agg);
+
+        // Verify no seen set was allocated (distinct is meaningless for COUNT(*))
+        assert!(
+            acc.seen.is_none(),
+            "COUNT(*) should not allocate distinct tracking"
+        );
     }
 
     // =========================================================================

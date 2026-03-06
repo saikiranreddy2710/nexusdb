@@ -643,13 +643,22 @@ impl LogicalExpr {
             LogicalExpr::BinaryOp { left, op, right } => {
                 format!("{} {} {}", left.output_name(), op, right.output_name())
             }
-            LogicalExpr::AggregateFunction { name, args, .. } => {
+            LogicalExpr::AggregateFunction {
+                name,
+                args,
+                distinct,
+                ..
+            } => {
                 // CountStar is displayed as "COUNT(*)" already, no need to add args
                 if matches!(name, AggregateFunc::CountStar) {
                     "COUNT(*)".to_string()
                 } else {
                     let args_str: Vec<_> = args.iter().map(|a| a.output_name()).collect();
-                    format!("{}({})", name, args_str.join(", "))
+                    if *distinct {
+                        format!("{}(DISTINCT {})", name, args_str.join(", "))
+                    } else {
+                        format!("{}({})", name, args_str.join(", "))
+                    }
                 }
             }
             LogicalExpr::ScalarFunction { name, args, .. } => {
