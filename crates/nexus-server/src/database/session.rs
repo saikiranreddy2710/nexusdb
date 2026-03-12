@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use nexus_cache::plan_cache::{PlanCache, PlanCacheConfig};
 use nexus_cache::result_cache::{ResultCache, ResultCacheConfig, ResultCacheKey};
 use nexus_common::types::TxnId;
+use nexus_common::types::PageId;
 use nexus_mvcc::IsolationLevel;
+use nexus_wal::{InsertPayload, UpdatePayload, DeletePayload};
 use nexus_security::audit::{AuditAction, AuditLog};
 use nexus_security::authn::Identity;
 use nexus_security::authz::{Authorizer, Privilege};
@@ -259,17 +261,29 @@ impl Session {
 
     /// Commits the current transaction.
     pub fn commit(&mut self) -> DatabaseResult<()> {
-        if self.current_txn.is_none() {
-            return Err(DatabaseError::TransactionError(
-                "no transaction in progress".to_string(),
-            ));
+        let txn_id = self.current_txn.ok_or_else(|| {
+            DatabaseError::TransactionError("no transaction in progress".to_string())
+        })?;
+
+        // Log commit to WAL for durability
+        if let Some(wal) = self.database.wal() {
+            wal.log_commit(txn_id, 0).map_err(|e| {
+                DatabaseError::Internal(format!("WAL commit failed: {}", e))
+            })?;
         }
 
-        // For now, just clear the transaction state
-        // In the future, this will call TransactionManager::commit()
+        // Flush table data to disk
+        if self.database.config().data_dir.is_some() {
+            let storage = self.storage();
+            for table_name in storage.list_tables() {
+                if let Some(table_store) = storage.get_table(&table_name) {
+                    let _ = table_store.flush();
+                }
+            }
+        }
+
         self.current_txn = None;
         self.state = SessionState::Idle;
-
         Ok(())
     }
 
@@ -280,17 +294,39 @@ impl Session {
             return Ok(());
         }
 
-        // For now, just clear the transaction state
-        // In the future, this will call TransactionManager::abort()
+        // Log abort to WAL
+        if let Some(wal) = self.database.wal() {
+            if let Some(txn_id) = self.current_txn {
+                let _ = wal.log_abort(txn_id);
+            }
+        }
+
         self.current_txn = None;
         self.state = SessionState::Idle;
-
         Ok(())
     }
 
     // =========================================================================
     // SQL Execution
     // =========================================================================
+
+    /// Builds a WAL key by prefixing the encoded key with the table name (separated by null byte).
+    /// Format: `table_name\0encoded_key`
+    fn wal_key(table_name: &str, encoded_key: Vec<u8>) -> bytes::Bytes {
+        let mut buf = Vec::with_capacity(table_name.len() + 1 + encoded_key.len());
+        buf.extend_from_slice(table_name.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&encoded_key);
+        bytes::Bytes::from(buf)
+    }
+
+    /// Parses a WAL key back into (table_name, encoded_key).
+    pub fn parse_wal_key(key: &[u8]) -> Option<(&str, &[u8])> {
+        let sep = key.iter().position(|&b| b == 0)?;
+        let table_name = std::str::from_utf8(&key[..sep]).ok()?;
+        let encoded_key = &key[sep + 1..];
+        Some((table_name, encoded_key))
+    }
 
     /// Executes a SQL statement.
     pub fn execute(&mut self, sql: &str) -> DatabaseResult<StatementResult> {
@@ -1018,6 +1054,28 @@ impl Session {
 
         let count = self.storage().execute_insert(table_name, rows.clone())?;
 
+        // WAL logging for durability
+        if let Some(wal) = self.database.wal() {
+            let txn_id = self.current_txn.unwrap_or_else(|| TxnId::new(self.statement_count));
+            if let Some(table_store) = self.storage().get_table(table_name) {
+                for row in &rows {
+                    if let Ok((key_bytes, value_bytes)) = table_store.encode_row(row) {
+                        let payload = InsertPayload {
+                            page_id: PageId::new(0),
+                            slot_id: 0,
+                            key: Self::wal_key(table_name, key_bytes),
+                            value: bytes::Bytes::from(value_bytes),
+                        };
+                        let _ = wal.log_insert(txn_id, payload);
+                    }
+                }
+                // Auto-commit WAL for non-transactional inserts
+                if !self.in_transaction() {
+                    let _ = wal.log_commit(txn_id, 0);
+                }
+            }
+        }
+
         // Populate any HNSW vector indexes for this table
         let vim = self.database.vector_index_manager();
         let vector_keys = vim.list_table_indexes(&self.current_database, table_name);
@@ -1101,8 +1159,35 @@ impl Session {
             }
 
             // Update the row
-            if self.storage().execute_update(table_name, new_row)? {
+            if self.storage().execute_update(table_name, new_row.clone())? {
                 updated_count += 1;
+
+                // WAL logging for durability
+                if let Some(wal) = self.database.wal() {
+                    let txn_id = self.current_txn.unwrap_or_else(|| TxnId::new(self.statement_count));
+                    if let Some(table_store) = self.storage().get_table(table_name) {
+                        if let (Ok((old_key, old_val)), Ok((_new_key, new_val))) =
+                            (table_store.encode_row(&row), table_store.encode_row(&new_row))
+                        {
+                            let payload = UpdatePayload {
+                                page_id: PageId::new(0),
+                                slot_id: 0,
+                                key: Self::wal_key(table_name, old_key),
+                                old_value: bytes::Bytes::from(old_val),
+                                new_value: bytes::Bytes::from(new_val),
+                            };
+                            let _ = wal.log_update(txn_id, payload);
+                        }
+                    }
+                }
+            }
+        }
+
+        // WAL auto-commit for non-transactional updates
+        if updated_count > 0 && !self.in_transaction() {
+            if let Some(wal) = self.database.wal() {
+                let txn_id = TxnId::new(self.statement_count);
+                let _ = wal.log_commit(txn_id, 0);
             }
         }
 
@@ -1150,6 +1235,30 @@ impl Session {
 
             if self.storage().execute_delete(table_name, &key_values)? {
                 deleted_count += 1;
+
+                // WAL logging for durability
+                if let Some(wal) = self.database.wal() {
+                    let txn_id = self.current_txn.unwrap_or_else(|| TxnId::new(self.statement_count));
+                    if let Some(table_store) = self.storage().get_table(table_name) {
+                        if let Ok((key_bytes, value_bytes)) = table_store.encode_row(&row) {
+                            let payload = DeletePayload {
+                                page_id: PageId::new(0),
+                                slot_id: 0,
+                                key: Self::wal_key(table_name, key_bytes),
+                                value: bytes::Bytes::from(value_bytes),
+                            };
+                            let _ = wal.log_delete(txn_id, payload);
+                        }
+                    }
+                }
+            }
+        }
+
+        // WAL auto-commit for non-transactional deletes
+        if deleted_count > 0 && !self.in_transaction() {
+            if let Some(wal) = self.database.wal() {
+                let txn_id = TxnId::new(self.statement_count);
+                let _ = wal.log_commit(txn_id, 0);
             }
         }
 

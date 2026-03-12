@@ -74,6 +74,10 @@ pub struct ServerConfig {
     /// Raft peer addresses.
     #[serde(default)]
     pub raft_peers: Vec<String>,
+
+    /// Whether authentication is enabled (default: true).
+    #[serde(default = "default_auth_enabled")]
+    pub auth_enabled: bool,
 }
 
 fn default_host() -> String {
@@ -104,6 +108,10 @@ fn default_node_id() -> u64 {
     1
 }
 
+fn default_auth_enabled() -> bool {
+    true
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -123,6 +131,7 @@ impl Default for ServerConfig {
             enable_raft: false,
             node_id: default_node_id(),
             raft_peers: Vec::new(),
+            auth_enabled: default_auth_enabled(),
         }
     }
 }

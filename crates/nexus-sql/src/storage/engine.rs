@@ -4,7 +4,10 @@
 //! It manages the table catalog and provides query execution methods.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+use serde::{Deserialize, Serialize};
 
 use crate::executor::{RecordBatch, Row, Value};
 use crate::logical::Schema;
@@ -13,6 +16,15 @@ use super::catalog::{Catalog, TableInfo};
 use super::encoder::EncodingFormat;
 use super::error::{StorageError, StorageResult};
 use super::table::TableStore;
+
+/// Serializable catalog entry for disk persistence.
+#[derive(Debug, Serialize, Deserialize)]
+struct CatalogEntry {
+    name: String,
+    schema: Schema,
+    primary_key: Vec<usize>,
+    table_id: u64,
+}
 
 /// Storage engine that manages all tables.
 ///
@@ -27,16 +39,50 @@ pub struct StorageEngine {
     tables: RwLock<HashMap<String, Arc<TableStore>>>,
     /// Default encoding format.
     encoding_format: EncodingFormat,
+    /// Data directory for persistent storage. None = in-memory only.
+    data_dir: Option<PathBuf>,
 }
 
 impl StorageEngine {
-    /// Creates a new storage engine.
+    /// Creates a new in-memory storage engine.
     pub fn new() -> Self {
         Self {
             catalog: Catalog::new(),
             tables: RwLock::new(HashMap::new()),
             encoding_format: EncodingFormat::Binary,
+            data_dir: None,
         }
+    }
+
+    /// Creates a new storage engine backed by the given data directory.
+    ///
+    /// Tables will be persisted as files under `data_dir/tables/<table_name>.db`.
+    pub fn with_data_dir(data_dir: impl Into<PathBuf>) -> StorageResult<Self> {
+        let data_dir = data_dir.into();
+        let tables_dir = data_dir.join("tables");
+        std::fs::create_dir_all(&tables_dir).map_err(|e| {
+            StorageError::EngineError(format!(
+                "failed to create tables directory {:?}: {}",
+                tables_dir, e
+            ))
+        })?;
+
+        let mut engine = Self {
+            catalog: Catalog::new(),
+            tables: RwLock::new(HashMap::new()),
+            encoding_format: EncodingFormat::Binary,
+            data_dir: Some(data_dir),
+        };
+
+        // Recover catalog from disk if available
+        engine.recover_catalog()?;
+
+        Ok(engine)
+    }
+
+    /// Returns the data directory, if configured.
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
     }
 
     /// Sets the default encoding format for new tables.
@@ -51,6 +97,93 @@ impl StorageEngine {
     }
 
     // =========================================================================
+    // Catalog Persistence
+    // =========================================================================
+
+    /// Path to the catalog metadata file.
+    fn catalog_path(&self) -> Option<PathBuf> {
+        self.data_dir.as_ref().map(|d| d.join("catalog.json"))
+    }
+
+    /// Persists catalog metadata to disk.
+    fn persist_catalog(&self) -> StorageResult<()> {
+        let path = match self.catalog_path() {
+            Some(p) => p,
+            None => return Ok(()), // No-op for in-memory mode
+        };
+
+        let entries: Vec<CatalogEntry> = self
+            .catalog
+            .list_tables()
+            .iter()
+            .filter_map(|name| {
+                self.catalog.get_table(name).map(|info| CatalogEntry {
+                    name: info.name.clone(),
+                    schema: (*info.schema).clone(),
+                    primary_key: info.primary_key.clone(),
+                    table_id: info.table_id,
+                })
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&entries).map_err(|e| {
+            StorageError::EngineError(format!("failed to serialize catalog: {}", e))
+        })?;
+
+        // Write atomically: write to temp file then rename
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, json.as_bytes()).map_err(|e| {
+            StorageError::EngineError(format!("failed to write catalog: {}", e))
+        })?;
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            StorageError::EngineError(format!("failed to rename catalog file: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Recovers catalog and table stores from disk.
+    fn recover_catalog(&mut self) -> StorageResult<()> {
+        let path = match self.catalog_path() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let json = std::fs::read_to_string(&path).map_err(|e| {
+            StorageError::EngineError(format!("failed to read catalog: {}", e))
+        })?;
+
+        let entries: Vec<CatalogEntry> = serde_json::from_str(&json).map_err(|e| {
+            StorageError::EngineError(format!("failed to deserialize catalog: {}", e))
+        })?;
+
+        let data_dir = self.data_dir.as_ref().unwrap();
+        let mut tables = self.tables.write().unwrap();
+
+        for entry in entries {
+            let mut info = TableInfo::new(entry.name.clone(), entry.schema);
+            if !entry.primary_key.is_empty() {
+                info = info.with_primary_key(entry.primary_key);
+            }
+            info = info.with_table_id(entry.table_id);
+
+            // Register in catalog
+            let _ = self.catalog.create_table(info.clone());
+
+            // Open existing table file
+            let table_path = data_dir.join("tables").join(format!("{}.db", entry.name));
+            let store = TableStore::with_data_path(info, &table_path)?;
+            tables.insert(entry.name, Arc::new(store));
+        }
+
+        Ok(())
+    }
+
+    // =========================================================================
     // DDL Operations
     // =========================================================================
 
@@ -59,12 +192,20 @@ impl StorageEngine {
         // Register in catalog
         self.catalog.create_table(info.clone())?;
 
-        // Create table store
-        let store = Arc::new(TableStore::new(info.clone()));
+        // Create table store (disk-backed if data_dir is set)
+        let store = if let Some(ref data_dir) = self.data_dir {
+            let table_path = data_dir.join("tables").join(format!("{}.db", info.name));
+            Arc::new(TableStore::with_data_path(info.clone(), &table_path)?)
+        } else {
+            Arc::new(TableStore::new(info.clone()))
+        };
 
         // Add to tables map
         let mut tables = self.tables.write().unwrap();
         tables.insert(info.name.clone(), store);
+
+        // Persist catalog to disk
+        self.persist_catalog()?;
 
         Ok(())
     }
@@ -91,6 +232,10 @@ impl StorageEngine {
         // Remove table store
         let mut tables = self.tables.write().unwrap();
         tables.remove(name);
+
+        // Persist catalog to disk
+        drop(tables); // release lock before IO
+        self.persist_catalog()?;
 
         Ok(())
     }
@@ -250,6 +395,15 @@ impl StorageEngine {
     // =========================================================================
     // Maintenance
     // =========================================================================
+
+    /// Flushes all tables to disk (no-op for in-memory engine).
+    pub fn flush_all(&self) -> StorageResult<()> {
+        let tables = self.tables.read().unwrap();
+        for store in tables.values() {
+            store.flush()?;
+        }
+        Ok(())
+    }
 
     /// Consolidates all delta chains in all tables.
     pub fn consolidate_all(&self) {

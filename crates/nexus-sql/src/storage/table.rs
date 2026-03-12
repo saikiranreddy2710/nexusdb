@@ -3,8 +3,10 @@
 //! This module provides `TableStore`, which wraps a SageTree instance
 //! and provides table-level operations for INSERT, GET, DELETE, and SCAN.
 
+use std::path::Path;
+
 use nexus_common::types::Key;
-use nexus_storage::sagetree::{CursorEntry, KeyRange, SageTree};
+use nexus_storage::sagetree::{CursorEntry, FilePager, KeyRange, SageTree};
 
 use crate::executor::{Row, Value};
 
@@ -50,6 +52,43 @@ impl TableStore {
         }
     }
 
+    /// Creates a new table store backed by a file on disk.
+    ///
+    /// The `data_path` should be the path to the table's data file.
+    /// If the file exists, existing data is loaded from it.
+    pub fn with_data_path(info: TableInfo, data_path: &Path) -> StorageResult<Self> {
+        let primary_key = if info.primary_key.is_empty() && !info.schema.is_empty() {
+            vec![0]
+        } else {
+            info.primary_key.clone()
+        };
+
+        let encoder = RowEncoder::new(info.table_id, primary_key, info.schema.clone());
+        let decoder = RowDecoder::new(info.schema.clone());
+
+        let pager = FilePager::open(data_path).map_err(|e| {
+            StorageError::EngineError(format!("failed to open table file {:?}: {}", data_path, e))
+        })?;
+        let tree = SageTree::with_pager(
+            nexus_storage::sagetree::SageTreeConfig::default(),
+            Box::new(pager),
+        );
+
+        Ok(Self {
+            info,
+            tree,
+            encoder,
+            decoder,
+        })
+    }
+
+    /// Flushes all pending writes to disk.
+    pub fn flush(&self) -> StorageResult<()> {
+        self.tree.flush().map_err(|e| {
+            StorageError::EngineError(format!("failed to flush table '{}': {}", self.info.name, e))
+        })
+    }
+
     /// Returns the table info.
     pub fn info(&self) -> &TableInfo {
         &self.info
@@ -73,6 +112,28 @@ impl TableStore {
     // =========================================================================
     // Row Operations
     // =========================================================================
+
+    /// Encodes a row into its key/value representation.
+    ///
+    /// Returns `(key_bytes, value_bytes)` which can be used for WAL logging.
+    pub fn encode_row(&self, row: &Row) -> StorageResult<(Vec<u8>, Vec<u8>)> {
+        let key = self.encoder.encode_key(row)?;
+        let value = self.encoder.encode_value(row)?;
+        Ok((key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+    }
+
+    /// Encodes primary key values into the key representation.
+    pub fn encode_pk(&self, key_values: &[Value]) -> StorageResult<Vec<u8>> {
+        let mut temp_row_values = vec![Value::Null; self.info.schema.len()];
+        for (i, &pk_idx) in self.info.primary_key.iter().enumerate() {
+            if i < key_values.len() {
+                temp_row_values[pk_idx] = key_values[i].clone();
+            }
+        }
+        let temp_row = Row::new(temp_row_values);
+        let key = self.encoder.encode_key(&temp_row)?;
+        Ok(key.as_bytes().to_vec())
+    }
 
     /// Inserts a row into the table.
     ///
@@ -193,6 +254,47 @@ impl TableStore {
         // Upsert in tree
         self.tree.upsert(key, value)?;
         Ok(())
+    }
+
+    // =========================================================================
+    // Raw Key/Value Operations (for WAL replay)
+    // =========================================================================
+
+    /// Inserts a raw encoded key/value pair (used during WAL replay).
+    pub fn insert_raw(
+        &self,
+        key: nexus_common::types::Key,
+        value: nexus_common::types::Value,
+    ) -> StorageResult<()> {
+        self.tree.insert(key, value).map_err(|e| {
+            if matches!(e, nexus_storage::sagetree::SageTreeError::DuplicateKey) {
+                StorageError::PrimaryKeyViolation(format!(
+                    "Duplicate primary key in table '{}'",
+                    self.info.name
+                ))
+            } else {
+                StorageError::from(e)
+            }
+        })
+    }
+
+    /// Upserts a raw encoded key/value pair (used during WAL replay).
+    pub fn upsert_raw(
+        &self,
+        key: nexus_common::types::Key,
+        value: nexus_common::types::Value,
+    ) -> StorageResult<()> {
+        self.tree.upsert(key, value)?;
+        Ok(())
+    }
+
+    /// Deletes by raw encoded key (used during WAL replay).
+    pub fn delete_raw(&self, key: &nexus_common::types::Key) -> StorageResult<bool> {
+        match self.tree.delete(key) {
+            Ok(()) => Ok(true),
+            Err(nexus_storage::sagetree::SageTreeError::KeyNotFound) => Ok(false),
+            Err(e) => Err(StorageError::from(e)),
+        }
     }
 
     // =========================================================================

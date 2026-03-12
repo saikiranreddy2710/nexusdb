@@ -48,7 +48,7 @@ impl Default for DatabaseConfig {
             session_config: SessionConfig::default(),
             wal_enabled: true,
             wal_sync_mode: 1,
-            auth_enabled: false,
+            auth_enabled: true,
             authz_enabled: false,
             audit_max_entries: 10_000,
             pbkdf2_iterations: 0, // 0 = use library default (600,000)
@@ -124,7 +124,14 @@ pub struct Database {
 impl Database {
     /// Opens a database with the given configuration.
     pub fn open(config: DatabaseConfig) -> DatabaseResult<Self> {
-        let storage = Arc::new(StorageEngine::new());
+        let storage = if let Some(ref data_dir) = config.data_dir {
+            Arc::new(
+                StorageEngine::with_data_dir(data_dir)
+                    .map_err(|e| DatabaseError::Internal(format!("Storage init failed: {}", e)))?,
+            )
+        } else {
+            Arc::new(StorageEngine::new())
+        };
 
         // Initialize WAL if enabled and data directory is specified
         let wal = if config.wal_enabled {
@@ -205,7 +212,10 @@ impl Database {
     }
 
     /// Replays the WAL to recover state after a crash.
-    fn replay_wal(wal: &Wal, _storage: &StorageEngine) -> DatabaseResult<()> {
+    ///
+    /// Only operations from committed transactions are replayed.
+    /// WAL keys use the format: `table_name\0encoded_key`.
+    fn replay_wal(wal: &Wal, storage: &StorageEngine) -> DatabaseResult<()> {
         use nexus_wal::record::RecordType;
 
         let min_recovery_lsn = wal.min_recovery_lsn();
@@ -249,16 +259,83 @@ impl Database {
             aborted_txns.len()
         );
 
-        // TODO: Second pass - replay committed transactions' operations
-        // This requires integration with the storage engine to re-apply
-        // INSERT, UPDATE, DELETE operations. For now, we just log.
-        //
-        // In a full implementation:
-        // - For each INSERT record from a committed txn: re-insert the row
-        // - For each UPDATE record from a committed txn: re-apply the update
-        // - For each DELETE record from a committed txn: re-delete the row
-        //
-        // We also need to handle the page_id/slot_id mapping to actual storage.
+        // Second pass: replay committed transactions' operations
+        let mut replayed_inserts = 0u64;
+        let mut replayed_updates = 0u64;
+        let mut replayed_deletes = 0u64;
+        let mut skipped = 0u64;
+
+        for record in &records {
+            // Only replay operations from committed transactions
+            if !committed_txns.contains(&record.header.txn_id) {
+                continue;
+            }
+
+            match &record.payload {
+                nexus_wal::WalPayload::Insert(payload) => {
+                    if let Some((table_name, encoded_key)) =
+                        super::session::Session::parse_wal_key(&payload.key)
+                    {
+                        if let Some(table_store) = storage.get_table(table_name) {
+                            let key = nexus_common::types::Key::from_bytes(encoded_key);
+                            let value =
+                                nexus_common::types::Value::from_bytes(&payload.value);
+                            // Use upsert semantics: if the key already exists (from disk),
+                            // this is a no-op or idempotent overwrite
+                            match table_store.insert_raw(key, value) {
+                                Ok(()) => replayed_inserts += 1,
+                                Err(_) => skipped += 1, // duplicate key = already persisted
+                            }
+                        }
+                    }
+                }
+                nexus_wal::WalPayload::Update(payload) => {
+                    if let Some((table_name, _encoded_key)) =
+                        super::session::Session::parse_wal_key(&payload.key)
+                    {
+                        if let Some(table_store) = storage.get_table(table_name) {
+                            let new_value =
+                                nexus_common::types::Value::from_bytes(&payload.new_value);
+                            // Re-encode the key from the new_value would be complex,
+                            // so we use upsert_raw which does insert-or-update
+                            let key = nexus_common::types::Key::from_bytes(_encoded_key);
+                            match table_store.upsert_raw(key, new_value) {
+                                Ok(()) => replayed_updates += 1,
+                                Err(e) => {
+                                    tracing::warn!("WAL replay update failed: {}", e);
+                                    skipped += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                nexus_wal::WalPayload::Delete(payload) => {
+                    if let Some((table_name, encoded_key)) =
+                        super::session::Session::parse_wal_key(&payload.key)
+                    {
+                        if let Some(table_store) = storage.get_table(table_name) {
+                            let key = nexus_common::types::Key::from_bytes(encoded_key);
+                            match table_store.delete_raw(&key) {
+                                Ok(_) => replayed_deletes += 1,
+                                Err(e) => {
+                                    tracing::warn!("WAL replay delete failed: {}", e);
+                                    skipped += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {} // Skip non-DML records
+            }
+        }
+
+        tracing::info!(
+            "WAL replay complete: {} inserts, {} updates, {} deletes ({} skipped)",
+            replayed_inserts,
+            replayed_updates,
+            replayed_deletes,
+            skipped
+        );
 
         Ok(())
     }
@@ -286,7 +363,12 @@ impl Database {
         if let Some(storage) = dbs.get(name) {
             return Arc::clone(storage);
         }
-        let storage = Arc::new(StorageEngine::new());
+        let storage = if let Some(ref data_dir) = self.config.data_dir {
+            let db_dir = PathBuf::from(data_dir).join(name);
+            Arc::new(StorageEngine::with_data_dir(&db_dir).unwrap_or_else(|_| StorageEngine::new()))
+        } else {
+            Arc::new(StorageEngine::new())
+        };
         dbs.insert(name.to_string(), Arc::clone(&storage));
         storage
     }
@@ -304,7 +386,13 @@ impl Database {
                 )))
             };
         }
-        dbs.insert(name.to_string(), Arc::new(StorageEngine::new()));
+        let storage = if let Some(ref data_dir) = self.config.data_dir {
+            let db_dir = PathBuf::from(data_dir).join(name);
+            Arc::new(StorageEngine::with_data_dir(&db_dir).unwrap_or_else(|_| StorageEngine::new()))
+        } else {
+            Arc::new(StorageEngine::new())
+        };
+        dbs.insert(name.to_string(), storage);
         Ok(())
     }
 
