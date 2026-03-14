@@ -958,63 +958,121 @@ impl Session {
                 .collect::<DatabaseResult<Vec<_>>>()?
         };
 
-        // Convert values to rows
-        let value_rows = match &insert.values {
-            InsertSource::Values(rows) => rows,
-            InsertSource::Query(_) => {
-                return Err(DatabaseError::NotImplemented(
-                    "INSERT from SELECT query".to_string(),
-                ))
-            }
-            InsertSource::DefaultValues => {
-                return Err(DatabaseError::NotImplemented(
-                    "INSERT DEFAULT VALUES".to_string(),
-                ))
-            }
-        };
+        // Build rows from the INSERT source
+        let rows = match &insert.values {
+            InsertSource::Values(value_rows) => {
+                let mut rows = Vec::with_capacity(value_rows.len());
+                for value_row in value_rows {
+                    let mut row_values = vec![Value::Null; schema.fields().len()];
 
-        let mut rows = Vec::with_capacity(value_rows.len());
-        for value_row in value_rows {
-            let mut row_values = vec![Value::Null; schema.fields().len()];
+                    for (i, expr) in value_row.iter().enumerate() {
+                        if i < column_order.len() {
+                            let col_idx = column_order[i];
+                            let val = self.eval_literal(expr)?;
 
-            for (i, expr) in value_row.iter().enumerate() {
-                if i < column_order.len() {
-                    let col_idx = column_order[i];
-                    let val = self.eval_literal(expr)?;
+                            // Auto-coerce string values to vectors for VECTOR columns
+                            let val = if matches!(
+                                &schema.fields()[col_idx].data_type,
+                                nexus_sql::parser::DataType::Vector(_)
+                            ) {
+                                val.cast(&schema.fields()[col_idx].data_type)
+                                    .map_err(|e| DatabaseError::ExecutionError(e))?
+                            } else {
+                                val
+                            };
 
-                    // Auto-coerce string values to vectors for VECTOR columns
-                    let val = if matches!(
-                        &schema.fields()[col_idx].data_type,
-                        nexus_sql::parser::DataType::Vector(_)
-                    ) {
-                        val.cast(&schema.fields()[col_idx].data_type)
-                            .map_err(|e| DatabaseError::ExecutionError(e))?
-                    } else {
-                        val
-                    };
-
-                    // Validate vector dimension against the column's declared dimension
-                    if let Value::Vector(ref vec_data) = val {
-                        if let nexus_sql::parser::DataType::Vector(expected_dim) =
-                            &schema.fields()[col_idx].data_type
-                        {
-                            if vec_data.len() != *expected_dim as usize {
-                                return Err(DatabaseError::ExecutionError(format!(
-                                    "vector dimension mismatch for column '{}': expected {}, got {}",
-                                    schema.fields()[col_idx].name(),
-                                    expected_dim,
-                                    vec_data.len()
-                                )));
+                            // Validate vector dimension against the column's declared dimension
+                            if let Value::Vector(ref vec_data) = val {
+                                if let nexus_sql::parser::DataType::Vector(expected_dim) =
+                                    &schema.fields()[col_idx].data_type
+                                {
+                                    if vec_data.len() != *expected_dim as usize {
+                                        return Err(DatabaseError::ExecutionError(format!(
+                                            "vector dimension mismatch for column '{}': expected {}, got {}",
+                                            schema.fields()[col_idx].name(),
+                                            expected_dim,
+                                            vec_data.len()
+                                        )));
+                                    }
+                                }
                             }
+
+                            row_values[col_idx] = val;
                         }
                     }
 
-                    row_values[col_idx] = val;
+                    rows.push(Row::new(row_values));
                 }
+                rows
             }
+            InsertSource::Query(select_stmt) => {
+                // Execute the SELECT query to get source rows
+                let select_statement = Statement::Select((**select_stmt).clone());
+                let source_rows = self.execute_select_for_insert(&select_statement)?;
 
-            rows.push(Row::new(row_values));
-        }
+                // Validate column count
+                let expected_cols = column_order.len();
+                if !source_rows.is_empty() {
+                    let actual_cols = source_rows[0].num_columns();
+                    if actual_cols != expected_cols {
+                        return Err(DatabaseError::ExecutionError(format!(
+                            "INSERT...SELECT column count mismatch: target has {} columns, SELECT produces {}",
+                            expected_cols, actual_cols
+                        )));
+                    }
+                }
+
+                // Map SELECT output columns to target table columns
+                let mut rows = Vec::with_capacity(source_rows.len());
+                for source_row in &source_rows {
+                    let mut row_values = vec![Value::Null; schema.fields().len()];
+
+                    for (i, val) in source_row.iter().enumerate() {
+                        if i < column_order.len() {
+                            let col_idx = column_order[i];
+
+                            // Auto-coerce for VECTOR columns
+                            let val = if matches!(
+                                &schema.fields()[col_idx].data_type,
+                                nexus_sql::parser::DataType::Vector(_)
+                            ) {
+                                val.clone()
+                                    .cast(&schema.fields()[col_idx].data_type)
+                                    .map_err(|e| DatabaseError::ExecutionError(e))?
+                            } else {
+                                val.clone()
+                            };
+
+                            // Validate vector dimension
+                            if let Value::Vector(ref vec_data) = val {
+                                if let nexus_sql::parser::DataType::Vector(expected_dim) =
+                                    &schema.fields()[col_idx].data_type
+                                {
+                                    if vec_data.len() != *expected_dim as usize {
+                                        return Err(DatabaseError::ExecutionError(format!(
+                                            "vector dimension mismatch for column '{}': expected {}, got {}",
+                                            schema.fields()[col_idx].name(),
+                                            expected_dim,
+                                            vec_data.len()
+                                        )));
+                                    }
+                                }
+                            }
+
+                            row_values[col_idx] = val;
+                        }
+                    }
+
+                    rows.push(Row::new(row_values));
+                }
+                rows
+            }
+            InsertSource::DefaultValues => {
+                // Single row of all NULLs / defaults
+                let row_values = vec![Value::Null; schema.fields().len()];
+                vec![Row::new(row_values)]
+            }
+        };
 
         let count = self.storage().execute_insert(table_name, rows.clone())?;
 
@@ -1156,6 +1214,57 @@ impl Session {
         Ok(StatementResult::Delete {
             rows_affected: deleted_count,
         })
+    }
+
+    /// Executes a SELECT statement and returns raw rows for INSERT...SELECT.
+    ///
+    /// This bypasses result caching and plan caching since the result will be
+    /// consumed by the INSERT, not returned to the user.
+    fn execute_select_for_insert(&self, statement: &Statement) -> DatabaseResult<Vec<Row>> {
+        // Build catalog from current storage
+        let mut catalog = MemoryCatalog::new();
+        for tbl in self.storage().list_tables() {
+            if let Some(info) = self.storage().get_table_info(&tbl) {
+                catalog.add_table(nexus_sql::logical::TableMeta::new(
+                    tbl.clone(),
+                    (*info.schema).clone(),
+                ));
+            }
+        }
+
+        // Build logical plan
+        let logical_plan =
+            build_plan(statement, &catalog).map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        // Optimize
+        let optimizer = Optimizer::new(OptimizerConfig::default());
+        let optimized = optimizer
+            .optimize(logical_plan)
+            .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        // Create physical plan
+        let ctx = ExecutionContext::default();
+        let physical_planner = PhysicalPlanner::new(&ctx);
+        let plan = physical_planner
+            .create_physical_plan(&optimized.root)
+            .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        // Execute
+        let exec_ctx = ExecutionContext::default();
+        let mut executor = nexus_sql::executor::QueryExecutor::new(exec_ctx);
+
+        for tbl in self.storage().list_tables() {
+            if let Ok(batches) = self.storage().execute_scan(&tbl) {
+                executor.register_table(tbl, batches);
+            }
+        }
+
+        let result = executor.execute(&plan)?;
+
+        // Flatten batches into rows
+        let rows: Vec<Row> = result.batches.iter().flat_map(|b| b.rows()).collect();
+
+        Ok(rows)
     }
 
     /// Executes a SELECT query.
@@ -2767,5 +2876,233 @@ mod tests {
         } else {
             panic!("expected Query result");
         }
+    }
+
+    // =========================================================================
+    // INSERT...SELECT end-to-end tests
+    // =========================================================================
+
+    #[test]
+    fn test_session_insert_select_basic() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE src (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE dst (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO src VALUES (1, 'Alice')")
+            .unwrap();
+        session
+            .execute("INSERT INTO src VALUES (2, 'Bob')")
+            .unwrap();
+        session
+            .execute("INSERT INTO src VALUES (3, 'Charlie')")
+            .unwrap();
+
+        // INSERT...SELECT: copy all rows from src to dst
+        let result = session
+            .execute("INSERT INTO dst SELECT * FROM src")
+            .unwrap();
+
+        if let StatementResult::Insert { rows_affected } = result {
+            assert_eq!(rows_affected, 3, "should insert 3 rows");
+        } else {
+            panic!("expected Insert result, got {:?}", result);
+        }
+
+        // Verify dst has the rows
+        let result = session.execute("SELECT * FROM dst").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 3);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_insert_select_with_where() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE src (id INT PRIMARY KEY, name TEXT, age INT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE dst (id INT PRIMARY KEY, name TEXT, age INT)")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO src VALUES (1, 'Alice', 30)")
+            .unwrap();
+        session
+            .execute("INSERT INTO src VALUES (2, 'Bob', 20)")
+            .unwrap();
+        session
+            .execute("INSERT INTO src VALUES (3, 'Charlie', 35)")
+            .unwrap();
+
+        // INSERT with filtered SELECT
+        let result = session
+            .execute("INSERT INTO dst SELECT * FROM src WHERE age > 25")
+            .unwrap();
+
+        if let StatementResult::Insert { rows_affected } = result {
+            assert_eq!(rows_affected, 2, "should insert 2 rows (age > 25)");
+        } else {
+            panic!("expected Insert result");
+        }
+    }
+
+    #[test]
+    fn test_session_insert_select_with_columns() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE src (id INT PRIMARY KEY, name TEXT, val INT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE dst (id INT PRIMARY KEY, val INT, name TEXT)")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO src VALUES (1, 'X', 100)")
+            .unwrap();
+
+        // INSERT with explicit column mapping (reordered)
+        let result = session
+            .execute("INSERT INTO dst (id, name, val) SELECT id, name, val FROM src")
+            .unwrap();
+
+        if let StatementResult::Insert { rows_affected } = result {
+            assert_eq!(rows_affected, 1);
+        } else {
+            panic!("expected Insert result");
+        }
+
+        // Verify the data is correct
+        let result = session.execute("SELECT name, val FROM dst").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1);
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0).cloned(), Some(Value::string("X")));
+            assert_eq!(row.get(1).cloned(), Some(Value::Int(100)));
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_insert_select_empty_result() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE src (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE dst (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+
+        // SELECT with impossible WHERE -> 0 rows inserted
+        let result = session
+            .execute("INSERT INTO dst SELECT * FROM src WHERE val > 999")
+            .unwrap();
+
+        if let StatementResult::Insert { rows_affected } = result {
+            assert_eq!(rows_affected, 0, "empty SELECT should insert 0 rows");
+        } else {
+            panic!("expected Insert result");
+        }
+    }
+
+    #[test]
+    fn test_session_insert_select_with_aggregates() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE sales (id INT PRIMARY KEY, dept TEXT, amount INT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE summary (dept TEXT PRIMARY KEY, total INT)")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO sales VALUES (1, 'A', 100)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (2, 'A', 200)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (3, 'B', 150)")
+            .unwrap();
+
+        // INSERT...SELECT with GROUP BY aggregate
+        let result = session
+            .execute("INSERT INTO summary SELECT dept, SUM(amount) FROM sales GROUP BY dept")
+            .unwrap();
+
+        if let StatementResult::Insert { rows_affected } = result {
+            assert_eq!(rows_affected, 2, "should insert 2 department summaries");
+        } else {
+            panic!("expected Insert result");
+        }
+    }
+
+    #[test]
+    fn test_session_insert_select_self_table() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+        // INSERT from same table (snapshot semantics — reads before writes)
+        // This inserts the existing rows with new IDs
+        let result = session
+            .execute("INSERT INTO t SELECT id + 100, val FROM t")
+            .unwrap();
+
+        if let StatementResult::Insert { rows_affected } = result {
+            assert_eq!(rows_affected, 2, "should insert 2 copies");
+        } else {
+            panic!("expected Insert result");
+        }
+
+        // Verify total rows
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 4, "should have 4 total rows");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_insert_select_column_count_mismatch() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE src (id INT PRIMARY KEY, name TEXT, extra INT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE dst (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO src VALUES (1, 'Alice', 99)")
+            .unwrap();
+
+        // SELECT produces 3 columns, but dst has only 2 -> error
+        let result = session.execute("INSERT INTO dst SELECT * FROM src");
+        assert!(result.is_err(), "column count mismatch should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("column count mismatch"),
+            "error should mention column mismatch: {}",
+            err
+        );
     }
 }
