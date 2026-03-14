@@ -1,6 +1,6 @@
 # NexusDB
 
-A research-grade next-generation database written in Rust, combining high performance, ACID reliability, military-grade security, and AI-native capabilities.
+A next-generation database written in Rust, combining high performance, ACID reliability, security, and AI-native capabilities.
 
 ## What is this?
 
@@ -119,7 +119,7 @@ crates/
 │   Client    │ ────────────────▶│           Server (nexusd)            │
 │  (nexus)    │                  │                                      │
 └─────────────┘                  │  ┌──────────────────────────────┐    │
-                                 │  │     Security Layer            │    │
+                                 │  │     Security Layer           │    │
                                  │  │  Authentication (PBKDF2/JWT) │    │
                                  │  │  Authorization (RBAC)        │    │
                                  │  │  Audit Log (hash-chained)    │    │
@@ -131,11 +131,11 @@ crates/
                                  │  │  Physical Plan → Executor    │    │
                                  │  └──────────────┬───────────────┘    │
                                  │                 │                    │
-                                 │  ┌──────┬───────▼──────┬────────┐   │
-                                 │  │ Txn  │   Storage    │  Raft  │   │
-                                 │  │ Mgr  │   Engine     │Consensu│   │
-                                 │  │(MVCC)│(SageTree+WAL)│   s    │   │
-                                 │  └──────┴──────────────┴────────┘   │
+                                 │  ┌──────┬───────▼──────┬────────┐    │
+                                 │  │ Txn  │   Storage    │  Raft  │    │
+                                 │  │ Mgr  │   Engine     │Consensu│    │
+                                 │  │(MVCC)│(SageTree+WAL)│   s    │    │
+                                 │  └──────┴──────────────┴────────┘    │
                                  └──────────────────────────────────────┘
 ```
 
