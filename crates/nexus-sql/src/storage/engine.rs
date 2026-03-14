@@ -7,8 +7,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use serde::{Deserialize, Serialize};
-
 use crate::executor::{RecordBatch, Row, Value};
 use crate::logical::Schema;
 
@@ -17,20 +15,15 @@ use super::encoder::EncodingFormat;
 use super::error::{StorageError, StorageResult};
 use super::table::TableStore;
 
-/// Serializable catalog entry for disk persistence.
-#[derive(Debug, Serialize, Deserialize)]
-struct CatalogEntry {
-    name: String,
-    schema: Schema,
-    primary_key: Vec<usize>,
-    table_id: u64,
-}
-
 /// Storage engine that manages all tables.
 ///
 /// The `StorageEngine` is the main entry point for all storage operations.
 /// It maintains the catalog and provides methods for DDL (CREATE/DROP TABLE)
 /// and DML (INSERT/SELECT/UPDATE/DELETE) operations.
+///
+/// When `data_dir` is set, tables are backed by [`FilePager`] on disk and
+/// the catalog is persisted as JSON. When `data_dir` is `None`, everything
+/// is in-memory and lost on restart.
 #[derive(Debug)]
 pub struct StorageEngine {
     /// Table catalog.
@@ -39,9 +32,12 @@ pub struct StorageEngine {
     tables: RwLock<HashMap<String, Arc<TableStore>>>,
     /// Default encoding format.
     encoding_format: EncodingFormat,
-    /// Data directory for persistent storage. None = in-memory only.
+    /// Data directory for persistence (None = in-memory only).
     data_dir: Option<PathBuf>,
 }
+
+/// Name of the catalog file inside the data directory.
+const CATALOG_FILE: &str = "catalog.json";
 
 impl StorageEngine {
     /// Creates a new in-memory storage engine.
@@ -54,14 +50,18 @@ impl StorageEngine {
         }
     }
 
-    /// Creates a new storage engine backed by the given data directory.
+    /// Creates a disk-backed storage engine rooted at `data_dir`.
     ///
-    /// Tables will be persisted as files under `data_dir/tables/<table_name>.db`.
+    /// If the directory contains a `catalog.json` file from a previous run,
+    /// it is loaded and every table's `FilePager` is opened, recovering data
+    /// that was flushed before the last shutdown.
     pub fn with_data_dir(data_dir: impl Into<PathBuf>) -> StorageResult<Self> {
         let data_dir = data_dir.into();
+
+        // Ensure the tables subdirectory exists
         let tables_dir = data_dir.join("tables");
         std::fs::create_dir_all(&tables_dir).map_err(|e| {
-            StorageError::EngineError(format!(
+            StorageError::Internal(format!(
                 "failed to create tables directory {:?}: {}",
                 tables_dir, e
             ))
@@ -71,18 +71,108 @@ impl StorageEngine {
             catalog: Catalog::new(),
             tables: RwLock::new(HashMap::new()),
             encoding_format: EncodingFormat::Binary,
-            data_dir: Some(data_dir),
+            data_dir: Some(data_dir.clone()),
         };
 
-        // Recover catalog from disk if available
-        engine.recover_catalog()?;
+        // Recover catalog from disk if it exists
+        let catalog_path = data_dir.join(CATALOG_FILE);
+        if catalog_path.exists() {
+            engine.recover_catalog(&catalog_path)?;
+        }
 
         Ok(engine)
     }
 
-    /// Returns the data directory, if configured.
+    /// Returns the data directory, if any.
     pub fn data_dir(&self) -> Option<&Path> {
         self.data_dir.as_deref()
+    }
+
+    /// Recovers catalog and table stores from a catalog JSON file.
+    fn recover_catalog(&mut self, catalog_path: &Path) -> StorageResult<()> {
+        use nexus_storage::sagetree::{FilePager, SageTree, SageTreeConfig};
+
+        let data = std::fs::read_to_string(catalog_path).map_err(|e| {
+            StorageError::Internal(format!("failed to read catalog file: {}", e))
+        })?;
+
+        let table_infos: Vec<TableInfo> = serde_json::from_str(&data).map_err(|e| {
+            StorageError::Internal(format!("failed to parse catalog file: {}", e))
+        })?;
+
+        let tables_dir = self.data_dir.as_ref().unwrap().join("tables");
+
+        for info in table_infos {
+            let table_file = tables_dir.join(format!("{}.db", info.name));
+
+            let tree = if table_file.exists() {
+                let pager = FilePager::open(&table_file).map_err(|e| {
+                    StorageError::Internal(format!(
+                        "failed to open table file {:?}: {}",
+                        table_file, e
+                    ))
+                })?;
+                SageTree::with_pager(SageTreeConfig::default(), Box::new(pager))
+            } else {
+                // Catalog references a table but the file doesn't exist —
+                // create an empty file-backed table.
+                let pager = FilePager::open(&table_file).map_err(|e| {
+                    StorageError::Internal(format!(
+                        "failed to create table file {:?}: {}",
+                        table_file, e
+                    ))
+                })?;
+                SageTree::with_pager(SageTreeConfig::default(), Box::new(pager))
+            };
+
+            let store = Arc::new(TableStore::with_tree(info.clone(), tree));
+
+            // Register in catalog (skip ID assignment, preserve original IDs)
+            self.catalog.create_table(info.clone())?;
+
+            let mut tables = self.tables.write().unwrap();
+            tables.insert(info.name.clone(), store);
+        }
+
+        Ok(())
+    }
+
+    /// Persists the catalog to disk (no-op for in-memory engines).
+    pub fn persist_catalog(&self) -> StorageResult<()> {
+        let data_dir = match &self.data_dir {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        let catalog_path = data_dir.join(CATALOG_FILE);
+
+        let table_names = self.catalog.list_tables();
+        let mut table_infos = Vec::with_capacity(table_names.len());
+        for name in &table_names {
+            if let Some(info) = self.catalog.get_table(name) {
+                table_infos.push(info);
+            }
+        }
+
+        let json = serde_json::to_string_pretty(&table_infos).map_err(|e| {
+            StorageError::Internal(format!("failed to serialize catalog: {}", e))
+        })?;
+
+        std::fs::write(&catalog_path, json).map_err(|e| {
+            StorageError::Internal(format!("failed to write catalog file: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Flushes all table stores to disk and persists the catalog.
+    pub fn flush_all(&self) -> StorageResult<()> {
+        let tables = self.tables.read().unwrap();
+        for store in tables.values() {
+            store.flush()?;
+        }
+        drop(tables);
+        self.persist_catalog()
     }
 
     /// Sets the default encoding format for new tables.
@@ -97,105 +187,30 @@ impl StorageEngine {
     }
 
     // =========================================================================
-    // Catalog Persistence
-    // =========================================================================
-
-    /// Path to the catalog metadata file.
-    fn catalog_path(&self) -> Option<PathBuf> {
-        self.data_dir.as_ref().map(|d| d.join("catalog.json"))
-    }
-
-    /// Persists catalog metadata to disk.
-    fn persist_catalog(&self) -> StorageResult<()> {
-        let path = match self.catalog_path() {
-            Some(p) => p,
-            None => return Ok(()), // No-op for in-memory mode
-        };
-
-        let entries: Vec<CatalogEntry> = self
-            .catalog
-            .list_tables()
-            .iter()
-            .filter_map(|name| {
-                self.catalog.get_table(name).map(|info| CatalogEntry {
-                    name: info.name.clone(),
-                    schema: (*info.schema).clone(),
-                    primary_key: info.primary_key.clone(),
-                    table_id: info.table_id,
-                })
-            })
-            .collect();
-
-        let json = serde_json::to_string_pretty(&entries).map_err(|e| {
-            StorageError::EngineError(format!("failed to serialize catalog: {}", e))
-        })?;
-
-        // Write atomically: write to temp file then rename
-        let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, json.as_bytes()).map_err(|e| {
-            StorageError::EngineError(format!("failed to write catalog: {}", e))
-        })?;
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            StorageError::EngineError(format!("failed to rename catalog file: {}", e))
-        })?;
-
-        Ok(())
-    }
-
-    /// Recovers catalog and table stores from disk.
-    fn recover_catalog(&mut self) -> StorageResult<()> {
-        let path = match self.catalog_path() {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-
-        if !path.exists() {
-            return Ok(());
-        }
-
-        let json = std::fs::read_to_string(&path).map_err(|e| {
-            StorageError::EngineError(format!("failed to read catalog: {}", e))
-        })?;
-
-        let entries: Vec<CatalogEntry> = serde_json::from_str(&json).map_err(|e| {
-            StorageError::EngineError(format!("failed to deserialize catalog: {}", e))
-        })?;
-
-        let data_dir = self.data_dir.as_ref().unwrap();
-        let mut tables = self.tables.write().unwrap();
-
-        for entry in entries {
-            let mut info = TableInfo::new(entry.name.clone(), entry.schema);
-            if !entry.primary_key.is_empty() {
-                info = info.with_primary_key(entry.primary_key);
-            }
-            info = info.with_table_id(entry.table_id);
-
-            // Register in catalog
-            let _ = self.catalog.create_table(info.clone());
-
-            // Open existing table file
-            let table_path = data_dir.join("tables").join(format!("{}.db", entry.name));
-            let store = TableStore::with_data_path(info, &table_path)?;
-            tables.insert(entry.name, Arc::new(store));
-        }
-
-        Ok(())
-    }
-
-    // =========================================================================
     // DDL Operations
     // =========================================================================
 
     /// Creates a new table.
+    ///
+    /// If `data_dir` is set, the table is backed by a [`FilePager`] on disk.
     pub fn create_table(&self, info: TableInfo) -> StorageResult<()> {
         // Register in catalog
         self.catalog.create_table(info.clone())?;
 
-        // Create table store (disk-backed if data_dir is set)
+        // Create table store — file-backed if data_dir is set
         let store = if let Some(ref data_dir) = self.data_dir {
-            let table_path = data_dir.join("tables").join(format!("{}.db", info.name));
-            Arc::new(TableStore::with_data_path(info.clone(), &table_path)?)
+            use nexus_storage::sagetree::{FilePager, SageTree, SageTreeConfig};
+
+            let tables_dir = data_dir.join("tables");
+            let table_file = tables_dir.join(format!("{}.db", info.name));
+            let pager = FilePager::open(&table_file).map_err(|e| {
+                StorageError::Internal(format!(
+                    "failed to create table file {:?}: {}",
+                    table_file, e
+                ))
+            })?;
+            let tree = SageTree::with_pager(SageTreeConfig::default(), Box::new(pager));
+            Arc::new(TableStore::with_tree(info.clone(), tree))
         } else {
             Arc::new(TableStore::new(info.clone()))
         };
@@ -225,6 +240,8 @@ impl StorageEngine {
     }
 
     /// Drops a table.
+    ///
+    /// If the table is file-backed, the `.db` file is also removed.
     pub fn drop_table(&self, name: &str) -> StorageResult<()> {
         // Remove from catalog
         self.catalog.drop_table(name)?;
@@ -232,9 +249,17 @@ impl StorageEngine {
         // Remove table store
         let mut tables = self.tables.write().unwrap();
         tables.remove(name);
+        drop(tables);
+
+        // Remove the data file if we are disk-backed
+        if let Some(ref data_dir) = self.data_dir {
+            let table_file = data_dir.join("tables").join(format!("{}.db", name));
+            if table_file.exists() {
+                let _ = std::fs::remove_file(&table_file);
+            }
+        }
 
         // Persist catalog to disk
-        drop(tables); // release lock before IO
         self.persist_catalog()?;
 
         Ok(())
@@ -261,8 +286,26 @@ impl StorageEngine {
         // 2. Update catalog with new schema
         self.catalog.update_table(new_info.clone())?;
 
-        // 3. Create new table store with the new schema
-        let new_store = Arc::new(TableStore::new(new_info));
+        // 3. Create new table store with the new schema (file-backed if data_dir is set)
+        let new_store = if let Some(ref data_dir) = self.data_dir {
+            use nexus_storage::sagetree::{FilePager, SageTree, SageTreeConfig};
+
+            // Write to a temporary file, then swap
+            let tables_dir = data_dir.join("tables");
+            let table_file = tables_dir.join(format!("{}.db", name));
+            // Remove old file so we start fresh
+            let _ = std::fs::remove_file(&table_file);
+            let pager = FilePager::open(&table_file).map_err(|e| {
+                StorageError::Internal(format!(
+                    "failed to create table file {:?}: {}",
+                    table_file, e
+                ))
+            })?;
+            let tree = SageTree::with_pager(SageTreeConfig::default(), Box::new(pager));
+            Arc::new(TableStore::with_tree(new_info, tree))
+        } else {
+            Arc::new(TableStore::new(new_info))
+        };
 
         // 4. Re-insert rows mapped to the new schema
         for old_row in &old_rows {
@@ -273,6 +316,10 @@ impl StorageEngine {
         // 5. Atomically swap the store
         let mut tables = self.tables.write().unwrap();
         tables.insert(name.to_string(), new_store);
+        drop(tables);
+
+        // Persist catalog to disk
+        self.persist_catalog()?;
 
         Ok(())
     }
@@ -432,15 +479,6 @@ impl StorageEngine {
     // =========================================================================
     // Maintenance
     // =========================================================================
-
-    /// Flushes all tables to disk (no-op for in-memory engine).
-    pub fn flush_all(&self) -> StorageResult<()> {
-        let tables = self.tables.read().unwrap();
-        for store in tables.values() {
-            store.flush()?;
-        }
-        Ok(())
-    }
 
     /// Consolidates all delta chains in all tables.
     pub fn consolidate_all(&self) {

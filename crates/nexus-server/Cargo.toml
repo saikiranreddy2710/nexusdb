@@ -25,7 +25,6 @@ nexus-proto = { workspace = true }
 nexus-cache = { path = "../nexus-cache" }
 nexus-security = { path = "../nexus-security" }
 nexus-hnsw = { workspace = true }
-bytes = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }

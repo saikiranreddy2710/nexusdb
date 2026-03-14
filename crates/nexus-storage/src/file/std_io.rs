@@ -56,7 +56,7 @@ impl StandardFile {
 
     /// Synchronously opens a file with the specified options.
     fn open_sync(path: &Path, options: &OpenOptions) -> IoResult<StdFile> {
-        let std_opts = options.to_std_options();
+        let mut std_opts = options.to_std_options();
 
         // Apply platform-specific direct I/O flags
         #[cfg(target_os = "linux")]

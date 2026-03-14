@@ -260,7 +260,7 @@ impl NumaAllocator {
         &self,
         size: usize,
         alignment: usize,
-        _node: NumaNode,
+        node: NumaNode,
     ) -> AlignedBuffer {
         #[cfg(target_os = "linux")]
         {
@@ -271,6 +271,8 @@ impl NumaAllocator {
                 }
             }
         }
+
+        let _ = node; // suppress unused warning on non-Linux
 
         // Fallback to standard aligned allocation
         AlignedBuffer::new(size, alignment)

@@ -1240,10 +1240,12 @@ dependencies = [
  "chrono",
  "crc32fast",
  "humantime",
+ "libc",
  "parking_lot",
  "proptest",
  "serde",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

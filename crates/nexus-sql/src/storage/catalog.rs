@@ -5,16 +5,22 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use serde::{Deserialize, Serialize};
+
 use crate::logical::Schema;
 
 use super::error::{StorageError, StorageResult};
 
 /// Information about a table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableInfo {
     /// Table name.
     pub name: String,
     /// Table schema.
+    #[serde(
+        serialize_with = "serialize_arc_schema",
+        deserialize_with = "deserialize_arc_schema"
+    )]
     pub schema: Arc<Schema>,
     /// Primary key column indices.
     pub primary_key: Vec<usize>,
@@ -24,6 +30,21 @@ pub struct TableInfo {
     pub row_count: u64,
     /// Table ID (for internal use).
     pub table_id: u64,
+}
+
+fn serialize_arc_schema<S>(schema: &Arc<Schema>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    schema.as_ref().serialize(serializer)
+}
+
+fn deserialize_arc_schema<'de, D>(deserializer: D) -> Result<Arc<Schema>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let schema = Schema::deserialize(deserializer)?;
+    Ok(Arc::new(schema))
 }
 
 impl TableInfo {
@@ -72,7 +93,7 @@ impl TableInfo {
 }
 
 /// The type of index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IndexType {
     /// Standard B-tree index.
     BTree,
@@ -94,7 +115,7 @@ impl Default for IndexType {
 }
 
 /// Index information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexInfo {
     /// Index name.
     pub name: String,

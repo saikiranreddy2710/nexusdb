@@ -73,6 +73,14 @@ pub trait Pager: Send + Sync + std::fmt::Debug {
     /// Return a page ID to the free list.
     fn free_page(&self, page_id: PageId);
 
+    // ── Enumeration ──────────────────────────────────────────────
+
+    /// Returns all page IDs that currently hold leaf nodes.
+    fn leaf_page_ids(&self) -> Vec<PageId>;
+
+    /// Returns all page IDs that currently hold internal nodes.
+    fn internal_page_ids(&self) -> Vec<PageId>;
+
     // ── Lifecycle ───────────────────────────────────────────────
 
     /// Flush all dirty data to disk (no-op for memory pager).
@@ -170,6 +178,14 @@ impl Pager for MemoryPager {
     fn free_page(&self, page_id: PageId) {
         let mut free = self.free_pages.write();
         free.push(page_id);
+    }
+
+    fn leaf_page_ids(&self) -> Vec<PageId> {
+        self.leaves.read().keys().copied().collect()
+    }
+
+    fn internal_page_ids(&self) -> Vec<PageId> {
+        self.internals.read().keys().copied().collect()
     }
 
     fn flush(&self) -> SageTreeResult<()> {
@@ -451,6 +467,14 @@ impl Pager for FilePager {
         if let Ok(mut free) = self.free_pages.write() {
             free.push(page_id);
         }
+    }
+
+    fn leaf_page_ids(&self) -> Vec<PageId> {
+        self.leaf_cache.read().unwrap().keys().copied().collect()
+    }
+
+    fn internal_page_ids(&self) -> Vec<PageId> {
+        self.internal_cache.read().unwrap().keys().copied().collect()
     }
 
     fn flush(&self) -> SageTreeResult<()> {

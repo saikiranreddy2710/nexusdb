@@ -32,7 +32,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use nexus_server::config::ServerConfig;
-use nexus_server::database::{Database, DatabaseConfig};
+use nexus_server::database::Database;
 use nexus_server::grpc::GrpcServer;
 
 /// NexusDB Server Daemon
@@ -66,10 +66,6 @@ struct Args {
     #[arg(long)]
     memory: bool,
 
-    /// Disable authentication (permissive mode, NOT recommended for production)
-    #[arg(long, env = "NEXUS_NO_AUTH")]
-    no_auth: bool,
-
     /// Enable verbose logging
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -89,18 +85,6 @@ struct Args {
     /// WAL directory (defaults to data_dir/wal)
     #[arg(long, value_name = "DIR", env = "NEXUS_WAL_DIR")]
     wal_dir: Option<PathBuf>,
-
-    /// TLS certificate file (PEM format)
-    #[arg(long, value_name = "FILE", env = "NEXUS_TLS_CERT")]
-    tls_cert: Option<PathBuf>,
-
-    /// TLS private key file (PEM format)
-    #[arg(long, value_name = "FILE", env = "NEXUS_TLS_KEY")]
-    tls_key: Option<PathBuf>,
-
-    /// TLS CA certificate for client verification (mTLS)
-    #[arg(long, value_name = "FILE", env = "NEXUS_TLS_CA_CERT")]
-    tls_ca_cert: Option<PathBuf>,
 
     /// Print configuration and exit
     #[arg(long)]
@@ -178,20 +162,6 @@ fn load_config(args: &Args) -> Result<ServerConfig> {
         config.wal_dir = Some(dir.clone());
     }
 
-    if args.no_auth {
-        config.auth_enabled = false;
-    }
-
-    if let Some(cert) = &args.tls_cert {
-        config.tls_cert = Some(cert.clone());
-    }
-    if let Some(key) = &args.tls_key {
-        config.tls_key = Some(key.clone());
-    }
-    if let Some(ca) = &args.tls_ca_cert {
-        config.tls_ca_cert = Some(ca.clone());
-    }
-
     Ok(config)
 }
 
@@ -212,23 +182,21 @@ fn print_banner() {
 }
 
 async fn run_server(config: ServerConfig) -> Result<()> {
-    // Build database configuration from server config
-    let mut db_config = if config.memory_mode {
+    // Create the database
+    let db = if config.memory_mode {
         info!("Starting in memory-only mode (data will not be persisted)");
-        DatabaseConfig::in_memory()
+        Database::open_memory().context("Failed to create in-memory database")?
     } else if let Some(ref dir) = config.data_dir {
         info!("Data directory: {}", dir.display());
+
+        // Ensure directory exists
         std::fs::create_dir_all(dir).context("Failed to create data directory")?;
-        DatabaseConfig::with_path(dir.to_string_lossy().to_string())
+
+        Database::open_path(dir).context("Failed to open database")?
     } else {
         info!("No data directory specified, using memory mode");
-        DatabaseConfig::in_memory()
+        Database::open_memory().context("Failed to create in-memory database")?
     };
-
-    // Apply auth setting from server config
-    db_config.auth_enabled = config.auth_enabled;
-
-    let db = Database::open(db_config).context("Failed to open database")?;
 
     let db = Arc::new(db);
 
@@ -242,21 +210,9 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     info!("  Max connections: {}", config.max_connections);
     info!("  Buffer pool: {} MB", config.buffer_pool_mb);
     info!("  Memory mode: {}", config.memory_mode);
-    info!("  Auth enabled: {}", config.auth_enabled);
 
-    // Create the gRPC server, optionally with TLS
+    // Create the gRPC server
     let grpc_server = GrpcServer::new(db.clone(), addr);
-    let grpc_server = if let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) {
-        info!("TLS enabled: cert={}, key={}", cert_path.display(), key_path.display());
-        if let Some(ref ca_path) = config.tls_ca_cert {
-            info!("mTLS enabled: ca_cert={}", ca_path.display());
-        }
-        grpc_server
-            .with_tls_files(cert_path, key_path, config.tls_ca_cert.as_deref())
-            .map_err(|e| anyhow::anyhow!("Failed to configure TLS: {}", e))?
-    } else {
-        grpc_server
-    };
 
     // Start the server with graceful shutdown
     info!("Starting gRPC server on {}...", addr);
@@ -276,12 +232,15 @@ async fn run_server(config: ServerConfig) -> Result<()> {
 
     // Graceful shutdown
     info!("Shutting down gracefully...");
-    
-    // Close all sessions
+
+    // Close all sessions and flush data to disk
     let stats = db.stats();
     if stats.active_sessions > 0 {
         warn!("Closing {} active sessions", stats.active_sessions);
     }
+
+    db.close();
+    info!("All data flushed to disk.");
 
     info!("Server stopped. Goodbye!");
     Ok(())

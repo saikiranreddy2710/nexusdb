@@ -130,17 +130,114 @@ impl SageTree {
     }
 
     /// Creates a new SageTree backed by the given [`Pager`].
+    ///
+    /// If the pager already contains pages (e.g. loaded from disk by
+    /// [`FilePager::open`]), call [`rebuild_from_pager`](Self::rebuild_from_pager)
+    /// afterwards to reconstruct the in-memory tree state (root pointer,
+    /// height, stats, bloom filter).
     pub fn with_pager(config: SageTreeConfig, pager: Box<dyn Pager>) -> Self {
         let bloom_filter = BloomFilter::with_rate(100_000, 0.01);
 
-        Self {
+        let mut tree = Self {
             config,
             pager,
             root: RwLock::new(None),
             height: AtomicU64::new(0),
             stats: RwLock::new(TreeStats::default()),
             bloom_filter: RwLock::new(bloom_filter),
+        };
+
+        // Auto-rebuild if the pager already has pages loaded
+        let has_leaves = !tree.pager.leaf_page_ids().is_empty();
+        let has_internals = !tree.pager.internal_page_ids().is_empty();
+        if has_leaves || has_internals {
+            let _ = tree.rebuild_from_pager();
         }
+
+        tree
+    }
+
+    /// Reconstructs tree state (root, height, stats, bloom filter) from
+    /// pages already present in the pager.
+    ///
+    /// This is called automatically by [`with_pager`](Self::with_pager) when
+    /// the pager has pre-loaded pages (e.g. from a [`FilePager`]).
+    pub fn rebuild_from_pager(&mut self) -> SageTreeResult<()> {
+        let leaf_ids = self.pager.leaf_page_ids();
+        let internal_ids = self.pager.internal_page_ids();
+
+        if leaf_ids.is_empty() && internal_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Find the root: the internal node with the highest level,
+        // or the single leaf if there are no internal nodes.
+        let mut max_level: u16 = 0;
+        let mut root_id: Option<PageId> = None;
+
+        for &pid in &internal_ids {
+            if let Ok(node) = self.pager.get_internal(pid) {
+                if node.header.level >= max_level {
+                    max_level = node.header.level;
+                    root_id = Some(pid);
+                }
+            }
+        }
+
+        // If no internal nodes, root is a leaf
+        if root_id.is_none() {
+            if leaf_ids.len() == 1 {
+                root_id = Some(leaf_ids[0]);
+            } else if !leaf_ids.is_empty() {
+                // Multiple leaves but no internal nodes — pick the one that
+                // has no prev_page (the leftmost leaf is the root at height 0
+                // only when there is exactly one leaf; multiple leaves without
+                // an internal parent shouldn't happen, but handle gracefully).
+                for &lid in &leaf_ids {
+                    if let Ok(node) = self.pager.get_leaf(lid) {
+                        if !node.base.header.prev_page.is_valid() {
+                            root_id = Some(lid);
+                            break;
+                        }
+                    }
+                }
+                if root_id.is_none() {
+                    root_id = Some(leaf_ids[0]);
+                }
+            }
+        }
+
+        // Count entries and rebuild bloom filter
+        let mut entry_count = 0usize;
+        let mut bloom = BloomFilter::with_rate(
+            std::cmp::max(100_000, leaf_ids.len() * 256),
+            0.01,
+        );
+
+        for &lid in &leaf_ids {
+            if let Ok(node) = self.pager.get_leaf(lid) {
+                let mut consolidated = node.base.clone();
+                consolidated = node.chain.apply_to_leaf(consolidated);
+                for entry in &consolidated.entries {
+                    bloom.insert(&entry.key);
+                    entry_count += 1;
+                }
+            }
+        }
+
+        // Set tree state
+        *self.root.write().unwrap() = root_id;
+        self.height.store(max_level as u64, AtomicOrdering::SeqCst);
+        *self.bloom_filter.write().unwrap() = bloom;
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.entry_count = entry_count;
+            stats.leaf_count = leaf_ids.len();
+            stats.internal_count = internal_ids.len();
+            stats.height = max_level as usize;
+        }
+
+        Ok(())
     }
 
     /// Flush the underlying pager to disk.
