@@ -502,6 +502,7 @@ impl Session {
             }
             Statement::CreateTable(_)
             | Statement::DropTable(_)
+            | Statement::AlterTable(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::CreateDatabase { .. }
@@ -525,6 +526,7 @@ impl Session {
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
+            Statement::AlterTable(alter) => Some(alter.table.table.clone()),
             Statement::DescribeTable(name) => Some(name.to_string()),
             Statement::CreateIndex(ci) => Some(format!("{} ON {}", ci.name, ci.table.table)),
             Statement::DropIndex(di) => Some(di.names.join(", ")),
@@ -614,6 +616,11 @@ impl Session {
                 self.plan_cache.clear();
                 self.result_cache.clear();
                 self.execute_drop_index(drop_index)
+            }
+            Statement::AlterTable(alter) => {
+                self.plan_cache.clear();
+                self.result_cache.invalidate_table(&alter.table.table);
+                self.execute_alter_table(alter)
             }
 
             // DML - invalidate result cache for affected tables
@@ -754,6 +761,241 @@ impl Session {
             self.storage().drop_table(name)?;
         }
         Ok(StatementResult::ddl("DROP TABLE"))
+    }
+
+    /// Executes ALTER TABLE.
+    fn execute_alter_table(
+        &self,
+        alter: &nexus_sql::parser::AlterTableStatement,
+    ) -> DatabaseResult<StatementResult> {
+        use nexus_sql::parser::AlterOperation;
+
+        let table_name = &alter.table.table;
+
+        // Check table exists
+        if !self.storage().table_exists(table_name) {
+            if alter.if_exists {
+                return Ok(StatementResult::ddl("ALTER TABLE"));
+            }
+            return Err(DatabaseError::StorageError(
+                nexus_sql::storage::StorageError::TableNotFound(table_name.clone()),
+            ));
+        }
+
+        // Apply each operation sequentially
+        for op in &alter.operations {
+            let table_info = self.storage().get_table_info(table_name).ok_or_else(|| {
+                DatabaseError::StorageError(nexus_sql::storage::StorageError::TableNotFound(
+                    table_name.clone(),
+                ))
+            })?;
+
+            match op {
+                AlterOperation::AddColumn(col_def) => {
+                    // Check column doesn't already exist
+                    if table_info.schema.index_of(&col_def.name).is_some() {
+                        return Err(DatabaseError::ExecutionError(format!(
+                            "column \"{}\" already exists in table \"{}\"",
+                            col_def.name, table_name
+                        )));
+                    }
+
+                    // Build new schema with the added column
+                    let new_field = if col_def.nullable {
+                        Field::nullable(&col_def.name, col_def.data_type.clone())
+                    } else {
+                        Field::not_null(&col_def.name, col_def.data_type.clone())
+                    };
+
+                    let mut new_fields: Vec<Field> = table_info.schema.fields().to_vec();
+                    new_fields.push(new_field);
+                    let new_schema = Schema::new(new_fields);
+
+                    let mut new_info = TableInfo::new(table_name.clone(), new_schema);
+                    new_info.primary_key = table_info.primary_key.clone();
+                    new_info.indexes = table_info.indexes.clone();
+                    new_info.table_id = table_info.table_id;
+                    new_info.row_count = table_info.row_count;
+
+                    // Rows gain a NULL column at the end
+                    let old_col_count = table_info.schema.len();
+                    self.storage().alter_table(table_name, new_info, |row| {
+                        let mut values: Vec<Value> = row.iter().cloned().collect();
+                        // Pad with NULLs if the row has fewer columns
+                        while values.len() <= old_col_count {
+                            values.push(Value::Null);
+                        }
+                        Row::new(values)
+                    })?;
+                }
+
+                AlterOperation::DropColumn { name, if_exists } => {
+                    let col_idx = match table_info.schema.index_of(name) {
+                        Some(idx) => idx,
+                        None => {
+                            if *if_exists {
+                                continue;
+                            }
+                            return Err(DatabaseError::ExecutionError(format!(
+                                "column \"{}\" does not exist in table \"{}\"",
+                                name, table_name
+                            )));
+                        }
+                    };
+
+                    // Prevent dropping last column
+                    if table_info.schema.len() <= 1 {
+                        return Err(DatabaseError::ExecutionError(
+                            "cannot drop the only column of a table".to_string(),
+                        ));
+                    }
+
+                    // Prevent dropping PK column
+                    if table_info.primary_key.contains(&col_idx) {
+                        return Err(DatabaseError::ExecutionError(format!(
+                            "cannot drop primary key column \"{}\"",
+                            name
+                        )));
+                    }
+
+                    // Build new schema without the dropped column
+                    let new_fields: Vec<Field> = table_info
+                        .schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != col_idx)
+                        .map(|(_, f)| f.clone())
+                        .collect();
+                    let new_schema = Schema::new(new_fields);
+
+                    // Adjust PK indices: indices after the dropped column shift left
+                    let new_pk: Vec<usize> = table_info
+                        .primary_key
+                        .iter()
+                        .filter(|&&i| i != col_idx)
+                        .map(|&i| if i > col_idx { i - 1 } else { i })
+                        .collect();
+
+                    // Adjust index column indices
+                    let new_indexes: Vec<_> = table_info
+                        .indexes
+                        .iter()
+                        .filter(|idx| !idx.columns.contains(&col_idx))
+                        .map(|idx| {
+                            let mut new_idx = idx.clone();
+                            new_idx.columns = idx
+                                .columns
+                                .iter()
+                                .map(|&c| if c > col_idx { c - 1 } else { c })
+                                .collect();
+                            new_idx
+                        })
+                        .collect();
+
+                    let mut new_info = TableInfo::new(table_name.clone(), new_schema);
+                    new_info.primary_key = new_pk;
+                    new_info.indexes = new_indexes;
+                    new_info.table_id = table_info.table_id;
+                    new_info.row_count = table_info.row_count;
+
+                    // Rows lose the column at col_idx
+                    self.storage().alter_table(table_name, new_info, |row| {
+                        let values: Vec<Value> = row
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != col_idx)
+                            .map(|(_, v)| v.clone())
+                            .collect();
+                        Row::new(values)
+                    })?;
+                }
+
+                AlterOperation::RenameColumn { old_name, new_name } => {
+                    let col_idx = table_info.schema.index_of(old_name).ok_or_else(|| {
+                        DatabaseError::ExecutionError(format!(
+                            "column \"{}\" does not exist in table \"{}\"",
+                            old_name, table_name
+                        ))
+                    })?;
+
+                    // Check new name doesn't conflict
+                    if table_info.schema.index_of(new_name).is_some() {
+                        return Err(DatabaseError::ExecutionError(format!(
+                            "column \"{}\" already exists in table \"{}\"",
+                            new_name, table_name
+                        )));
+                    }
+
+                    // Build new schema with the renamed column
+                    let new_fields: Vec<Field> = table_info
+                        .schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            if i == col_idx {
+                                if f.nullable {
+                                    Field::nullable(new_name.as_str(), f.data_type.clone())
+                                } else {
+                                    Field::not_null(new_name.as_str(), f.data_type.clone())
+                                }
+                            } else {
+                                f.clone()
+                            }
+                        })
+                        .collect();
+                    let new_schema = Schema::new(new_fields);
+
+                    let mut new_info = TableInfo::new(table_name.clone(), new_schema);
+                    new_info.primary_key = table_info.primary_key.clone();
+                    new_info.indexes = table_info.indexes.clone();
+                    new_info.table_id = table_info.table_id;
+                    new_info.row_count = table_info.row_count;
+
+                    // Data doesn't change — identity mapper
+                    self.storage()
+                        .alter_table(table_name, new_info, |row| row.clone())?;
+                }
+
+                AlterOperation::RenameTable(new_name) => {
+                    // Read all data, drop old table, create new table with new name
+                    let old_rows = {
+                        let store = self.storage().get_table(table_name).ok_or_else(|| {
+                            DatabaseError::StorageError(
+                                nexus_sql::storage::StorageError::TableNotFound(table_name.clone()),
+                            )
+                        })?;
+                        store.scan_all().map_err(DatabaseError::StorageError)?
+                    };
+
+                    self.storage()
+                        .drop_table(table_name)
+                        .map_err(DatabaseError::StorageError)?;
+
+                    let mut new_info =
+                        TableInfo::new(new_name.clone(), (*table_info.schema).clone());
+                    new_info.primary_key = table_info.primary_key.clone();
+                    new_info.indexes = table_info.indexes.clone();
+                    new_info.table_id = table_info.table_id;
+
+                    self.storage()
+                        .create_table(new_info)
+                        .map_err(DatabaseError::StorageError)?;
+                    self.storage()
+                        .execute_insert(new_name, old_rows)
+                        .map_err(DatabaseError::StorageError)?;
+                }
+
+                AlterOperation::AlterColumn { .. } => {
+                    return Err(DatabaseError::NotImplemented(
+                        "ALTER COLUMN (change type/nullability)".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(StatementResult::ddl("ALTER TABLE"))
     }
 
     /// Executes CREATE INDEX.
@@ -3104,5 +3346,282 @@ mod tests {
             "error should mention column mismatch: {}",
             err
         );
+    }
+
+    // =========================================================================
+    // ALTER TABLE end-to-end tests
+    // =========================================================================
+
+    #[test]
+    fn test_session_alter_table_add_column() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 'Alice')")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (2, 'Bob')").unwrap();
+
+        // ADD COLUMN
+        session.execute("ALTER TABLE t ADD COLUMN age INT").unwrap();
+
+        // Verify schema changed via DESCRIBE
+        let result = session.execute("DESCRIBE t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            // Should now have 3 columns
+            assert_eq!(qr.total_rows, 3, "should have 3 columns after ADD COLUMN");
+        } else {
+            panic!("expected Query result");
+        }
+
+        // Verify existing rows get NULL for new column
+        let result = session.execute("SELECT id, name, age FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2);
+            for row in qr.rows() {
+                assert_eq!(
+                    row.get(2).cloned(),
+                    Some(Value::Null),
+                    "new column should be NULL"
+                );
+            }
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_alter_table_drop_column() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 'Alice', 30)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (2, 'Bob', 25)")
+            .unwrap();
+
+        // DROP COLUMN
+        session.execute("ALTER TABLE t DROP COLUMN age").unwrap();
+
+        // Verify schema
+        let result = session.execute("DESCRIBE t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2, "should have 2 columns after DROP");
+        } else {
+            panic!("expected Query result");
+        }
+
+        // Verify data - should only have id and name
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_alter_table_rename_column() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 'Alice')")
+            .unwrap();
+
+        // RENAME COLUMN
+        session
+            .execute("ALTER TABLE t RENAME COLUMN name TO full_name")
+            .unwrap();
+
+        // Verify we can query with new name
+        let result = session.execute("SELECT full_name FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1);
+            assert_eq!(qr.rows()[0].get(0).cloned(), Some(Value::string("Alice")));
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_alter_table_add_column_duplicate_error() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        let result = session.execute("ALTER TABLE t ADD COLUMN name TEXT");
+        assert!(result.is_err(), "duplicate column should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("already exists"));
+    }
+
+    #[test]
+    fn test_session_alter_table_drop_column_not_found() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        let result = session.execute("ALTER TABLE t DROP COLUMN nonexistent");
+        assert!(result.is_err(), "dropping nonexistent column should fail");
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_session_alter_table_drop_column_if_exists() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        // DROP COLUMN IF EXISTS on nonexistent column should succeed
+        let result = session
+            .execute("ALTER TABLE t DROP COLUMN IF EXISTS nonexistent")
+            .unwrap();
+        assert!(matches!(result, StatementResult::Ddl { .. }));
+    }
+
+    #[test]
+    fn test_session_alter_table_drop_pk_column_error() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        let result = session.execute("ALTER TABLE t DROP COLUMN id");
+        assert!(result.is_err(), "dropping PK column should fail");
+        assert!(result.unwrap_err().to_string().contains("primary key"));
+    }
+
+    #[test]
+    fn test_session_alter_table_drop_last_column_error() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY)")
+            .unwrap();
+
+        let result = session.execute("ALTER TABLE t DROP COLUMN id");
+        // Could fail with either "only column" or "primary key" - both are valid
+        assert!(result.is_err(), "dropping last/PK column should fail");
+    }
+
+    #[test]
+    fn test_session_alter_table_rename_column_conflict() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)")
+            .unwrap();
+
+        let result = session.execute("ALTER TABLE t RENAME COLUMN name TO age");
+        assert!(result.is_err(), "rename to existing name should fail");
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_session_alter_table_if_exists_nonexistent() {
+        let mut session = create_session();
+
+        // IF EXISTS on nonexistent table should succeed silently
+        let result = session
+            .execute("ALTER TABLE IF EXISTS nonexistent ADD COLUMN x INT")
+            .unwrap();
+        assert!(matches!(result, StatementResult::Ddl { .. }));
+    }
+
+    #[test]
+    fn test_session_alter_table_add_then_insert() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        // Add a column then insert a row using it
+        session
+            .execute("ALTER TABLE t ADD COLUMN val TEXT")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (2, 'hello')")
+            .unwrap();
+
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_session_alter_table_rename_table() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE old_name (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO old_name VALUES (1, 'data')")
+            .unwrap();
+
+        // RENAME TABLE
+        session
+            .execute("ALTER TABLE old_name RENAME TO new_name")
+            .unwrap();
+
+        // Verify via SHOW TABLES that old_name is gone and new_name exists
+        let result = session.execute("SHOW TABLES").unwrap();
+        if let StatementResult::Query(qr) = &result {
+            let tables: Vec<String> = qr
+                .rows()
+                .iter()
+                .filter_map(|r| match r.get(0) {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !tables.contains(&"old_name".to_string()),
+                "old_name should not be in table list: {:?}",
+                tables
+            );
+            assert!(
+                tables.contains(&"new_name".to_string()),
+                "new_name should be in table list: {:?}",
+                tables
+            );
+        }
+
+        // New name should have the data
+        let result = session.execute("SELECT * FROM new_name").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1);
+        } else {
+            panic!("expected Query result");
+        }
+
+        // New name should have the data
+        let result = session.execute("SELECT * FROM new_name").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1);
+        } else {
+            panic!("expected Query result");
+        }
     }
 }
