@@ -206,6 +206,19 @@ impl Catalog {
         tables.len()
     }
 
+    /// Replaces the entire `TableInfo` for an existing table.
+    ///
+    /// Used by ALTER TABLE to update the schema while preserving table_id
+    /// and other metadata.
+    pub fn update_table(&self, info: TableInfo) -> StorageResult<()> {
+        let mut tables = self.tables.write().unwrap();
+        if !tables.contains_key(&info.name) {
+            return Err(StorageError::TableNotFound(info.name));
+        }
+        tables.insert(info.name.clone(), info);
+        Ok(())
+    }
+
     /// Updates the row count for a table.
     pub fn update_row_count(&self, name: &str, count: u64) -> StorageResult<()> {
         let mut tables = self.tables.write().unwrap();

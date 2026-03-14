@@ -240,6 +240,43 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Alters a table by replacing its schema and migrating existing rows.
+    ///
+    /// `row_mapper` transforms each old row into the new schema.  For ADD
+    /// COLUMN it appends NULLs, for DROP COLUMN it removes a column, for
+    /// RENAME COLUMN the data is unchanged (only the schema differs).
+    ///
+    /// The operation is atomic: the old `TableStore` is replaced by a new
+    /// one in a single lock scope.
+    pub fn alter_table(
+        &self,
+        name: &str,
+        new_info: TableInfo,
+        row_mapper: impl Fn(&Row) -> Row,
+    ) -> StorageResult<()> {
+        // 1. Read all rows from the old store
+        let old_store = self.get_table_store(name)?;
+        let old_rows = old_store.scan_all()?;
+
+        // 2. Update catalog with new schema
+        self.catalog.update_table(new_info.clone())?;
+
+        // 3. Create new table store with the new schema
+        let new_store = Arc::new(TableStore::new(new_info));
+
+        // 4. Re-insert rows mapped to the new schema
+        for old_row in &old_rows {
+            let new_row = row_mapper(old_row);
+            new_store.insert(new_row)?;
+        }
+
+        // 5. Atomically swap the store
+        let mut tables = self.tables.write().unwrap();
+        tables.insert(name.to_string(), new_store);
+
+        Ok(())
+    }
+
     /// Checks if a table exists.
     pub fn table_exists(&self, name: &str) -> bool {
         self.catalog.table_exists(name)
