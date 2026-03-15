@@ -1322,36 +1322,13 @@ impl Session {
         let vim = self.database.vector_index_manager();
         let vector_keys = vim.list_table_indexes(&self.current_database, table_name);
         if !vector_keys.is_empty() {
-            // Find HNSW index info to know which column has the vector
             for vk in &vector_keys {
                 if let Some(idx_info) = table_info.indexes.iter().find(|i| i.name == vk.index_name)
                 {
                     if let Some(&col_idx) = idx_info.columns.first() {
-                        for (row_i, row) in rows.iter().enumerate() {
+                        for row in rows.iter() {
                             if let Some(Value::Vector(ref vec_data)) = row.get(col_idx) {
-                                // Derive a VectorId from the primary key or row counter
-                                let vector_id: u64 = if !table_info.primary_key.is_empty() {
-                                    let pk_val = row
-                                        .get(table_info.primary_key[0])
-                                        .cloned()
-                                        .unwrap_or(Value::Null);
-                                    match pk_val {
-                                        Value::Int(v) => v as u64,
-                                        Value::BigInt(v) => v as u64,
-                                        Value::SmallInt(v) => v as u64,
-                                        Value::TinyInt(v) => v as u64,
-                                        _ => {
-                                            use std::hash::{Hash, Hasher};
-                                            let mut hasher =
-                                                std::collections::hash_map::DefaultHasher::new();
-                                            format!("{:?}", pk_val).hash(&mut hasher);
-                                            hasher.finish()
-                                        }
-                                    }
-                                } else {
-                                    row_i as u64
-                                };
-                                // Best-effort: ignore errors (e.g. duplicate id)
+                                let vector_id = Self::derive_vector_id(row, &table_info);
                                 let _ = vim.insert(vk, vector_id, vec_data);
                             }
                         }
@@ -1398,12 +1375,26 @@ impl Session {
                 let col_name = &assignment.column.column;
                 if let Some(col_idx) = table_info.schema.index_of(col_name) {
                     let val = self.eval_expr(&row, &assignment.value, &table_info.schema)?;
+
+                    // Auto-coerce for VECTOR columns (string -> Vector)
+                    let val = if matches!(
+                        &table_info.schema.fields()[col_idx].data_type,
+                        nexus_sql::parser::DataType::Vector(_)
+                    ) {
+                        val.cast(&table_info.schema.fields()[col_idx].data_type)
+                            .map_err(|e| DatabaseError::ExecutionError(e))?
+                    } else {
+                        val
+                    };
+
                     new_row.set(col_idx, val);
                 }
             }
 
             // Update the row
-            if self.storage().execute_update(table_name, new_row)? {
+            if self.storage().execute_update(table_name, new_row.clone())? {
+                // Sync HNSW vector indexes if any vector columns changed
+                self.sync_hnsw_update(table_name, &table_info, &row, &new_row);
                 updated_count += 1;
             }
         }
@@ -1451,6 +1442,8 @@ impl Session {
                 .collect();
 
             if self.storage().execute_delete(table_name, &key_values)? {
+                // Sync HNSW vector indexes — remove deleted vector entries
+                self.sync_hnsw_delete(table_name, &table_info, &row);
                 deleted_count += 1;
             }
         }
@@ -1911,6 +1904,92 @@ impl Session {
         };
 
         Ok(StatementResult::Query(result))
+    }
+
+    // =========================================================================
+    // HNSW Vector Index Helpers
+    // =========================================================================
+
+    /// Derives a `u64` vector ID from a row's primary key value.
+    ///
+    /// Integer PK types are cast directly; other types are hashed.
+    /// Returns 0 if the table has no primary key.
+    fn derive_vector_id(row: &Row, table_info: &nexus_sql::storage::TableInfo) -> u64 {
+        if table_info.primary_key.is_empty() {
+            return 0;
+        }
+        let pk_val = row
+            .get(table_info.primary_key[0])
+            .cloned()
+            .unwrap_or(Value::Null);
+        match pk_val {
+            Value::Int(v) => v as u64,
+            Value::BigInt(v) => v as u64,
+            Value::SmallInt(v) => v as u64,
+            Value::TinyInt(v) => v as u64,
+            _ => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                format!("{:?}", pk_val).hash(&mut hasher);
+                hasher.finish()
+            }
+        }
+    }
+
+    /// Syncs HNSW vector indexes after a row is deleted.
+    ///
+    /// Removes the vector entry from every HNSW index on the table.
+    fn sync_hnsw_delete(
+        &self,
+        table_name: &str,
+        table_info: &nexus_sql::storage::TableInfo,
+        row: &Row,
+    ) {
+        let vim = self.database.vector_index_manager();
+        let vector_keys = vim.list_table_indexes(&self.current_database, table_name);
+        for vk in &vector_keys {
+            let vector_id = Self::derive_vector_id(row, table_info);
+            let _ = vim.delete(vk, vector_id); // best-effort
+        }
+    }
+
+    /// Syncs HNSW vector indexes after a row is updated.
+    ///
+    /// If the vector column changed, removes the old entry and inserts the new one.
+    /// If only non-vector columns changed, no HNSW action is needed (vector_id
+    /// is PK-based, so the mapping is still valid).
+    fn sync_hnsw_update(
+        &self,
+        table_name: &str,
+        table_info: &nexus_sql::storage::TableInfo,
+        old_row: &Row,
+        new_row: &Row,
+    ) {
+        let vim = self.database.vector_index_manager();
+        let vector_keys = vim.list_table_indexes(&self.current_database, table_name);
+
+        for vk in &vector_keys {
+            if let Some(idx_info) = table_info.indexes.iter().find(|i| i.name == vk.index_name) {
+                if let Some(&col_idx) = idx_info.columns.first() {
+                    let old_vec = old_row.get(col_idx);
+                    let new_vec = new_row.get(col_idx);
+
+                    // Only sync if the vector column actually changed
+                    if old_vec != new_vec {
+                        let vector_id = Self::derive_vector_id(old_row, table_info);
+
+                        // Remove old entry
+                        let _ = vim.delete(vk, vector_id);
+
+                        // Insert new entry if the new value is a vector
+                        if let Some(Value::Vector(ref vec_data)) = new_vec {
+                            let new_vector_id = Self::derive_vector_id(new_row, table_info);
+                            let _ = vim.insert(vk, new_vector_id, vec_data);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================

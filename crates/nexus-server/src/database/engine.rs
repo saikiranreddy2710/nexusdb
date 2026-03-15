@@ -1316,4 +1316,187 @@ mod tests {
             panic!("expected Query result");
         }
     }
+
+    // =========================================================================
+    // HNSW sync on UPDATE/DELETE tests
+    // =========================================================================
+
+    /// Helper: set up a vector table with HNSW index and 3 rows.
+    fn setup_vector_table(
+        db: &Arc<Database>,
+    ) -> (crate::database::SessionId, crate::database::VectorIndexKey) {
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        session
+            .execute("CREATE TABLE vt (id INT PRIMARY KEY, embedding VECTOR(3))")
+            .unwrap();
+        session
+            .execute("CREATE INDEX idx_emb ON vt (embedding)")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO vt VALUES (1, '[1.0, 0.0, 0.0]')")
+            .unwrap();
+        session
+            .execute("INSERT INTO vt VALUES (2, '[0.0, 1.0, 0.0]')")
+            .unwrap();
+        session
+            .execute("INSERT INTO vt VALUES (3, '[0.0, 0.0, 1.0]')")
+            .unwrap();
+
+        let key = crate::database::VectorIndexKey::new(DEFAULT_DATABASE_NAME, "vt", "idx_emb");
+        (sid, key)
+    }
+
+    #[test]
+    fn test_hnsw_sync_delete_removes_vector() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (sid, key) = setup_vector_table(&db);
+
+        // Verify 3 vectors exist
+        let vim = db.vector_index_manager();
+        let results = vim.search(&key, &[0.5, 0.5, 0.5], 10).unwrap();
+        assert_eq!(results.len(), 3, "should start with 3 vectors");
+
+        // DELETE row id=2
+        {
+            let s = db.get_session(sid).unwrap();
+            let mut session = s.write().unwrap();
+            session.execute("DELETE FROM vt WHERE id = 2").unwrap();
+        }
+
+        // HNSW index should now have only 2 vectors
+        let results = vim.search(&key, &[0.5, 0.5, 0.5], 10).unwrap();
+        assert_eq!(results.len(), 2, "should have 2 vectors after DELETE");
+
+        // Verify the remaining vectors are id=1 and id=3
+        let mut ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 3], "id=2 should be removed from HNSW");
+    }
+
+    #[test]
+    fn test_hnsw_sync_delete_all_rows() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (sid, key) = setup_vector_table(&db);
+
+        // DELETE all rows
+        {
+            let s = db.get_session(sid).unwrap();
+            let mut session = s.write().unwrap();
+            session.execute("DELETE FROM vt").unwrap();
+        }
+
+        // HNSW index should be empty
+        let vim = db.vector_index_manager();
+        let results = vim.search(&key, &[0.5, 0.5, 0.5], 10).unwrap();
+        assert_eq!(results.len(), 0, "should have 0 vectors after DELETE all");
+    }
+
+    #[test]
+    fn test_hnsw_sync_update_changes_vector() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (sid, key) = setup_vector_table(&db);
+
+        // Search for nearest to [1,0,0] — should find id=1
+        let vim = db.vector_index_manager();
+        let results = vim.search(&key, &[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results[0].id, 1);
+
+        // UPDATE id=1's vector to point in a very different direction
+        {
+            let s = db.get_session(sid).unwrap();
+            let mut session = s.write().unwrap();
+            session
+                .execute("UPDATE vt SET embedding = '[0.0, 0.0, 0.9]' WHERE id = 1")
+                .unwrap();
+        }
+
+        // Now search for nearest to [1,0,0] — id=1 should NO LONGER be closest
+        // (it was moved to [0,0,0.9]). id=2 ([0,1,0]) or id=3 ([0,0,1]) should be closest.
+        let results = vim.search(&key, &[1.0, 0.0, 0.0], 3).unwrap();
+        assert_eq!(results.len(), 3, "should still have 3 vectors");
+
+        // Search for nearest to [0,0,1] — id=1 (now [0,0,0.9]) and id=3 ([0,0,1]) should be top 2
+        let results = vim.search(&key, &[0.0, 0.0, 1.0], 2).unwrap();
+        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        assert!(
+            ids.contains(&3) || ids.contains(&1),
+            "updated vector should be findable at new location"
+        );
+    }
+
+    #[test]
+    fn test_hnsw_sync_update_non_vector_column_no_change() {
+        let db = Arc::new(Database::open_memory().unwrap());
+
+        let sid = db.create_session(DEFAULT_DATABASE_NAME);
+        let s = db.get_session(sid).unwrap();
+        let mut session = s.write().unwrap();
+
+        session
+            .execute("CREATE TABLE vt2 (id INT PRIMARY KEY, name TEXT, embedding VECTOR(3))")
+            .unwrap();
+        session
+            .execute("CREATE INDEX idx_emb2 ON vt2 (embedding)")
+            .unwrap();
+        session
+            .execute("INSERT INTO vt2 VALUES (1, 'Alice', '[1.0, 0.0, 0.0]')")
+            .unwrap();
+
+        let key = crate::database::VectorIndexKey::new(DEFAULT_DATABASE_NAME, "vt2", "idx_emb2");
+
+        // Verify vector exists
+        let vim = db.vector_index_manager();
+        let results = vim.search(&key, &[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 1);
+
+        // UPDATE only the name column — vector should not change
+        session
+            .execute("UPDATE vt2 SET name = 'Bob' WHERE id = 1")
+            .unwrap();
+
+        // Vector should still be searchable at the same location
+        let results = vim.search(&key, &[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "vector should still exist after non-vector update"
+        );
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn test_hnsw_sync_delete_then_reinsert() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (sid, key) = setup_vector_table(&db);
+
+        let vim = db.vector_index_manager();
+
+        // DELETE id=2
+        {
+            let s = db.get_session(sid).unwrap();
+            let mut session = s.write().unwrap();
+            session.execute("DELETE FROM vt WHERE id = 2").unwrap();
+        }
+
+        let results = vim.search(&key, &[0.5, 0.5, 0.5], 10).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Re-insert id=2 with a different vector
+        {
+            let s = db.get_session(sid).unwrap();
+            let mut session = s.write().unwrap();
+            session
+                .execute("INSERT INTO vt VALUES (2, '[0.5, 0.5, 0.5]')")
+                .unwrap();
+        }
+
+        // Should have 3 vectors again
+        let results = vim.search(&key, &[0.5, 0.5, 0.5], 10).unwrap();
+        assert_eq!(results.len(), 3, "should have 3 vectors after re-insert");
+    }
 }
