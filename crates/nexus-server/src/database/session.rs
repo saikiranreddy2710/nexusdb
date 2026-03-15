@@ -1391,12 +1391,14 @@ impl Session {
                 }
             }
 
-            // Apply updates
+            // Apply updates — evaluate expressions against the ORIGINAL row
+            // so that `SET x = x + 1` reads the old value of x.
             let mut new_row = row.clone();
             for assignment in &update.assignments {
                 let col_name = &assignment.column.column;
                 if let Some(col_idx) = table_info.schema.index_of(col_name) {
-                    new_row.set(col_idx, self.eval_literal(&assignment.value)?);
+                    let val = self.eval_expr(&row, &assignment.value, &table_info.schema)?;
+                    new_row.set(col_idx, val);
                 }
             }
 
@@ -1939,59 +1941,33 @@ impl Session {
         }
     }
 
-    /// Evaluates a WHERE clause against a row.
+    /// Evaluates a WHERE clause against a row, returning a boolean result.
+    ///
+    /// Delegates to `eval_expr` for the full expression evaluation and coerces
+    /// the result to a boolean. NULL is treated as false (row excluded).
     fn eval_where(&self, row: &Row, expr: &Expr, schema: &Schema) -> DatabaseResult<bool> {
-        match expr {
-            Expr::BinaryOp { left, op, right } => {
-                // Handle AND/OR specially
-                match op {
-                    BinaryOperator::And => {
-                        return Ok(self.eval_where(row, left, schema)?
-                            && self.eval_where(row, right, schema)?);
-                    }
-                    BinaryOperator::Or => {
-                        return Ok(self.eval_where(row, left, schema)?
-                            || self.eval_where(row, right, schema)?);
-                    }
-                    _ => {}
-                }
-
-                let left_val = self.eval_expr(row, left, schema)?;
-                let right_val = self.eval_expr(row, right, schema)?;
-
-                Ok(match op {
-                    BinaryOperator::Eq => left_val == right_val,
-                    BinaryOperator::NotEq => left_val != right_val,
-                    BinaryOperator::Lt => left_val < right_val,
-                    BinaryOperator::LtEq => left_val <= right_val,
-                    BinaryOperator::Gt => left_val > right_val,
-                    BinaryOperator::GtEq => left_val >= right_val,
-                    _ => {
-                        return Err(DatabaseError::ExecutionError(format!(
-                            "unsupported operator in WHERE: {:?}",
-                            op
-                        )))
-                    }
-                })
-            }
-            Expr::IsNull(e) => {
-                let val = self.eval_expr(row, e, schema)?;
-                Ok(val == Value::Null)
-            }
-            Expr::IsNotNull(e) => {
-                let val = self.eval_expr(row, e, schema)?;
-                Ok(val != Value::Null)
-            }
-            _ => Err(DatabaseError::ExecutionError(
-                "unsupported WHERE expression".to_string(),
-            )),
+        let val = self.eval_expr(row, expr, schema)?;
+        match val {
+            Value::Boolean(b) => Ok(b),
+            Value::Null => Ok(false), // NULL in WHERE context = exclude row
+            _ => Err(DatabaseError::ExecutionError(format!(
+                "WHERE clause must evaluate to boolean, got {:?}",
+                val
+            ))),
         }
     }
 
     /// Evaluates an expression against a row.
+    /// Evaluates an arbitrary expression against a row.
+    ///
+    /// Supports literals, column references, arithmetic (`+`, `-`, `*`, `/`, `%`),
+    /// string concatenation (`||`), unary operators (`-`, `NOT`), scalar functions
+    /// (UPPER, LOWER, ABS, etc.), CASE expressions, CAST, IS NULL, IS NOT NULL,
+    /// and parenthesized sub-expressions.
     fn eval_expr(&self, row: &Row, expr: &Expr, schema: &Schema) -> DatabaseResult<Value> {
         match expr {
             Expr::Literal(lit) => Ok(Value::from_literal(lit)),
+
             Expr::Column(col_ref) => {
                 if let Some(idx) = schema.index_of(&col_ref.column) {
                     Ok(row.get(idx).cloned().unwrap_or(Value::Null))
@@ -2002,9 +1978,269 @@ impl Session {
                     )))
                 }
             }
-            _ => Err(DatabaseError::ExecutionError(
-                "complex expression in WHERE not fully supported".to_string(),
-            )),
+
+            Expr::BinaryOp { left, op, right } => {
+                let lv = self.eval_expr(row, left, schema)?;
+                let rv = self.eval_expr(row, right, schema)?;
+
+                // NULL propagation: any arithmetic with NULL yields NULL
+                if lv.is_null() || rv.is_null() {
+                    // Logical operators handle NULL differently
+                    match op {
+                        BinaryOperator::And => {
+                            // FALSE AND NULL = FALSE; NULL AND TRUE = NULL
+                            if matches!(&lv, Value::Boolean(false))
+                                || matches!(&rv, Value::Boolean(false))
+                            {
+                                return Ok(Value::Boolean(false));
+                            }
+                            return Ok(Value::Null);
+                        }
+                        BinaryOperator::Or => {
+                            // TRUE OR NULL = TRUE; NULL OR FALSE = NULL
+                            if matches!(&lv, Value::Boolean(true))
+                                || matches!(&rv, Value::Boolean(true))
+                            {
+                                return Ok(Value::Boolean(true));
+                            }
+                            return Ok(Value::Null);
+                        }
+                        BinaryOperator::Eq => return Ok(Value::Null),
+                        BinaryOperator::NotEq => return Ok(Value::Null),
+                        _ => return Ok(Value::Null),
+                    }
+                }
+
+                match op {
+                    // Arithmetic
+                    BinaryOperator::Plus => match (&lv, &rv) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+                        (Value::BigInt(a), Value::BigInt(b)) => Ok(Value::BigInt(a + b)),
+                        _ => {
+                            if let (Some(a), Some(b)) = (lv.to_f64(), rv.to_f64()) {
+                                Ok(Value::Double(a + b))
+                            } else {
+                                Err(DatabaseError::ExecutionError(format!(
+                                    "cannot add {:?} and {:?}",
+                                    lv, rv
+                                )))
+                            }
+                        }
+                    },
+                    BinaryOperator::Minus => match (&lv, &rv) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+                        (Value::BigInt(a), Value::BigInt(b)) => Ok(Value::BigInt(a - b)),
+                        _ => {
+                            if let (Some(a), Some(b)) = (lv.to_f64(), rv.to_f64()) {
+                                Ok(Value::Double(a - b))
+                            } else {
+                                Err(DatabaseError::ExecutionError(format!(
+                                    "cannot subtract {:?} and {:?}",
+                                    lv, rv
+                                )))
+                            }
+                        }
+                    },
+                    BinaryOperator::Multiply => match (&lv, &rv) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+                        (Value::BigInt(a), Value::BigInt(b)) => Ok(Value::BigInt(a * b)),
+                        _ => {
+                            if let (Some(a), Some(b)) = (lv.to_f64(), rv.to_f64()) {
+                                Ok(Value::Double(a * b))
+                            } else {
+                                Err(DatabaseError::ExecutionError(format!(
+                                    "cannot multiply {:?} and {:?}",
+                                    lv, rv
+                                )))
+                            }
+                        }
+                    },
+                    BinaryOperator::Divide => {
+                        if let (Some(a), Some(b)) = (lv.to_f64(), rv.to_f64()) {
+                            if b == 0.0 {
+                                Err(DatabaseError::ExecutionError(
+                                    "division by zero".to_string(),
+                                ))
+                            } else {
+                                Ok(Value::Double(a / b))
+                            }
+                        } else {
+                            Err(DatabaseError::ExecutionError(format!(
+                                "cannot divide {:?} by {:?}",
+                                lv, rv
+                            )))
+                        }
+                    }
+                    BinaryOperator::Modulo => match (&lv, &rv) {
+                        (Value::Int(a), Value::Int(b)) => {
+                            if *b == 0 {
+                                Err(DatabaseError::ExecutionError(
+                                    "division by zero".to_string(),
+                                ))
+                            } else {
+                                Ok(Value::Int(a % b))
+                            }
+                        }
+                        (Value::BigInt(a), Value::BigInt(b)) => {
+                            if *b == 0 {
+                                Err(DatabaseError::ExecutionError(
+                                    "division by zero".to_string(),
+                                ))
+                            } else {
+                                Ok(Value::BigInt(a % b))
+                            }
+                        }
+                        _ => {
+                            if let (Some(a), Some(b)) = (lv.to_f64(), rv.to_f64()) {
+                                if b == 0.0 {
+                                    Err(DatabaseError::ExecutionError(
+                                        "division by zero".to_string(),
+                                    ))
+                                } else {
+                                    Ok(Value::Double(a % b))
+                                }
+                            } else {
+                                Err(DatabaseError::ExecutionError(format!(
+                                    "cannot modulo {:?} by {:?}",
+                                    lv, rv
+                                )))
+                            }
+                        }
+                    },
+
+                    // String concatenation
+                    BinaryOperator::Concat => {
+                        let ls = lv.to_string_value().unwrap_or_default();
+                        let rs = rv.to_string_value().unwrap_or_default();
+                        Ok(Value::String(format!("{}{}", ls, rs)))
+                    }
+
+                    // Comparison operators (return Boolean)
+                    BinaryOperator::Eq => Ok(Value::Boolean(lv == rv)),
+                    BinaryOperator::NotEq => Ok(Value::Boolean(lv != rv)),
+                    BinaryOperator::Lt => Ok(Value::Boolean(lv < rv)),
+                    BinaryOperator::LtEq => Ok(Value::Boolean(lv <= rv)),
+                    BinaryOperator::Gt => Ok(Value::Boolean(lv > rv)),
+                    BinaryOperator::GtEq => Ok(Value::Boolean(lv >= rv)),
+
+                    // Logical operators
+                    BinaryOperator::And => {
+                        let lb = lv.to_bool().unwrap_or(false);
+                        let rb = rv.to_bool().unwrap_or(false);
+                        Ok(Value::Boolean(lb && rb))
+                    }
+                    BinaryOperator::Or => {
+                        let lb = lv.to_bool().unwrap_or(false);
+                        let rb = rv.to_bool().unwrap_or(false);
+                        Ok(Value::Boolean(lb || rb))
+                    }
+
+                    _ => Err(DatabaseError::ExecutionError(format!(
+                        "unsupported binary operator: {:?}",
+                        op
+                    ))),
+                }
+            }
+
+            Expr::UnaryOp { op, expr: inner } => {
+                let val = self.eval_expr(row, inner, schema)?;
+                match op {
+                    UnaryOperator::Minus => match &val {
+                        Value::Int(n) => Ok(Value::Int(-n)),
+                        Value::BigInt(n) => Ok(Value::BigInt(-n)),
+                        Value::Float(n) => Ok(Value::Float(-n)),
+                        Value::Double(n) => Ok(Value::Double(-n)),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(DatabaseError::ExecutionError(format!(
+                            "cannot negate {:?}",
+                            val
+                        ))),
+                    },
+                    UnaryOperator::Plus => Ok(val), // no-op
+                    UnaryOperator::Not => match &val {
+                        Value::Boolean(b) => Ok(Value::Boolean(!b)),
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(DatabaseError::ExecutionError(format!(
+                            "NOT requires boolean, got {:?}",
+                            val
+                        ))),
+                    },
+                    _ => Err(DatabaseError::ExecutionError(format!(
+                        "unsupported unary operator: {:?}",
+                        op
+                    ))),
+                }
+            }
+
+            Expr::Function(func) => {
+                // Evaluate function arguments
+                let args: DatabaseResult<Vec<Value>> = func
+                    .args
+                    .iter()
+                    .map(|a| self.eval_expr(row, a, schema))
+                    .collect();
+                let args = args?;
+
+                nexus_sql::executor::evaluate_scalar_function(&func.name, &args)
+                    .map_err(|e| DatabaseError::ExecutionError(format!("function error: {}", e)))
+            }
+
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    // Simple CASE: CASE expr WHEN val THEN result ...
+                    let op_val = self.eval_expr(row, op, schema)?;
+                    for (when_expr, then_expr) in when_clauses {
+                        let when_val = self.eval_expr(row, when_expr, schema)?;
+                        if op_val == when_val {
+                            return self.eval_expr(row, then_expr, schema);
+                        }
+                    }
+                } else {
+                    // Searched CASE: CASE WHEN condition THEN result ...
+                    for (when_expr, then_expr) in when_clauses {
+                        let cond = self.eval_expr(row, when_expr, schema)?;
+                        if matches!(cond, Value::Boolean(true)) {
+                            return self.eval_expr(row, then_expr, schema);
+                        }
+                    }
+                }
+                // ELSE clause
+                if let Some(else_expr) = else_clause {
+                    self.eval_expr(row, else_expr, schema)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+
+            Expr::Cast {
+                expr: inner,
+                data_type,
+            } => {
+                let val = self.eval_expr(row, inner, schema)?;
+                val.cast(data_type)
+                    .map_err(|e| DatabaseError::ExecutionError(format!("CAST error: {}", e)))
+            }
+
+            Expr::IsNull(inner) => {
+                let val = self.eval_expr(row, inner, schema)?;
+                Ok(Value::Boolean(val.is_null()))
+            }
+
+            Expr::IsNotNull(inner) => {
+                let val = self.eval_expr(row, inner, schema)?;
+                Ok(Value::Boolean(!val.is_null()))
+            }
+
+            Expr::Nested(inner) => self.eval_expr(row, inner, schema),
+
+            _ => Err(DatabaseError::ExecutionError(format!(
+                "unsupported expression in SET/WHERE: {:?}",
+                std::mem::discriminant(expr)
+            ))),
         }
     }
 
@@ -3620,6 +3856,247 @@ mod tests {
         let result = session.execute("SELECT * FROM new_name").unwrap();
         if let StatementResult::Query(qr) = result {
             assert_eq!(qr.total_rows, 1);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    // =========================================================================
+    // UPDATE SET expression tests
+    // =========================================================================
+
+    #[test]
+    fn test_session_update_set_column_plus_literal() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+        // SET val = val + 5
+        let result = session.execute("UPDATE t SET val = val + 5").unwrap();
+        if let StatementResult::Update { rows_affected } = result {
+            assert_eq!(rows_affected, 2);
+        } else {
+            panic!("expected Update result");
+        }
+
+        // Verify: 10+5=15, 20+5=25
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::Int(15));
+
+        let result = session.execute("SELECT val FROM t WHERE id = 2").unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::Int(25));
+    }
+
+    #[test]
+    fn test_session_update_set_multiply() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, price INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+        // SET price = price * 2
+        session.execute("UPDATE t SET price = price * 2").unwrap();
+
+        let result = session.execute("SELECT price FROM t WHERE id = 1").unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::Int(200));
+    }
+
+    #[test]
+    fn test_session_update_set_subtract_and_divide() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+        // SET val = val - 10
+        session.execute("UPDATE t SET val = val - 10").unwrap();
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        let val = extract_single_value(result);
+        assert_eq!(val, Value::Int(90));
+    }
+
+    #[test]
+    fn test_session_update_set_with_where_expression() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+        // Only update rows where val > 15
+        session
+            .execute("UPDATE t SET val = val + 100 WHERE val > 15")
+            .unwrap();
+
+        // id=1: val=10 (unchanged), id=2: val=120, id=3: val=130
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(10));
+
+        let result = session.execute("SELECT val FROM t WHERE id = 2").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(120));
+
+        let result = session.execute("SELECT val FROM t WHERE id = 3").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(130));
+    }
+
+    #[test]
+    fn test_session_update_set_column_to_column() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10, 20)").unwrap();
+
+        // SET a = b (copy column value)
+        session.execute("UPDATE t SET a = b WHERE id = 1").unwrap();
+
+        let result = session.execute("SELECT a FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(20));
+    }
+
+    #[test]
+    fn test_session_update_set_cross_column_arithmetic() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10, 3)").unwrap();
+
+        // SET a = a + b
+        session
+            .execute("UPDATE t SET a = a + b WHERE id = 1")
+            .unwrap();
+
+        let result = session.execute("SELECT a FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(13));
+    }
+
+    #[test]
+    fn test_session_update_set_string_concat() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 'hello')")
+            .unwrap();
+
+        // SET name = name || ' world'
+        session
+            .execute("UPDATE t SET name = name || ' world' WHERE id = 1")
+            .unwrap();
+
+        let result = session.execute("SELECT name FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::string("hello world"));
+    }
+
+    #[test]
+    fn test_session_update_set_function_call() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 'hello')")
+            .unwrap();
+
+        // SET name = UPPER(name)
+        session
+            .execute("UPDATE t SET name = UPPER(name) WHERE id = 1")
+            .unwrap();
+
+        let result = session.execute("SELECT name FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::string("HELLO"));
+    }
+
+    #[test]
+    fn test_session_update_set_negation() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 42)").unwrap();
+
+        // SET val = -val
+        session
+            .execute("UPDATE t SET val = -val WHERE id = 1")
+            .unwrap();
+
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(-42));
+    }
+
+    #[test]
+    fn test_session_update_set_null_propagation() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+
+        // SET val = val + 1 — NULL + 1 = NULL
+        session
+            .execute("UPDATE t SET val = val + 1 WHERE id = 1")
+            .unwrap();
+
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::Null);
+    }
+
+    #[test]
+    fn test_session_update_set_division_by_zero() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 42)").unwrap();
+
+        // SET val = val / 0 — should error
+        let result = session.execute("UPDATE t SET val = val / 0");
+        assert!(result.is_err(), "division by zero should fail");
+        assert!(result.unwrap_err().to_string().contains("division by zero"));
+    }
+
+    #[test]
+    fn test_session_update_multiple_set_expressions() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10, 20)").unwrap();
+
+        // SET a = a + 1, b = b * 2
+        session
+            .execute("UPDATE t SET a = a + 1, b = b * 2 WHERE id = 1")
+            .unwrap();
+
+        let result = session.execute("SELECT a, b FROM t WHERE id = 1").unwrap();
+        if let StatementResult::Query(qr) = result {
+            let row = &qr.rows()[0];
+            assert_eq!(row.get(0).cloned(), Some(Value::Int(11)));
+            assert_eq!(row.get(1).cloned(), Some(Value::Int(40)));
         } else {
             panic!("expected Query result");
         }

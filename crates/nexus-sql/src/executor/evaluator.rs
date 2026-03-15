@@ -336,8 +336,8 @@ fn evaluate_case(
     }
 }
 
-/// Evaluates a scalar function.
-fn evaluate_scalar_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+/// Evaluates a scalar function by name and arguments.
+pub fn evaluate_scalar_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name.to_lowercase().as_str() {
         // String functions
         "upper" => {
