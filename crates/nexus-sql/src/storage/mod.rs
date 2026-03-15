@@ -37,7 +37,7 @@ mod engine;
 mod error;
 mod table;
 
-pub use catalog::{Catalog, IndexInfo, IndexType, TableInfo};
+pub use catalog::{Catalog, CheckConstraint, ColumnDefault, IndexInfo, IndexType, TableInfo};
 pub use encoder::{EncodingFormat, RowDecoder, RowEncoder};
 pub use engine::{QuerySession, StorageEngine};
 pub use error::{StorageError, StorageResult};

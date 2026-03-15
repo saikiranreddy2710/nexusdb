@@ -9,6 +9,22 @@ use crate::logical::Schema;
 
 use super::error::{StorageError, StorageResult};
 
+/// A stored default value expression for a column.
+#[derive(Debug, Clone)]
+pub struct ColumnDefault {
+    /// Column index.
+    pub col_idx: usize,
+    /// Default value (pre-evaluated to a Value for efficiency).
+    pub value: crate::executor::Value,
+}
+
+/// A stored CHECK constraint.
+#[derive(Debug, Clone)]
+pub struct CheckConstraint {
+    /// The check expression (parsed AST).
+    pub expr: crate::parser::Expr,
+}
+
 /// Information about a table.
 #[derive(Debug, Clone)]
 pub struct TableInfo {
@@ -24,6 +40,12 @@ pub struct TableInfo {
     pub row_count: u64,
     /// Table ID (for internal use).
     pub table_id: u64,
+    /// Column indices that have a UNIQUE constraint (excluding PK).
+    pub unique_columns: Vec<usize>,
+    /// Default values for columns.
+    pub defaults: Vec<ColumnDefault>,
+    /// CHECK constraints.
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 impl TableInfo {
@@ -36,6 +58,9 @@ impl TableInfo {
             indexes: Vec::new(),
             row_count: 0,
             table_id: 0,
+            unique_columns: Vec::new(),
+            defaults: Vec::new(),
+            check_constraints: Vec::new(),
         }
     }
 

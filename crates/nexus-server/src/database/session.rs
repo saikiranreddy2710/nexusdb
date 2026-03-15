@@ -728,11 +728,59 @@ impl Session {
             .map(|(i, _)| i)
             .collect();
 
+        // Collect UNIQUE column indices (from column-level constraints)
+        let unique_columns: Vec<usize> = create
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| {
+                col.constraints
+                    .iter()
+                    .any(|c| matches!(c, ColumnConstraint::Unique))
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        // Collect DEFAULT values (evaluate literal defaults at CREATE time)
+        let defaults: Vec<nexus_sql::storage::ColumnDefault> = create
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| {
+                col.default.as_ref().and_then(|expr| {
+                    self.eval_literal(expr)
+                        .ok()
+                        .map(|val| nexus_sql::storage::ColumnDefault {
+                            col_idx: i,
+                            value: val,
+                        })
+                })
+            })
+            .collect();
+
+        // Collect CHECK constraints
+        let check_constraints: Vec<nexus_sql::storage::CheckConstraint> = create
+            .columns
+            .iter()
+            .filter_map(|col| {
+                col.constraints.iter().find_map(|c| {
+                    if let ColumnConstraint::Check(expr) = c {
+                        Some(nexus_sql::storage::CheckConstraint { expr: expr.clone() })
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
         // Create table info
         let mut info = TableInfo::new(name.clone(), schema);
         if !primary_key.is_empty() {
             info = info.with_primary_key(primary_key);
         }
+        info.unique_columns = unique_columns;
+        info.defaults = defaults;
+        info.check_constraints = check_constraints;
 
         self.storage().create_table(info)?;
 
@@ -816,6 +864,9 @@ impl Session {
                     new_info.indexes = table_info.indexes.clone();
                     new_info.table_id = table_info.table_id;
                     new_info.row_count = table_info.row_count;
+                    new_info.unique_columns = table_info.unique_columns.clone();
+                    new_info.defaults = table_info.defaults.clone();
+                    new_info.check_constraints = table_info.check_constraints.clone();
 
                     // Rows gain a NULL column at the end
                     let old_col_count = table_info.schema.len();
@@ -898,6 +949,27 @@ impl Session {
                     new_info.indexes = new_indexes;
                     new_info.table_id = table_info.table_id;
                     new_info.row_count = table_info.row_count;
+                    // Remove dropped column from unique/default lists and adjust indices
+                    new_info.unique_columns = table_info
+                        .unique_columns
+                        .iter()
+                        .filter(|&&i| i != col_idx)
+                        .map(|&i| if i > col_idx { i - 1 } else { i })
+                        .collect();
+                    new_info.defaults = table_info
+                        .defaults
+                        .iter()
+                        .filter(|d| d.col_idx != col_idx)
+                        .map(|d| nexus_sql::storage::ColumnDefault {
+                            col_idx: if d.col_idx > col_idx {
+                                d.col_idx - 1
+                            } else {
+                                d.col_idx
+                            },
+                            value: d.value.clone(),
+                        })
+                        .collect();
+                    new_info.check_constraints = table_info.check_constraints.clone();
 
                     // Rows lose the column at col_idx
                     self.storage().alter_table(table_name, new_info, |row| {
@@ -952,6 +1024,9 @@ impl Session {
                     new_info.indexes = table_info.indexes.clone();
                     new_info.table_id = table_info.table_id;
                     new_info.row_count = table_info.row_count;
+                    new_info.unique_columns = table_info.unique_columns.clone();
+                    new_info.defaults = table_info.defaults.clone();
+                    new_info.check_constraints = table_info.check_constraints.clone();
 
                     // Data doesn't change — identity mapper
                     self.storage()
@@ -1201,7 +1276,7 @@ impl Session {
         };
 
         // Build rows from the INSERT source
-        let rows = match &insert.values {
+        let mut rows = match &insert.values {
             InsertSource::Values(value_rows) => {
                 let mut rows = Vec::with_capacity(value_rows.len());
                 for value_row in value_rows {
@@ -1310,11 +1385,18 @@ impl Session {
                 rows
             }
             InsertSource::DefaultValues => {
-                // Single row of all NULLs / defaults
+                // Single row — defaults will be applied below
                 let row_values = vec![Value::Null; schema.fields().len()];
                 vec![Row::new(row_values)]
             }
         };
+
+        // Apply defaults and validate constraints for each row
+        for row in &mut rows {
+            Self::apply_defaults(row, &table_info);
+            self.validate_row(row, &table_info)?;
+            self.validate_unique(row, table_name, &table_info, None)?;
+        }
 
         let count = self.storage().execute_insert(table_name, rows.clone())?;
 
@@ -1390,6 +1472,17 @@ impl Session {
                     new_row.set(col_idx, val);
                 }
             }
+
+            // Validate constraints on the new row
+            self.validate_row(&new_row, &table_info)?;
+
+            // For UNIQUE checks, exclude the current row (same PK)
+            let pk_vals: Vec<Value> = table_info
+                .primary_key
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                .collect();
+            self.validate_unique(&new_row, table_name, &table_info, Some(&pk_vals))?;
 
             // Update the row
             if self.storage().execute_update(table_name, new_row.clone())? {
@@ -1904,6 +1997,123 @@ impl Session {
         };
 
         Ok(StatementResult::Query(result))
+    }
+
+    // =========================================================================
+    // Constraint Enforcement
+    // =========================================================================
+
+    /// Applies DEFAULT values to a row for columns that are NULL and have defaults.
+    fn apply_defaults(row: &mut Row, table_info: &nexus_sql::storage::TableInfo) {
+        for def in &table_info.defaults {
+            if def.col_idx < row.num_columns() {
+                if let Some(val) = row.get(def.col_idx) {
+                    if val.is_null() {
+                        row.set(def.col_idx, def.value.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Validates a row against table constraints (NOT NULL, CHECK).
+    ///
+    /// Should be called after defaults have been applied.
+    fn validate_row(
+        &self,
+        row: &Row,
+        table_info: &nexus_sql::storage::TableInfo,
+    ) -> DatabaseResult<()> {
+        // NOT NULL enforcement
+        for (i, field) in table_info.schema.fields().iter().enumerate() {
+            if !field.nullable {
+                if let Some(val) = row.get(i) {
+                    if val.is_null() {
+                        return Err(DatabaseError::ExecutionError(format!(
+                            "NOT NULL constraint violated: column '{}' cannot be NULL",
+                            field.name()
+                        )));
+                    }
+                }
+            }
+        }
+
+        // CHECK constraint enforcement
+        for check in &table_info.check_constraints {
+            let result = self.eval_expr(row, &check.expr, &table_info.schema)?;
+            match result {
+                Value::Boolean(true) | Value::Null => {} // NULL = unknown, pass per SQL standard
+                Value::Boolean(false) => {
+                    return Err(DatabaseError::ExecutionError(format!(
+                        "CHECK constraint violated: {}",
+                        check.expr
+                    )));
+                }
+                _ => {
+                    return Err(DatabaseError::ExecutionError(
+                        "CHECK constraint must evaluate to boolean".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates UNIQUE constraint for a row against existing table data.
+    ///
+    /// Checks each unique column to ensure no other row has the same value.
+    /// `exclude_pk` allows skipping the row being updated (identified by PK).
+    fn validate_unique(
+        &self,
+        row: &Row,
+        table_name: &str,
+        table_info: &nexus_sql::storage::TableInfo,
+        exclude_pk: Option<&[Value]>,
+    ) -> DatabaseResult<()> {
+        if table_info.unique_columns.is_empty() {
+            return Ok(());
+        }
+
+        let batches = self.storage().execute_scan(table_name)?;
+        let existing_rows: Vec<Row> = batches.iter().flat_map(|b| b.rows()).collect();
+
+        for &col_idx in &table_info.unique_columns {
+            let new_val = row.get(col_idx).cloned().unwrap_or(Value::Null);
+            if new_val.is_null() {
+                continue; // NULL is allowed in UNIQUE columns (per SQL standard)
+            }
+
+            for existing in &existing_rows {
+                // Skip the row we're updating (same PK)
+                if let Some(pk_vals) = exclude_pk {
+                    let existing_pk: Vec<Value> = table_info
+                        .primary_key
+                        .iter()
+                        .map(|&i| existing.get(i).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    if existing_pk == pk_vals {
+                        continue;
+                    }
+                }
+
+                let existing_val = existing.get(col_idx).cloned().unwrap_or(Value::Null);
+                if new_val == existing_val {
+                    let col_name = table_info
+                        .schema
+                        .fields()
+                        .get(col_idx)
+                        .map(|f| f.name())
+                        .unwrap_or("?");
+                    return Err(DatabaseError::ExecutionError(format!(
+                        "UNIQUE constraint violated: duplicate value '{}' in column '{}'",
+                        new_val, col_name
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     // =========================================================================
@@ -4179,5 +4389,179 @@ mod tests {
         } else {
             panic!("expected Query result");
         }
+    }
+
+    // =========================================================================
+    // Constraint enforcement tests
+    // =========================================================================
+
+    #[test]
+    fn test_constraint_not_null_insert_violation() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+
+        // Explicit NULL into NOT NULL column should fail
+        let result = session.execute("INSERT INTO t VALUES (1, NULL)");
+        assert!(result.is_err(), "NOT NULL violation should fail");
+        assert!(result.unwrap_err().to_string().contains("NOT NULL"));
+    }
+
+    #[test]
+    fn test_constraint_not_null_insert_omitted_column() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+
+        // Omitting NOT NULL column should fail (gets NULL by default)
+        let result = session.execute("INSERT INTO t (id) VALUES (1)");
+        assert!(result.is_err(), "omitting NOT NULL column should fail");
+        assert!(result.unwrap_err().to_string().contains("NOT NULL"));
+    }
+
+    #[test]
+    fn test_constraint_default_overrides_null() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT DEFAULT 42)")
+            .unwrap();
+
+        // Omitting the column — default should apply
+        session.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(
+            extract_single_value(result),
+            Value::BigInt(42),
+            "default should substitute for omitted column"
+        );
+    }
+
+    #[test]
+    fn test_constraint_not_null_update_violation() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 'Alice')")
+            .unwrap();
+
+        // Setting NOT NULL column to NULL should fail
+        let result = session.execute("UPDATE t SET name = NULL WHERE id = 1");
+        assert!(
+            result.is_err(),
+            "UPDATE to NULL on NOT NULL column should fail"
+        );
+        assert!(result.unwrap_err().to_string().contains("NOT NULL"));
+    }
+
+    #[test]
+    fn test_constraint_default_value() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, status TEXT DEFAULT 'active')")
+            .unwrap();
+
+        // Insert without specifying status — should get default
+        session.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+        let result = session
+            .execute("SELECT status FROM t WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            extract_single_value(result),
+            Value::string("active"),
+            "default value should be applied"
+        );
+    }
+
+    #[test]
+    fn test_constraint_default_with_not_null() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT NOT NULL DEFAULT 0)")
+            .unwrap();
+
+        // Omitting val — default 0 should be applied, satisfying NOT NULL
+        session.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::BigInt(0));
+    }
+
+    #[test]
+    fn test_constraint_unique_insert_violation() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 'a@b.com')")
+            .unwrap();
+
+        // Duplicate UNIQUE value should fail
+        let result = session.execute("INSERT INTO t VALUES (2, 'a@b.com')");
+        assert!(result.is_err(), "UNIQUE violation should fail");
+        assert!(result.unwrap_err().to_string().contains("UNIQUE"));
+    }
+
+    #[test]
+    fn test_constraint_unique_null_allowed() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, code TEXT UNIQUE)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+        // Multiple NULLs are allowed in UNIQUE columns per SQL standard
+        session.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
+
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_constraint_unique_update_violation() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, code TEXT UNIQUE)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 'AAA')").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 'BBB')").unwrap();
+
+        // Updating to existing UNIQUE value should fail
+        let result = session.execute("UPDATE t SET code = 'AAA' WHERE id = 2");
+        assert!(result.is_err(), "UNIQUE violation on UPDATE should fail");
+        assert!(result.unwrap_err().to_string().contains("UNIQUE"));
+    }
+
+    #[test]
+    fn test_constraint_unique_update_same_value_ok() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, code TEXT UNIQUE)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 'AAA')").unwrap();
+
+        // Updating a row to its own UNIQUE value should succeed
+        session
+            .execute("UPDATE t SET code = 'AAA' WHERE id = 1")
+            .unwrap();
     }
 }
