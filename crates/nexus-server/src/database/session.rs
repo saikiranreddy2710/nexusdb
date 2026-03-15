@@ -2000,6 +2000,72 @@ impl Session {
     }
 
     // =========================================================================
+    // Pattern Matching
+    // =========================================================================
+
+    /// SQL LIKE pattern matching.
+    ///
+    /// Supports `%` (any sequence of characters) and `_` (any single character).
+    /// If `case_insensitive` is true, comparison ignores case (ILIKE).
+    fn sql_like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+        let text: Vec<char> = if case_insensitive {
+            text.to_lowercase().chars().collect()
+        } else {
+            text.chars().collect()
+        };
+        let pattern: Vec<char> = if case_insensitive {
+            pattern.to_lowercase().chars().collect()
+        } else {
+            pattern.chars().collect()
+        };
+
+        Self::like_match_impl(&text, &pattern)
+    }
+
+    /// Recursive LIKE matching with `%` and `_` wildcards.
+    fn like_match_impl(text: &[char], pattern: &[char]) -> bool {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+
+        match pattern[0] {
+            '%' => {
+                // Skip consecutive %
+                let mut p = 0;
+                while p < pattern.len() && pattern[p] == '%' {
+                    p += 1;
+                }
+                if p == pattern.len() {
+                    return true; // trailing % matches everything
+                }
+
+                // Try matching the rest of the pattern from every position in text
+                for t in 0..=text.len() {
+                    if Self::like_match_impl(&text[t..], &pattern[p..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            '_' => {
+                // _ matches exactly one character
+                if text.is_empty() {
+                    false
+                } else {
+                    Self::like_match_impl(&text[1..], &pattern[1..])
+                }
+            }
+            c => {
+                if text.is_empty() || text[0] != c {
+                    false
+                } else {
+                    Self::like_match_impl(&text[1..], &pattern[1..])
+                }
+            }
+        }
+    }
+
+    // =========================================================================
     // Constraint Enforcement
     // =========================================================================
 
@@ -2424,6 +2490,18 @@ impl Session {
                         Ok(Value::Boolean(lb || rb))
                     }
 
+                    // LIKE / NOT LIKE / ILIKE pattern matching
+                    BinaryOperator::Like | BinaryOperator::NotLike | BinaryOperator::ILike => {
+                        let text = lv.to_string_value().unwrap_or_default();
+                        let pattern = rv.to_string_value().unwrap_or_default();
+
+                        let case_insensitive = matches!(op, BinaryOperator::ILike);
+                        let matched = Self::sql_like_match(&text, &pattern, case_insensitive);
+
+                        let result = matches!(op, BinaryOperator::NotLike) != matched;
+                        Ok(Value::Boolean(result))
+                    }
+
                     _ => Err(DatabaseError::ExecutionError(format!(
                         "unsupported binary operator: {:?}",
                         op
@@ -2522,6 +2600,46 @@ impl Session {
             Expr::IsNotNull(inner) => {
                 let val = self.eval_expr(row, inner, schema)?;
                 Ok(Value::Boolean(!val.is_null()))
+            }
+
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => {
+                let val = self.eval_expr(row, inner, schema)?;
+                let low_val = self.eval_expr(row, low, schema)?;
+                let high_val = self.eval_expr(row, high, schema)?;
+
+                if val.is_null() || low_val.is_null() || high_val.is_null() {
+                    return Ok(Value::Null);
+                }
+
+                let in_range = val >= low_val && val <= high_val;
+                Ok(Value::Boolean(if *negated { !in_range } else { in_range }))
+            }
+
+            Expr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let val = self.eval_expr(row, inner, schema)?;
+                if val.is_null() {
+                    return Ok(Value::Null);
+                }
+
+                let mut found = false;
+                for item in list {
+                    let item_val = self.eval_expr(row, item, schema)?;
+                    if val == item_val {
+                        found = true;
+                        break;
+                    }
+                }
+
+                Ok(Value::Boolean(if *negated { !found } else { found }))
             }
 
             Expr::Nested(inner) => self.eval_expr(row, inner, schema),
@@ -4563,5 +4681,221 @@ mod tests {
         session
             .execute("UPDATE t SET code = 'AAA' WHERE id = 1")
             .unwrap();
+    }
+
+    // =========================================================================
+    // WHERE clause: LIKE, IN, BETWEEN tests
+    // =========================================================================
+
+    /// Helper: set up a table for WHERE clause tests.
+    fn setup_where_test_table(session: &mut Session) {
+        session
+            .execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT, price INT, category TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (1, 'Apple', 150, 'fruit')")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (2, 'Banana', 80, 'fruit')")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (3, 'Carrot', 60, 'vegetable')")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (4, 'Apple Pie', 350, 'dessert')")
+            .unwrap();
+        session
+            .execute("INSERT INTO items VALUES (5, 'Mango', 200, 'fruit')")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_where_like_percent() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // LIKE '%apple%' (should match 'Apple' and 'Apple Pie' case-sensitively)
+        let result = session
+            .execute("SELECT name FROM items WHERE name LIKE 'Apple%'")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2, "LIKE 'Apple%' should match 2 rows");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_like_underscore() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // LIKE '_ango' should match 'Mango'
+        let result = session
+            .execute("SELECT name FROM items WHERE name LIKE '_ango'")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1);
+            assert_eq!(qr.rows()[0].get(0).cloned(), Some(Value::string("Mango")));
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_not_like() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // NOT LIKE 'Apple%' — should match Banana, Carrot, Mango (3 rows)
+        let result = session
+            .execute("SELECT name FROM items WHERE name NOT LIKE 'Apple%'")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 3);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_in_list() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // IN list
+        let result = session
+            .execute("SELECT name FROM items WHERE category IN ('fruit', 'dessert')")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            // fruit: Apple, Banana, Mango; dessert: Apple Pie = 4
+            assert_eq!(qr.total_rows, 4, "IN should match 4 rows");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_not_in_list() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // NOT IN list
+        let result = session
+            .execute("SELECT name FROM items WHERE category NOT IN ('fruit')")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            // vegetable: Carrot, dessert: Apple Pie = 2
+            assert_eq!(qr.total_rows, 2, "NOT IN should match 2 rows");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_in_integers() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // IN with integers
+        let result = session
+            .execute("SELECT name FROM items WHERE id IN (1, 3, 5)")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 3);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_between() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // BETWEEN (inclusive)
+        let result = session
+            .execute("SELECT name FROM items WHERE price BETWEEN 80 AND 200")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            // 80 (Banana), 150 (Apple), 200 (Mango) = 3
+            assert_eq!(qr.total_rows, 3, "BETWEEN 80 AND 200 should match 3 rows");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_not_between() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // NOT BETWEEN
+        let result = session
+            .execute("SELECT name FROM items WHERE price NOT BETWEEN 100 AND 300")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            // Outside [100,300]: 80 (Banana), 60 (Carrot), 350 (Apple Pie) = 3
+            assert_eq!(qr.total_rows, 3, "NOT BETWEEN should match 3 rows");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_like_combined_with_and() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // LIKE + AND
+        let result = session
+            .execute("SELECT name FROM items WHERE category = 'fruit' AND price > 100")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            // fruit with price > 100: Apple(150), Mango(200) = 2
+            assert_eq!(qr.total_rows, 2);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_where_in_update() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // UPDATE with IN
+        session
+            .execute("UPDATE items SET price = price + 10 WHERE id IN (1, 3)")
+            .unwrap();
+
+        let result = session
+            .execute("SELECT price FROM items WHERE id = 1")
+            .unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(160));
+
+        let result = session
+            .execute("SELECT price FROM items WHERE id = 3")
+            .unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(70));
+    }
+
+    #[test]
+    fn test_where_between_in_delete() {
+        let mut session = create_session();
+        setup_where_test_table(&mut session);
+
+        // DELETE with BETWEEN
+        session
+            .execute("DELETE FROM items WHERE price BETWEEN 100 AND 200")
+            .unwrap();
+
+        // Remaining: Banana(80), Carrot(60), Apple Pie(350) = 3
+        let result = session.execute("SELECT * FROM items").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 3);
+        } else {
+            panic!("expected Query result");
+        }
     }
 }

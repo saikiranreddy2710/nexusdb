@@ -942,6 +942,7 @@ fn convert_binary_op(op: &parser::BinaryOperator) -> PlanResult<BinaryOp> {
         parser::BinaryOperator::And => Ok(BinaryOp::And),
         parser::BinaryOperator::Or => Ok(BinaryOp::Or),
         parser::BinaryOperator::Like => Ok(BinaryOp::Like),
+        parser::BinaryOperator::NotLike => Ok(BinaryOp::NotLike),
         parser::BinaryOperator::ILike => Ok(BinaryOp::ILike),
         parser::BinaryOperator::Concat => Ok(BinaryOp::Concat),
         parser::BinaryOperator::BitwiseAnd => Ok(BinaryOp::BitwiseAnd),

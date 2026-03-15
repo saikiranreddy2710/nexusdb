@@ -796,6 +796,7 @@ pub enum BinaryOp {
 
     // String
     Like,
+    NotLike,
     ILike,
     Concat,
 
@@ -897,6 +898,7 @@ impl fmt::Display for BinaryOp {
             BinaryOp::And => write!(f, "AND"),
             BinaryOp::Or => write!(f, "OR"),
             BinaryOp::Like => write!(f, "LIKE"),
+            BinaryOp::NotLike => write!(f, "NOT LIKE"),
             BinaryOp::ILike => write!(f, "ILIKE"),
             BinaryOp::Concat => write!(f, "||"),
             BinaryOp::BitwiseAnd => write!(f, "&"),

@@ -250,6 +250,49 @@ impl Expr {
                 })
             }
             sql_ast::Expr::Nested(expr) => Ok(Expr::Nested(Box::new(Expr::from_sql_ast(*expr)?))),
+            sql_ast::Expr::Like {
+                negated,
+                expr,
+                pattern,
+                ..
+            } => {
+                let op = if negated {
+                    BinaryOperator::NotLike
+                } else {
+                    BinaryOperator::Like
+                };
+                Ok(Expr::BinaryOp {
+                    left: Box::new(Expr::from_sql_ast(*expr)?),
+                    op,
+                    right: Box::new(Expr::from_sql_ast(*pattern)?),
+                })
+            }
+            sql_ast::Expr::ILike {
+                negated,
+                expr,
+                pattern,
+                ..
+            } => {
+                let left = Expr::from_sql_ast(*expr)?;
+                let right = Expr::from_sql_ast(*pattern)?;
+                if negated {
+                    // NOT ILIKE → wrap ILIKE in NOT
+                    Ok(Expr::UnaryOp {
+                        op: UnaryOperator::Not,
+                        expr: Box::new(Expr::BinaryOp {
+                            left: Box::new(left),
+                            op: BinaryOperator::ILike,
+                            right: Box::new(right),
+                        }),
+                    })
+                } else {
+                    Ok(Expr::BinaryOp {
+                        left: Box::new(left),
+                        op: BinaryOperator::ILike,
+                        right: Box::new(right),
+                    })
+                }
+            }
             _ => Err(ParseError::Unsupported(format!("Expression: {:?}", expr))),
         }
     }

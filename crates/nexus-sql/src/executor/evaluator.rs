@@ -139,6 +139,7 @@ fn evaluate_binary_op(op: &BinaryOp, left: &Value, right: &Value) -> Result<Valu
             | BinaryOp::Gt
             | BinaryOp::GtEq
             | BinaryOp::Like
+            | BinaryOp::NotLike
             | BinaryOp::ILike
             | BinaryOp::Concat
     ) {
@@ -210,15 +211,17 @@ fn evaluate_binary_op(op: &BinaryOp, left: &Value, right: &Value) -> Result<Valu
         }
 
         // String operators
-        BinaryOp::Like | BinaryOp::ILike => {
+        BinaryOp::Like | BinaryOp::NotLike | BinaryOp::ILike => {
             let val_str = left.to_string_value().unwrap_or_default();
             let pattern_str = right.to_string_value().unwrap_or_default();
             let case_insensitive = matches!(op, BinaryOp::ILike);
-            Ok(Value::Boolean(match_like(
-                &val_str,
-                &pattern_str,
-                case_insensitive,
-            )))
+            let matched = match_like(&val_str, &pattern_str, case_insensitive);
+            let result = if matches!(op, BinaryOp::NotLike) {
+                !matched
+            } else {
+                matched
+            };
+            Ok(Value::Boolean(result))
         }
         BinaryOp::Concat => {
             let l = left.to_string_value().unwrap_or_default();

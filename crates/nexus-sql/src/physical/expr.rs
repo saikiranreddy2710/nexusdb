@@ -294,6 +294,7 @@ fn binary_op_return_type(op: &BinaryOp, left: &DataType, right: &DataType) -> Da
         | BinaryOp::And
         | BinaryOp::Or
         | BinaryOp::Like
+        | BinaryOp::NotLike
         | BinaryOp::ILike => DataType::Boolean,
 
         // Arithmetic operators return the wider type
@@ -500,7 +501,29 @@ pub fn create_physical_expr(expr: &LogicalExpr, schema: &Schema) -> Result<Physi
         LogicalExpr::BinaryOp { left, op, right } => {
             let left_expr = create_physical_expr(left, schema)?;
             let right_expr = create_physical_expr(right, schema)?;
-            Ok(PhysicalExpr::binary(left_expr, *op, right_expr))
+
+            // Map LIKE/NOT LIKE/ILIKE to the dedicated PhysicalExpr::Like variant
+            match op {
+                BinaryOp::Like => Ok(PhysicalExpr::Like {
+                    expr: Box::new(left_expr),
+                    pattern: Box::new(right_expr),
+                    negated: false,
+                    case_insensitive: false,
+                }),
+                BinaryOp::NotLike => Ok(PhysicalExpr::Like {
+                    expr: Box::new(left_expr),
+                    pattern: Box::new(right_expr),
+                    negated: true,
+                    case_insensitive: false,
+                }),
+                BinaryOp::ILike => Ok(PhysicalExpr::Like {
+                    expr: Box::new(left_expr),
+                    pattern: Box::new(right_expr),
+                    negated: false,
+                    case_insensitive: true,
+                }),
+                _ => Ok(PhysicalExpr::binary(left_expr, *op, right_expr)),
+            }
         }
 
         LogicalExpr::UnaryOp { op, expr } => {
