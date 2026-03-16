@@ -713,10 +713,10 @@ impl Session {
             })
             .collect();
 
-        let schema = Schema::new(fields);
+        let mut schema = Schema::new(fields);
 
-        // Find primary key columns
-        let primary_key: Vec<usize> = create
+        // Find primary key columns — first from column-level constraints
+        let mut primary_key: Vec<usize> = create
             .columns
             .iter()
             .enumerate()
@@ -728,8 +728,31 @@ impl Session {
             .map(|(i, _)| i)
             .collect();
 
-        // Collect UNIQUE column indices (from column-level constraints)
-        let unique_columns: Vec<usize> = create
+        // Then check table-level PRIMARY KEY(a, b, ...) constraint
+        if primary_key.is_empty() {
+            for tc in &create.constraints {
+                if let nexus_sql::parser::TableConstraint::PrimaryKey { columns, .. } = tc {
+                    primary_key = columns
+                        .iter()
+                        .filter_map(|col_name| schema.index_of(col_name))
+                        .collect();
+                    // Mark PK columns as NOT NULL (SQL standard)
+                    // Schema is already built, so we rebuild with updated nullable flags
+                    if !primary_key.is_empty() {
+                        let mut new_fields: Vec<Field> = schema.fields().to_vec();
+                        for &idx in &primary_key {
+                            let f = &new_fields[idx];
+                            new_fields[idx] = Field::not_null(f.name(), f.data_type.clone());
+                        }
+                        schema = Schema::new(new_fields);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Collect UNIQUE column indices — from column-level constraints
+        let mut unique_columns: Vec<usize> = create
             .columns
             .iter()
             .enumerate()
@@ -740,6 +763,19 @@ impl Session {
             })
             .map(|(i, _)| i)
             .collect();
+
+        // Also from table-level UNIQUE constraints
+        for tc in &create.constraints {
+            if let nexus_sql::parser::TableConstraint::Unique { columns, .. } = tc {
+                for col_name in columns {
+                    if let Some(idx) = schema.index_of(col_name) {
+                        if !unique_columns.contains(&idx) {
+                            unique_columns.push(idx);
+                        }
+                    }
+                }
+            }
+        }
 
         // Collect DEFAULT values (evaluate literal defaults at CREATE time)
         let defaults: Vec<nexus_sql::storage::ColumnDefault> = create
@@ -758,8 +794,8 @@ impl Session {
             })
             .collect();
 
-        // Collect CHECK constraints
-        let check_constraints: Vec<nexus_sql::storage::CheckConstraint> = create
+        // Collect CHECK constraints — from column-level and table-level
+        let mut check_constraints: Vec<nexus_sql::storage::CheckConstraint> = create
             .columns
             .iter()
             .filter_map(|col| {
@@ -772,6 +808,11 @@ impl Session {
                 })
             })
             .collect();
+        for tc in &create.constraints {
+            if let nexus_sql::parser::TableConstraint::Check { expr, .. } = tc {
+                check_constraints.push(nexus_sql::storage::CheckConstraint { expr: expr.clone() });
+            }
+        }
 
         // Create table info
         let mut info = TableInfo::new(name.clone(), schema);
@@ -4897,5 +4938,96 @@ mod tests {
         } else {
             panic!("expected Query result");
         }
+    }
+
+    // =========================================================================
+    // Table-level constraint tests
+    // =========================================================================
+
+    #[test]
+    fn test_table_level_primary_key_composite() {
+        let mut session = create_session();
+
+        // CREATE TABLE with table-level PRIMARY KEY(a, b)
+        session
+            .execute("CREATE TABLE t (a INT, b INT, val TEXT, PRIMARY KEY(a, b))")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO t VALUES (1, 1, 'first')")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 2, 'second')")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (2, 1, 'third')")
+            .unwrap();
+
+        // Duplicate composite key should fail
+        let result = session.execute("INSERT INTO t VALUES (1, 1, 'dup')");
+        assert!(result.is_err(), "duplicate composite PK should fail");
+    }
+
+    #[test]
+    fn test_table_level_primary_key_single() {
+        let mut session = create_session();
+
+        // Table-level PK with single column
+        session
+            .execute("CREATE TABLE t (id INT, name TEXT, PRIMARY KEY(id))")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO t VALUES (1, 'Alice')")
+            .unwrap();
+
+        let result = session.execute("INSERT INTO t VALUES (1, 'Bob')");
+        assert!(result.is_err(), "duplicate single PK should fail");
+    }
+
+    #[test]
+    fn test_table_level_primary_key_not_null() {
+        let mut session = create_session();
+
+        // Table-level PK columns should be implicitly NOT NULL
+        session
+            .execute("CREATE TABLE t (a INT, b INT, PRIMARY KEY(a, b))")
+            .unwrap();
+
+        let result = session.execute("INSERT INTO t VALUES (1, NULL)");
+        assert!(result.is_err(), "NULL in PK column should fail");
+        assert!(result.unwrap_err().to_string().contains("NOT NULL"));
+    }
+
+    #[test]
+    fn test_table_level_unique_constraint() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, email TEXT, UNIQUE(email))")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO t VALUES (1, 'a@b.com')")
+            .unwrap();
+
+        let result = session.execute("INSERT INTO t VALUES (2, 'a@b.com')");
+        assert!(result.is_err(), "table-level UNIQUE violation should fail");
+        assert!(result.unwrap_err().to_string().contains("UNIQUE"));
+    }
+
+    #[test]
+    fn test_table_level_check_constraint() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, age INT, CHECK(age > 0))")
+            .unwrap();
+
+        session.execute("INSERT INTO t VALUES (1, 25)").unwrap();
+
+        let result = session.execute("INSERT INTO t VALUES (2, -5)");
+        assert!(result.is_err(), "table-level CHECK violation should fail");
+        assert!(result.unwrap_err().to_string().contains("CHECK"));
     }
 }
