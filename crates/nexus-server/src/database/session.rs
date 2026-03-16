@@ -5148,4 +5148,154 @@ mod tests {
             panic!("expected Query result");
         }
     }
+
+    // =========================================================================
+    // Window function tests
+    // =========================================================================
+
+    /// Helper: set up a table for window function tests.
+    fn setup_window_test_table(session: &mut Session) {
+        session
+            .execute("CREATE TABLE sales (id INT PRIMARY KEY, dept TEXT, emp TEXT, amount INT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (1, 'A', 'Alice', 100)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (2, 'A', 'Bob', 200)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (3, 'B', 'Charlie', 150)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (4, 'B', 'Diana', 300)")
+            .unwrap();
+        session
+            .execute("INSERT INTO sales VALUES (5, 'A', 'Eve', 250)")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_window_row_number() {
+        let mut session = create_session();
+        setup_window_test_table(&mut session);
+
+        let result = session
+            .execute("SELECT id, ROW_NUMBER() OVER () FROM sales")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 5);
+            // Each row should have a row number 1-5
+            for (i, row) in qr.rows().iter().enumerate() {
+                let rn = row.get(1).cloned().unwrap();
+                assert_eq!(rn, Value::BigInt((i + 1) as i64));
+            }
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_window_sum_over() {
+        let mut session = create_session();
+        setup_window_test_table(&mut session);
+
+        // SUM(amount) OVER() — should be total sum for every row
+        let result = session
+            .execute("SELECT id, SUM(amount) OVER () FROM sales")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 5);
+            // Total: 100+200+150+300+250 = 1000
+            for row in qr.rows() {
+                let sum_val = row.get(1).cloned().unwrap();
+                assert_eq!(
+                    sum_val,
+                    Value::Double(1000.0),
+                    "SUM OVER() should be 1000 for all rows"
+                );
+            }
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_window_count_over() {
+        let mut session = create_session();
+        setup_window_test_table(&mut session);
+
+        // COUNT(*) OVER() — should be total count for every row
+        let result = session
+            .execute("SELECT id, COUNT(*) OVER () FROM sales")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 5);
+            for row in qr.rows() {
+                let cnt = row.get(1).cloned().unwrap();
+                assert_eq!(cnt, Value::BigInt(5));
+            }
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_window_sum_partition_by() {
+        let mut session = create_session();
+        setup_window_test_table(&mut session);
+
+        // SUM(amount) OVER(PARTITION BY dept)
+        let result = session
+            .execute("SELECT id, dept, SUM(amount) OVER (PARTITION BY dept) FROM sales")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 5);
+            // Dept A: 100+200+250=550, Dept B: 150+300=450
+            for row in qr.rows() {
+                let dept = row.get(1).cloned().unwrap();
+                let sum_val = row.get(2).cloned().unwrap();
+                match dept {
+                    Value::String(ref s) if s == "A" => {
+                        assert_eq!(sum_val, Value::Double(550.0), "dept A sum should be 550");
+                    }
+                    Value::String(ref s) if s == "B" => {
+                        assert_eq!(sum_val, Value::Double(450.0), "dept B sum should be 450");
+                    }
+                    _ => panic!("unexpected dept: {:?}", dept),
+                }
+            }
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_window_count_partition_by() {
+        let mut session = create_session();
+        setup_window_test_table(&mut session);
+
+        // COUNT(*) OVER(PARTITION BY dept)
+        let result = session
+            .execute("SELECT id, dept, COUNT(*) OVER (PARTITION BY dept) FROM sales")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 5);
+            for row in qr.rows() {
+                let dept = row.get(1).cloned().unwrap();
+                let cnt = row.get(2).cloned().unwrap();
+                match dept {
+                    Value::String(ref s) if s == "A" => {
+                        assert_eq!(cnt, Value::BigInt(3), "dept A count should be 3");
+                    }
+                    Value::String(ref s) if s == "B" => {
+                        assert_eq!(cnt, Value::BigInt(2), "dept B count should be 2");
+                    }
+                    _ => panic!("unexpected dept: {:?}", dept),
+                }
+            }
+        } else {
+            panic!("expected Query result");
+        }
+    }
 }

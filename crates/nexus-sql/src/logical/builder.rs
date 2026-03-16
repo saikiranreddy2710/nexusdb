@@ -12,7 +12,7 @@ use crate::parser::{
     OrderByExpr as AstOrderBy, SelectStatement, Statement, TableRef, UpdateStatement,
 };
 
-use super::expr::{AggregateFunc, BinaryOp, LogicalExpr, SortExpr, UnaryOp};
+use super::expr::{AggregateFunc, BinaryOp, LogicalExpr, SortExpr, UnaryOp, WindowFunc};
 use super::operator::*;
 use super::plan::LogicalPlan;
 use super::schema::{Column, Field, Schema, SchemaRef, TableMeta};
@@ -276,11 +276,10 @@ fn build_select(
         }));
     }
 
-    // Handle GROUP BY and aggregates
-    let has_aggregates = select
-        .columns
-        .iter()
-        .any(|item| matches!(&item.expr, AstExpr::Function(f) if is_aggregate_function(&f.name)));
+    // Handle GROUP BY and aggregates (exclude window functions from aggregate detection)
+    let has_aggregates = select.columns.iter().any(|item| {
+        matches!(&item.expr, AstExpr::Function(f) if is_aggregate_function(&f.name) && f.over.is_none())
+    });
     let has_group_by = !select.group_by.is_empty();
 
     if has_aggregates || has_group_by {
@@ -292,6 +291,46 @@ fn build_select(
             plan = Arc::new(LogicalOperator::Filter(FilterOperator {
                 input: plan,
                 predicate,
+            }));
+        }
+    }
+
+    // Detect window functions in SELECT and insert a Window operator if needed
+    let has_window_funcs = select
+        .columns
+        .iter()
+        .any(|item| matches!(&item.expr, AstExpr::Function(f) if f.over.is_some()));
+
+    if has_window_funcs {
+        // Build window expressions from the select list
+        let input_schema = plan.schema();
+        let mut window_exprs = Vec::new();
+
+        for item in &select.columns {
+            if let AstExpr::Function(f) = &item.expr {
+                if f.over.is_some() {
+                    let expr = build_expr(&item.expr, &input_schema)?;
+                    window_exprs.push(expr);
+                }
+            }
+        }
+
+        if !window_exprs.is_empty() {
+            // Build a schema that includes input columns + window function output columns
+            let mut fields: Vec<Field> = input_schema.fields().to_vec();
+            for (i, wexpr) in window_exprs.iter().enumerate() {
+                let name = match wexpr {
+                    LogicalExpr::WindowFunction { func, .. } => format!("{}", func),
+                    _ => format!("window_{}", i),
+                };
+                fields.push(Field::nullable(&name, crate::parser::DataType::BigInt));
+            }
+            let window_schema = Arc::new(Schema::new(fields));
+
+            plan = Arc::new(LogicalOperator::Window(WindowOperator {
+                input: plan,
+                window_exprs,
+                schema: window_schema,
             }));
         }
     }
@@ -563,8 +602,43 @@ fn build_projection(
                 }
             }
             _ => {
-                // For aggregate inputs, try to map the expression to a column reference
-                let expr = if is_aggregate_input {
+                // For window function expressions, find the column added by the
+                // Window operator instead of re-building the expression
+                let expr = if let AstExpr::Function(f) = &item.expr {
+                    if f.over.is_some() {
+                        // The Window operator added columns to the schema.
+                        // Try to find a matching column by the window function's output name.
+                        let window_expr = build_expr(&item.expr, &input_schema)?;
+                        let output_name = window_expr.output_name();
+
+                        if let Some(idx) = input_schema.index_of(&output_name) {
+                            LogicalExpr::Column(input_schema.fields()[idx].column.clone())
+                        } else {
+                            // Try scanning from the end of the schema (window cols are appended)
+                            let mut found = None;
+                            for (idx, field) in input_schema.fields().iter().enumerate().rev() {
+                                if field.name().contains(&f.name) || field.name() == output_name {
+                                    found = Some(idx);
+                                    break;
+                                }
+                            }
+                            if let Some(idx) = found {
+                                LogicalExpr::Column(input_schema.fields()[idx].column.clone())
+                            } else {
+                                // Pass through — physical planner handles WindowFunction
+                                window_expr
+                            }
+                        }
+                    } else if is_aggregate_input {
+                        if let Some(col_ref) = find_matching_column(&item.expr, &input_schema) {
+                            col_ref
+                        } else {
+                            build_expr(&item.expr, &input_schema)?
+                        }
+                    } else {
+                        build_expr(&item.expr, &input_schema)?
+                    }
+                } else if is_aggregate_input {
                     // Try to find a matching column in the aggregate output schema
                     if let Some(col_ref) = find_matching_column(&item.expr, &input_schema) {
                         col_ref
@@ -880,7 +954,48 @@ fn build_expr(expr: &AstExpr, schema: &Schema) -> PlanResult<LogicalExpr> {
                 func.args.iter().map(|a| build_expr(a, schema)).collect();
             let args = args?;
 
-            if is_aggregate_function(&func.name) {
+            // If OVER clause is present, this is a window function
+            if let Some(ref window_spec) = func.over {
+                let window_func = if is_aggregate_function(&func.name) {
+                    let agg_func = convert_aggregate_func(&func.name)?;
+                    let agg_func =
+                        if matches!(agg_func, AggregateFunc::Count) && has_wildcard_arg(&args) {
+                            AggregateFunc::CountStar
+                        } else {
+                            agg_func
+                        };
+                    WindowFunc::Aggregate(agg_func)
+                } else {
+                    convert_window_func(&func.name)?
+                };
+
+                let window_args =
+                    if matches!(window_func, WindowFunc::Aggregate(AggregateFunc::CountStar)) {
+                        vec![]
+                    } else {
+                        args
+                    };
+
+                let partition_by: PlanResult<Vec<_>> = window_spec
+                    .partition_by
+                    .iter()
+                    .map(|e| build_expr(e, schema))
+                    .collect();
+
+                let order_by: PlanResult<Vec<_>> = window_spec
+                    .order_by
+                    .iter()
+                    .map(|o| build_order_by(o, schema))
+                    .collect();
+
+                Ok(LogicalExpr::WindowFunction {
+                    func: window_func,
+                    args: window_args,
+                    partition_by: partition_by?,
+                    order_by: order_by?,
+                    window_frame: None,
+                })
+            } else if is_aggregate_function(&func.name) {
                 let agg_func = convert_aggregate_func(&func.name)?;
 
                 // Handle COUNT(*) specially - convert to CountStar with no args
@@ -958,6 +1073,23 @@ fn convert_unary_op(op: &parser::UnaryOperator) -> PlanResult<UnaryOp> {
         parser::UnaryOperator::Minus => Ok(UnaryOp::Minus),
         parser::UnaryOperator::Plus => Ok(UnaryOp::Plus),
         parser::UnaryOperator::BitwiseNot => Ok(UnaryOp::BitwiseNot),
+    }
+}
+
+fn convert_window_func(name: &str) -> PlanResult<WindowFunc> {
+    match name.to_lowercase().as_str() {
+        "row_number" => Ok(WindowFunc::RowNumber),
+        "rank" => Ok(WindowFunc::Rank),
+        "dense_rank" => Ok(WindowFunc::DenseRank),
+        "percent_rank" => Ok(WindowFunc::PercentRank),
+        "cume_dist" => Ok(WindowFunc::CumeDist),
+        "ntile" => Ok(WindowFunc::Ntile),
+        "lag" => Ok(WindowFunc::Lag),
+        "lead" => Ok(WindowFunc::Lead),
+        "first_value" => Ok(WindowFunc::FirstValue),
+        "last_value" => Ok(WindowFunc::LastValue),
+        "nth_value" => Ok(WindowFunc::NthValue),
+        _ => Err(PlanError::Unsupported(format!("Window function: {}", name))),
     }
 }
 

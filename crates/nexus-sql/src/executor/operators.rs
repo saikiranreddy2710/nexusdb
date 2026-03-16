@@ -1482,13 +1482,65 @@ impl WindowExec {
             for window_expr in &self.window_exprs {
                 let window_value = match window_expr.func {
                     WindowFunc::RowNumber => {
-                        // Simple ROW_NUMBER() without partitions
-                        // TODO: Implement partition support
-                        Value::BigInt((row_num + 1) as i64)
+                        // ROW_NUMBER() with partition support
+                        if window_expr.partition_by.is_empty() {
+                            Value::BigInt((row_num + 1) as i64)
+                        } else {
+                            // Count how many rows in the same partition come before this one
+                            let current_key: Vec<Value> = window_expr
+                                .partition_by
+                                .iter()
+                                .map(|e| {
+                                    evaluate_expr(e, &rows[row_num], &input_schema)
+                                        .unwrap_or(Value::Null)
+                                })
+                                .collect();
+                            let row_in_partition = rows[..=row_num]
+                                .iter()
+                                .filter(|r| {
+                                    let key: Vec<Value> = window_expr
+                                        .partition_by
+                                        .iter()
+                                        .map(|e| {
+                                            evaluate_expr(e, r, &input_schema)
+                                                .unwrap_or(Value::Null)
+                                        })
+                                        .collect();
+                                    key == current_key
+                                })
+                                .count();
+                            Value::BigInt(row_in_partition as i64)
+                        }
                     }
                     WindowFunc::Rank | WindowFunc::DenseRank => {
-                        // For now, same as ROW_NUMBER (no partition/order support)
-                        Value::BigInt((row_num + 1) as i64)
+                        // Same as ROW_NUMBER for now (proper RANK needs ORDER BY tie detection)
+                        if window_expr.partition_by.is_empty() {
+                            Value::BigInt((row_num + 1) as i64)
+                        } else {
+                            let current_key: Vec<Value> = window_expr
+                                .partition_by
+                                .iter()
+                                .map(|e| {
+                                    evaluate_expr(e, &rows[row_num], &input_schema)
+                                        .unwrap_or(Value::Null)
+                                })
+                                .collect();
+                            let row_in_partition = rows[..=row_num]
+                                .iter()
+                                .filter(|r| {
+                                    let key: Vec<Value> = window_expr
+                                        .partition_by
+                                        .iter()
+                                        .map(|e| {
+                                            evaluate_expr(e, r, &input_schema)
+                                                .unwrap_or(Value::Null)
+                                        })
+                                        .collect();
+                                    key == current_key
+                                })
+                                .count();
+                            Value::BigInt(row_in_partition as i64)
+                        }
                     }
                     WindowFunc::Ntile => {
                         // NTILE(n) - need first argument for bucket count
@@ -1609,10 +1661,30 @@ impl WindowExec {
                             Value::Null
                         }
                     }
-                    WindowFunc::Aggregate(_) => {
-                        // Aggregate as window function - not yet implemented
-                        // TODO: Implement SUM(), AVG(), etc. over windows
-                        Value::Null
+                    WindowFunc::Aggregate(ref agg_func) => {
+                        // Determine partition boundaries for this row
+                        let partition_rows =
+                            self.get_partition_rows(&rows, row_num, window_expr, &input_schema);
+
+                        // Run the aggregate over the partition
+                        let phys_agg = crate::physical::PhysicalAggregateExpr::new(
+                            agg_func.clone(),
+                            vec![],
+                            false,
+                            &format!("{}", agg_func),
+                        );
+                        let mut acc = crate::executor::evaluator::Accumulator::new(&phys_agg);
+
+                        for prow in &partition_rows {
+                            let val = if let Some(arg_expr) = window_expr.args.first() {
+                                evaluate_expr(arg_expr, prow, &input_schema).unwrap_or(Value::Null)
+                            } else {
+                                // COUNT(*) — use a non-null sentinel
+                                Value::BigInt(1)
+                            };
+                            acc.accumulate(&val);
+                        }
+                        acc.result()
                     }
                 };
 
@@ -1623,6 +1695,42 @@ impl WindowExec {
         }
 
         Ok(result_rows)
+    }
+
+    /// Returns all rows in the same partition as the given row.
+    ///
+    /// If there are no PARTITION BY expressions, all rows are in one partition.
+    fn get_partition_rows<'a>(
+        &self,
+        all_rows: &'a [Row],
+        current_idx: usize,
+        window_expr: &crate::physical::WindowExpr,
+        schema: &Schema,
+    ) -> Vec<&'a Row> {
+        if window_expr.partition_by.is_empty() {
+            // No partitioning — all rows belong to one partition
+            return all_rows.iter().collect();
+        }
+
+        // Compute partition key for the current row
+        let current_key: Vec<Value> = window_expr
+            .partition_by
+            .iter()
+            .map(|e| evaluate_expr(e, &all_rows[current_idx], schema).unwrap_or(Value::Null))
+            .collect();
+
+        // Collect all rows with matching partition key
+        all_rows
+            .iter()
+            .filter(|row| {
+                let row_key: Vec<Value> = window_expr
+                    .partition_by
+                    .iter()
+                    .map(|e| evaluate_expr(e, row, schema).unwrap_or(Value::Null))
+                    .collect();
+                row_key == current_key
+            })
+            .collect()
     }
 }
 
