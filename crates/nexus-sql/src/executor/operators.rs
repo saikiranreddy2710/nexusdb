@@ -1024,6 +1024,51 @@ impl Operator for HashAggregateExec {
     }
 }
 
+/// Compares two rows by a list of sort expressions, respecting NULLS FIRST/LAST.
+fn compare_rows_by_sort_exprs(
+    a: &Row,
+    b: &Row,
+    sort_exprs: &[PhysicalSortExpr],
+    schema: &Schema,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    for expr in sort_exprs {
+        let a_val = evaluate_expr(&expr.expr, a, schema).unwrap_or(Value::Null);
+        let b_val = evaluate_expr(&expr.expr, b, schema).unwrap_or(Value::Null);
+
+        let cmp = match (a_val.is_null(), b_val.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if expr.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if expr.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                if expr.asc {
+                    a_val.cmp(&b_val)
+                } else {
+                    b_val.cmp(&a_val)
+                }
+            }
+        };
+
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    Ordering::Equal
+}
+
 /// Sort operator for ordering results.
 #[derive(Debug)]
 pub struct SortExec {
@@ -1062,25 +1107,9 @@ impl SortExec {
             }
         }
 
-        // Sort rows
+        // Sort rows with proper NULLS FIRST/LAST handling
         let sort_exprs = &self.sort_exprs;
-        rows.sort_by(|a, b| {
-            for expr in sort_exprs {
-                let a_val = evaluate_expr(&expr.expr, a, &schema).unwrap_or(Value::Null);
-                let b_val = evaluate_expr(&expr.expr, b, &schema).unwrap_or(Value::Null);
-
-                let cmp = if expr.asc {
-                    a_val.cmp(&b_val)
-                } else {
-                    b_val.cmp(&a_val)
-                };
-
-                if cmp != std::cmp::Ordering::Equal {
-                    return cmp;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
+        rows.sort_by(|a, b| compare_rows_by_sort_exprs(a, b, sort_exprs, &schema));
 
         self.sorted_rows = Some(rows);
         Ok(())
@@ -1181,25 +1210,7 @@ impl TopNExec {
                 if heap.len() > self.limit * 2 {
                     // Sort and trim
                     let sort_exprs = &self.sort_exprs;
-                    heap.sort_by(|a, b| {
-                        for expr in sort_exprs {
-                            let a_val =
-                                evaluate_expr(&expr.expr, a, &schema).unwrap_or(Value::Null);
-                            let b_val =
-                                evaluate_expr(&expr.expr, b, &schema).unwrap_or(Value::Null);
-
-                            let cmp = if expr.asc {
-                                a_val.cmp(&b_val)
-                            } else {
-                                b_val.cmp(&a_val)
-                            };
-
-                            if cmp != std::cmp::Ordering::Equal {
-                                return cmp;
-                            }
-                        }
-                        std::cmp::Ordering::Equal
-                    });
+                    heap.sort_by(|a, b| compare_rows_by_sort_exprs(a, b, sort_exprs, &schema));
                     heap.truncate(self.limit);
                 }
             }
@@ -1207,23 +1218,7 @@ impl TopNExec {
 
         // Final sort
         let sort_exprs = &self.sort_exprs;
-        heap.sort_by(|a, b| {
-            for expr in sort_exprs {
-                let a_val = evaluate_expr(&expr.expr, a, &schema).unwrap_or(Value::Null);
-                let b_val = evaluate_expr(&expr.expr, b, &schema).unwrap_or(Value::Null);
-
-                let cmp = if expr.asc {
-                    a_val.cmp(&b_val)
-                } else {
-                    b_val.cmp(&a_val)
-                };
-
-                if cmp != std::cmp::Ordering::Equal {
-                    return cmp;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
+        heap.sort_by(|a, b| compare_rows_by_sort_exprs(a, b, sort_exprs, &schema));
         heap.truncate(self.limit);
 
         self.top_rows = Some(heap);

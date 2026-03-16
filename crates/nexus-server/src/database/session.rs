@@ -5030,4 +5030,122 @@ mod tests {
         assert!(result.is_err(), "table-level CHECK violation should fail");
         assert!(result.unwrap_err().to_string().contains("CHECK"));
     }
+
+    // =========================================================================
+    // NULLS FIRST/LAST tests
+    // =========================================================================
+
+    #[test]
+    fn test_order_by_nulls_last_asc() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 20)").unwrap();
+        session.execute("INSERT INTO t VALUES (4, NULL)").unwrap();
+
+        // ASC NULLS LAST — non-null values first, NULLs at end
+        let result = session
+            .execute("SELECT id, val FROM t ORDER BY val ASC NULLS LAST")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            let ids: Vec<Value> = qr
+                .rows()
+                .iter()
+                .map(|r| r.get(0).cloned().unwrap())
+                .collect();
+            // Non-nulls first (10, 20), then NULLs
+            assert_eq!(ids[0], Value::Int(2), "first should be id=2 (val=10)");
+            assert_eq!(ids[1], Value::Int(3), "second should be id=3 (val=20)");
+            // Last two should be NULL rows (id=1 or id=4)
+            let last_val = qr.rows()[2].get(1).cloned().unwrap();
+            assert_eq!(last_val, Value::Null, "third should have NULL val");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_order_by_nulls_first_asc() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 30)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 10)").unwrap();
+
+        // ASC NULLS FIRST — NULLs come first
+        let result = session
+            .execute("SELECT id, val FROM t ORDER BY val ASC NULLS FIRST")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            let first_val = qr.rows()[0].get(1).cloned().unwrap();
+            assert_eq!(first_val, Value::Null, "NULLS FIRST should put NULL first");
+            let second_id = qr.rows()[1].get(0).cloned().unwrap();
+            assert_eq!(second_id, Value::Int(3), "then id=3 (val=10)");
+            let third_id = qr.rows()[2].get(0).cloned().unwrap();
+            assert_eq!(third_id, Value::Int(1), "then id=1 (val=30)");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_order_by_nulls_first_desc() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+        // DESC NULLS FIRST — NULLs come first, then 30, 10
+        let result = session
+            .execute("SELECT id, val FROM t ORDER BY val DESC NULLS FIRST")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            let first_val = qr.rows()[0].get(1).cloned().unwrap();
+            assert_eq!(first_val, Value::Null);
+            let second_id = qr.rows()[1].get(0).cloned().unwrap();
+            assert_eq!(second_id, Value::Int(3), "then id=3 (val=30)");
+            let third_id = qr.rows()[2].get(0).cloned().unwrap();
+            assert_eq!(third_id, Value::Int(1), "then id=1 (val=10)");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_order_by_nulls_last_desc() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 10)").unwrap();
+
+        // DESC NULLS LAST — 20, 10, then NULL
+        let result = session
+            .execute("SELECT id, val FROM t ORDER BY val DESC NULLS LAST")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            let first_id = qr.rows()[0].get(0).cloned().unwrap();
+            assert_eq!(first_id, Value::Int(2), "first should be id=2 (val=20)");
+            let second_id = qr.rows()[1].get(0).cloned().unwrap();
+            assert_eq!(second_id, Value::Int(3), "second should be id=3 (val=10)");
+            let last_val = qr.rows()[2].get(1).cloned().unwrap();
+            assert_eq!(last_val, Value::Null, "last should be NULL");
+        } else {
+            panic!("expected Query result");
+        }
+    }
 }
