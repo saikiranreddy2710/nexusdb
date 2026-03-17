@@ -88,6 +88,20 @@ impl Default for SessionConfig {
 }
 
 /// A database session representing a client connection.
+/// An undo log entry for transaction rollback.
+#[derive(Debug, Clone)]
+enum UndoEntry {
+    /// Undo an INSERT by deleting the row with these PK values.
+    Insert {
+        table: String,
+        pk_values: Vec<Value>,
+    },
+    /// Undo a DELETE by re-inserting the old row.
+    Delete { table: String, old_row: Row },
+    /// Undo an UPDATE by restoring the old row.
+    Update { table: String, old_row: Row },
+}
+
 pub struct Session {
     /// Session ID.
     id: SessionId,
@@ -98,6 +112,8 @@ pub struct Session {
     config: SessionConfig,
     /// Current transaction ID (if in transaction).
     current_txn: Option<TxnId>,
+    /// Undo log for the current transaction (reversed on ROLLBACK).
+    undo_log: Vec<UndoEntry>,
     /// Reference to the database engine (for multi-database).
     database: Arc<Database>,
     /// Current database name for this session.
@@ -135,6 +151,7 @@ impl Session {
             state: SessionState::Idle,
             config,
             current_txn: None,
+            undo_log: Vec::new(),
             database,
             current_database,
             variables: HashMap::new(),
@@ -163,6 +180,7 @@ impl Session {
             state: SessionState::Idle,
             config,
             current_txn: None,
+            undo_log: Vec::new(),
             database,
             current_database,
             variables: HashMap::new(),
@@ -248,16 +266,18 @@ impl Session {
             ));
         }
 
-        // For now, we use a simple transaction ID
-        // In the future, this will integrate with TransactionManager
         let txn_id = TxnId::new(self.id.as_u64() * 1_000_000 + self.statement_count);
         self.current_txn = Some(txn_id);
+        self.undo_log.clear();
         self.state = SessionState::InTransaction;
 
         Ok(())
     }
 
     /// Commits the current transaction.
+    ///
+    /// All DML changes have already been applied to storage during execution.
+    /// Commit simply discards the undo log and clears transaction state.
     pub fn commit(&mut self) -> DatabaseResult<()> {
         if self.current_txn.is_none() {
             return Err(DatabaseError::TransactionError(
@@ -265,8 +285,8 @@ impl Session {
             ));
         }
 
-        // For now, just clear the transaction state
-        // In the future, this will call TransactionManager::commit()
+        // Discard undo log — changes are now permanent
+        self.undo_log.clear();
         self.current_txn = None;
         self.state = SessionState::Idle;
 
@@ -274,14 +294,33 @@ impl Session {
     }
 
     /// Rolls back the current transaction.
+    ///
+    /// Reverses all DML changes made since BEGIN by replaying the undo log
+    /// in reverse order.
     pub fn rollback(&mut self) -> DatabaseResult<()> {
         if self.current_txn.is_none() {
-            // Rollback on idle is a no-op
             return Ok(());
         }
 
-        // For now, just clear the transaction state
-        // In the future, this will call TransactionManager::abort()
+        // Replay undo log in reverse to undo all changes
+        let undo_entries: Vec<UndoEntry> = self.undo_log.drain(..).rev().collect();
+        for entry in undo_entries {
+            match entry {
+                UndoEntry::Insert { table, pk_values } => {
+                    // Undo INSERT by deleting the row
+                    let _ = self.storage().execute_delete(&table, &pk_values);
+                }
+                UndoEntry::Delete { table, old_row } => {
+                    // Undo DELETE by re-inserting the old row
+                    let _ = self.storage().execute_insert(&table, vec![old_row]);
+                }
+                UndoEntry::Update { table, old_row } => {
+                    // Undo UPDATE by restoring the old row
+                    let _ = self.storage().execute_update(&table, old_row);
+                }
+            }
+        }
+
         self.current_txn = None;
         self.state = SessionState::Idle;
 
@@ -1287,7 +1326,7 @@ impl Session {
 
     /// Executes INSERT.
     fn execute_insert(
-        &self,
+        &mut self,
         insert: &nexus_sql::parser::InsertStatement,
     ) -> DatabaseResult<StatementResult> {
         let table_name = &insert.table.table;
@@ -1441,6 +1480,21 @@ impl Session {
 
         let count = self.storage().execute_insert(table_name, rows.clone())?;
 
+        // Record undo entries for transaction rollback
+        if self.in_transaction() {
+            for row in &rows {
+                let pk_values: Vec<Value> = table_info
+                    .primary_key
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                    .collect();
+                self.undo_log.push(UndoEntry::Insert {
+                    table: table_name.to_string(),
+                    pk_values,
+                });
+            }
+        }
+
         // Populate any HNSW vector indexes for this table
         let vim = self.database.vector_index_manager();
         let vector_keys = vim.list_table_indexes(&self.current_database, table_name);
@@ -1467,7 +1521,7 @@ impl Session {
 
     /// Executes UPDATE.
     fn execute_update(
-        &self,
+        &mut self,
         update: &nexus_sql::parser::UpdateStatement,
     ) -> DatabaseResult<StatementResult> {
         let table_name = &update.table.table;
@@ -1527,6 +1581,13 @@ impl Session {
 
             // Update the row
             if self.storage().execute_update(table_name, new_row.clone())? {
+                // Record undo entry before sync
+                if self.in_transaction() {
+                    self.undo_log.push(UndoEntry::Update {
+                        table: table_name.to_string(),
+                        old_row: row.clone(),
+                    });
+                }
                 // Sync HNSW vector indexes if any vector columns changed
                 self.sync_hnsw_update(table_name, &table_info, &row, &new_row);
                 updated_count += 1;
@@ -1540,7 +1601,7 @@ impl Session {
 
     /// Executes DELETE.
     fn execute_delete(
-        &self,
+        &mut self,
         delete: &nexus_sql::parser::DeleteStatement,
     ) -> DatabaseResult<StatementResult> {
         let table_name = &delete.table.table;
@@ -1576,6 +1637,13 @@ impl Session {
                 .collect();
 
             if self.storage().execute_delete(table_name, &key_values)? {
+                // Record undo entry for rollback
+                if self.in_transaction() {
+                    self.undo_log.push(UndoEntry::Delete {
+                        table: table_name.to_string(),
+                        old_row: row.clone(),
+                    });
+                }
                 // Sync HNSW vector indexes — remove deleted vector entries
                 self.sync_hnsw_delete(table_name, &table_info, &row);
                 deleted_count += 1;
@@ -5297,5 +5365,176 @@ mod tests {
         } else {
             panic!("expected Query result");
         }
+    }
+
+    // =========================================================================
+    // Transaction ROLLBACK tests
+    // =========================================================================
+
+    #[test]
+    fn test_transaction_rollback_insert() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (1, 'before')")
+            .unwrap();
+
+        // BEGIN + INSERT + ROLLBACK
+        session.execute("BEGIN").unwrap();
+        session
+            .execute("INSERT INTO t VALUES (2, 'during')")
+            .unwrap();
+
+        // Verify row is visible during transaction
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(
+                qr.total_rows, 2,
+                "inserted row should be visible during txn"
+            );
+        }
+
+        session.execute("ROLLBACK").unwrap();
+
+        // After ROLLBACK, only the pre-txn row should exist
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1, "rollback should undo the insert");
+            assert_eq!(qr.rows()[0].get(1).cloned(), Some(Value::string("before")));
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_transaction_rollback_update() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+        // BEGIN + UPDATE + ROLLBACK
+        session.execute("BEGIN").unwrap();
+        session
+            .execute("UPDATE t SET val = 999 WHERE id = 1")
+            .unwrap();
+
+        // Value is 999 during transaction
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(999));
+
+        session.execute("ROLLBACK").unwrap();
+
+        // After ROLLBACK, value should be restored to 100
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(100));
+    }
+
+    #[test]
+    fn test_transaction_rollback_delete() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
+        session
+            .execute("INSERT INTO t VALUES (2, 'delete')")
+            .unwrap();
+
+        // BEGIN + DELETE + ROLLBACK
+        session.execute("BEGIN").unwrap();
+        session.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1, "delete should remove the row during txn");
+        }
+
+        session.execute("ROLLBACK").unwrap();
+
+        // After ROLLBACK, both rows should be back
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2, "rollback should restore deleted row");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_transaction_commit_persists() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+
+        // BEGIN + INSERT + COMMIT
+        session.execute("BEGIN").unwrap();
+        session.execute("INSERT INTO t VALUES (1, 42)").unwrap();
+        session.execute("COMMIT").unwrap();
+
+        // After COMMIT, the row should persist
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::BigInt(42));
+    }
+
+    #[test]
+    fn test_transaction_rollback_multiple_operations() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        session.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+        // BEGIN + multiple operations + ROLLBACK
+        session.execute("BEGIN").unwrap();
+        session
+            .execute("UPDATE t SET val = 99 WHERE id = 1")
+            .unwrap();
+        session.execute("DELETE FROM t WHERE id = 2").unwrap();
+        session.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+        session.execute("ROLLBACK").unwrap();
+
+        // Everything should be back to original
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2, "should have original 2 rows");
+        } else {
+            panic!("expected Query result");
+        }
+
+        // Original values should be restored
+        let result = session.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(10));
+
+        let result = session.execute("SELECT val FROM t WHERE id = 2").unwrap();
+        assert_eq!(extract_single_value(result), Value::Int(20));
+    }
+
+    #[test]
+    fn test_transaction_nested_begin_error() {
+        let mut session = create_session();
+
+        session.execute("BEGIN").unwrap();
+        let result = session.execute("BEGIN");
+        assert!(result.is_err(), "nested BEGIN should fail");
+        session.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn test_transaction_commit_without_begin_error() {
+        let mut session = create_session();
+
+        let result = session.execute("COMMIT");
+        assert!(result.is_err(), "COMMIT without BEGIN should fail");
     }
 }
