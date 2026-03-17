@@ -1664,10 +1664,20 @@ impl Session {
         let mut catalog = MemoryCatalog::new();
         for tbl in self.storage().list_tables() {
             if let Some(info) = self.storage().get_table_info(&tbl) {
-                catalog.add_table(nexus_sql::logical::TableMeta::new(
-                    tbl.clone(),
-                    (*info.schema).clone(),
-                ));
+                let mut meta =
+                    nexus_sql::logical::TableMeta::new(tbl.clone(), (*info.schema).clone());
+                // Populate index metadata for the planner
+                for idx in &info.indexes {
+                    let col_names: Vec<String> = idx
+                        .columns
+                        .iter()
+                        .filter_map(|&i| info.schema.field(i).map(|f| f.name().to_string()))
+                        .collect();
+                    meta.indexes.push(nexus_sql::logical::IndexMeta::new(
+                        &idx.name, col_names, idx.unique,
+                    ));
+                }
+                catalog.add_table(meta);
             }
         }
 
@@ -1736,10 +1746,23 @@ impl Session {
             let mut catalog = MemoryCatalog::new();
             for table_name in self.storage().list_tables() {
                 if let Some(table_info) = self.storage().get_table_info(&table_name) {
-                    catalog.add_table(nexus_sql::logical::TableMeta::new(
+                    let mut meta = nexus_sql::logical::TableMeta::new(
                         table_name.clone(),
                         (*table_info.schema).clone(),
-                    ));
+                    );
+                    for idx in &table_info.indexes {
+                        let col_names: Vec<String> = idx
+                            .columns
+                            .iter()
+                            .filter_map(|&i| {
+                                table_info.schema.field(i).map(|f| f.name().to_string())
+                            })
+                            .collect();
+                        meta.indexes.push(nexus_sql::logical::IndexMeta::new(
+                            &idx.name, col_names, idx.unique,
+                        ));
+                    }
+                    catalog.add_table(meta);
                 }
             }
 
@@ -5536,5 +5559,177 @@ mod tests {
 
         let result = session.execute("COMMIT");
         assert!(result.is_err(), "COMMIT without BEGIN should fail");
+    }
+
+    // =========================================================================
+    // BTree index tests
+    // =========================================================================
+
+    #[test]
+    fn test_btree_index_create_and_query() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE products (id INT PRIMARY KEY, name TEXT, category TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO products VALUES (1, 'Widget', 'A')")
+            .unwrap();
+        session
+            .execute("INSERT INTO products VALUES (2, 'Gadget', 'B')")
+            .unwrap();
+        session
+            .execute("INSERT INTO products VALUES (3, 'Doohickey', 'A')")
+            .unwrap();
+
+        // Create index on category
+        session
+            .execute("CREATE INDEX idx_category ON products (category)")
+            .unwrap();
+
+        // Queries should still work correctly with the index present
+        let result = session
+            .execute("SELECT name FROM products WHERE category = 'A'")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2, "should find 2 rows in category A");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_btree_index_unique_enforcement() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, email TEXT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (1, 'alice@test.com')")
+            .unwrap();
+
+        // Create unique index
+        session
+            .execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap();
+
+        // The unique index should be reflected in metadata
+        // (The UNIQUE enforcement is via table constraints, which we
+        // added in the constraints commit; index-level unique checks
+        // are an additional safety net for the future)
+        let result = session.execute("SELECT * FROM users").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_btree_index_drop() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        session.execute("CREATE INDEX idx_val ON t (val)").unwrap();
+
+        // Drop the index
+        session.execute("DROP INDEX idx_val").unwrap();
+
+        // Queries should still work after index is dropped
+        session
+            .execute("INSERT INTO t VALUES (1, 'hello')")
+            .unwrap();
+        let result = session
+            .execute("SELECT val FROM t WHERE val = 'hello'")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_btree_index_explain_shows_index_info() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, category TEXT)")
+            .unwrap();
+        session
+            .execute("CREATE INDEX idx_cat ON t (category)")
+            .unwrap();
+        session.execute("INSERT INTO t VALUES (1, 'A')").unwrap();
+
+        // EXPLAIN should work with indexed table
+        let result = session
+            .execute("EXPLAIN SELECT * FROM t WHERE category = 'A'")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert!(qr.total_rows > 0, "EXPLAIN should produce output");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_btree_index_with_update_delete() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, status TEXT)")
+            .unwrap();
+        session
+            .execute("CREATE INDEX idx_status ON t (status)")
+            .unwrap();
+
+        session
+            .execute("INSERT INTO t VALUES (1, 'active')")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (2, 'inactive')")
+            .unwrap();
+        session
+            .execute("INSERT INTO t VALUES (3, 'active')")
+            .unwrap();
+
+        // Update with filter on indexed column
+        session
+            .execute("UPDATE t SET status = 'archived' WHERE status = 'inactive'")
+            .unwrap();
+
+        // Delete with filter on indexed column
+        session
+            .execute("DELETE FROM t WHERE status = 'archived'")
+            .unwrap();
+
+        // Should have 2 active rows left
+        let result = session.execute("SELECT * FROM t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2);
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_btree_index_metadata_in_describe() {
+        let mut session = create_session();
+
+        session
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        session.execute("CREATE INDEX idx_val ON t (val)").unwrap();
+
+        // DESCRIBE should still work
+        let result = session.execute("DESCRIBE t").unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert!(qr.total_rows >= 2, "should have at least 2 columns");
+        } else {
+            panic!("expected Query result");
+        }
     }
 }

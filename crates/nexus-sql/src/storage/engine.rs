@@ -132,6 +132,40 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Looks up rows matching an equality condition on an indexed column.
+    ///
+    /// Uses a filtered scan. Future optimization: maintain a real secondary
+    /// BTree for O(log n) lookups.
+    pub fn index_lookup(
+        &self,
+        table: &str,
+        col_idx: usize,
+        value: &Value,
+    ) -> StorageResult<Vec<Row>> {
+        let store = self.get_table_store(table)?;
+        let all_rows = store.scan_all()?;
+        let matches = all_rows
+            .into_iter()
+            .filter(|row| row.get(col_idx).map(|v| v == value).unwrap_or(false))
+            .collect();
+        Ok(matches)
+    }
+
+    /// Checks if a table has a BTree index on the given column.
+    pub fn find_btree_index(&self, table: &str, col_idx: usize) -> Option<String> {
+        let info = self.catalog.get_table(table)?;
+        info.indexes.iter().find_map(|idx| {
+            if matches!(idx.index_type, super::catalog::IndexType::BTree)
+                && idx.columns.len() == 1
+                && idx.columns[0] == col_idx
+            {
+                Some(idx.name.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Checks if a table exists.
     pub fn table_exists(&self, name: &str) -> bool {
         self.catalog.table_exists(name)
