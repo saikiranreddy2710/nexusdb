@@ -16,9 +16,11 @@ pub enum CommandResult {
     /// Output a message.
     Output(String),
     /// Toggle timing mode.
-    ToggleTiming(bool),
+    ToggleTiming,
     /// Set output format.
     SetFormat(OutputFormat),
+    /// Switch to a different database.
+    SwitchDatabase(String),
 }
 
 /// A parsed command.
@@ -35,6 +37,8 @@ pub enum Command {
     ListDatabases,
     /// Show connection info.
     ConnectionInfo,
+    /// Switch to a different database.
+    ConnectDatabase(String),
     /// Toggle timing.
     Timing,
     /// Set output format.
@@ -79,7 +83,11 @@ impl Command {
             "d" => Command::Describe(args),
             "dt" | "tables" => Command::ListTables,
             "l" | "list" => Command::ListDatabases,
-            "conninfo" | "c" => Command::ConnectionInfo,
+            "conninfo" => Command::ConnectionInfo,
+            "c" => match args {
+                Some(dbname) => Command::ConnectDatabase(dbname),
+                None => Command::ConnectionInfo,
+            },
             "timing" | "t" => Command::Timing,
             "format" | "f" => Command::Format(args.unwrap_or_else(|| "table".to_string())),
             "version" | "v" => Command::Version,
@@ -114,7 +122,9 @@ impl Command {
             
             Command::ConnectionInfo => self.connection_info(repl).await,
             
-            Command::Timing => Ok(CommandResult::ToggleTiming(true)), // Toggle handled in repl
+            Command::ConnectDatabase(db) => Ok(CommandResult::SwitchDatabase(db.clone())),
+            
+            Command::Timing => Ok(CommandResult::ToggleTiming),
             
             Command::Format(format) => {
                 let fmt = match format.to_lowercase().as_str() {
@@ -190,6 +200,7 @@ General:
   \clear, \cls    Clear screen
 
 Connection:
+  \c DBNAME       Switch to a different database
   \c, \conninfo   Show connection information
   \s, \status     Show server status (uptime, connections, features)
 
@@ -216,8 +227,8 @@ SQL supported:
   DML: INSERT (VALUES), UPDATE, DELETE, SELECT
   INSERT (working):
     - VALUES       INSERT INTO t (a,b) VALUES (1,'x'), (2,'y');
-  INSERT (not yet supported):
     - SELECT       INSERT INTO t SELECT * FROM other;
+  INSERT (not yet supported):
     - DEFAULT      INSERT INTO t DEFAULT VALUES;
   Other: SHOW TABLES, SHOW DATABASES, BEGIN, COMMIT, ROLLBACK
 

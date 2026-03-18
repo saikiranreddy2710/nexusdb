@@ -332,6 +332,9 @@ struct ConnectionInner {
 pub struct Client {
     /// Configuration.
     config: ClientConfig,
+    /// Runtime database override (set by USE command).
+    /// Takes precedence over `config.database` when present.
+    database_override: RwLock<Option<String>>,
     /// Connection state.
     inner: RwLock<ConnectionInner>,
     /// Async lock for operations.
@@ -349,6 +352,7 @@ impl Client {
     pub fn new(config: ClientConfig) -> Self {
         Self {
             config,
+            database_override: RwLock::new(None),
             inner: RwLock::new(ConnectionInner {
                 state: ConnectionState::Disconnected,
                 connected_at: None,
@@ -376,6 +380,25 @@ impl Client {
             inner.connected_at = Some(Instant::now());
         }
         Ok(client)
+    }
+
+    /// Sets the active database for subsequent queries.
+    ///
+    /// This overrides the database name from the original `ClientConfig`.
+    /// Used by the CLI to implement `USE database` across gRPC requests.
+    pub fn set_database(&self, db: &str) {
+        *self.database_override.write() = Some(db.to_string());
+    }
+
+    /// Returns the active database name.
+    ///
+    /// Returns the runtime override if set (via `set_database`), otherwise
+    /// falls back to the configured database from `ClientConfig`.
+    pub fn database(&self) -> Option<String> {
+        self.database_override
+            .read()
+            .clone()
+            .or_else(|| self.config.database.clone())
     }
 
     /// Pings the server to check connectivity.
@@ -861,7 +884,7 @@ impl Client {
             transaction_id: None,
             max_rows: 0, // Unlimited
             timeout_ms: self.config.query_timeout.as_millis() as u32,
-            database: self.config.database.clone(),
+            database: self.database(),
         });
 
         let response = client

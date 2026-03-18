@@ -728,6 +728,13 @@ impl Session {
     ) -> DatabaseResult<StatementResult> {
         let name = &create.name.table;
 
+        // Reject tables with no columns
+        if create.columns.is_empty() {
+            return Err(DatabaseError::ExecutionError(
+                "CREATE TABLE requires at least one column definition".to_string(),
+            ));
+        }
+
         // Check if table exists
         if self.storage().table_exists(name) {
             if create.if_not_exists {

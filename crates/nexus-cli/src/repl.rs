@@ -22,10 +22,8 @@ use crate::commands::{Command, CommandResult};
 use crate::config::CliConfig;
 use crate::formatter::{self, OutputFormat};
 
-/// The REPL prompt shown when waiting for input.
-const PROMPT: &str = "nexus> ";
-
 /// The continuation prompt for multi-line input.
+#[allow(dead_code)]
 const CONTINUATION_PROMPT: &str = "    -> ";
 
 /// REPL helper for rustyline.
@@ -179,6 +177,16 @@ impl Highlighter for ReplHelper {
     }
 }
 
+/// SQL keywords that can start a multi-line statement.
+const SQL_START_KEYWORDS: &[&str] = &[
+    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
+    "BEGIN", "COMMIT", "ROLLBACK", "EXPLAIN", "SHOW", "DESCRIBE", "USE",
+    "WITH", "SET", "GRANT", "REVOKE", "TRUNCATE", "MERGE",
+];
+
+/// Maximum continuation lines before auto-accepting input.
+const MAX_CONTINUATION_LINES: usize = 50;
+
 impl Validator for ReplHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
         let input = ctx.input();
@@ -199,7 +207,29 @@ impl Validator for ReplHelper {
             return Ok(ValidationResult::Valid(None));
         }
 
-        // Otherwise, request more input
+        // Safety valve: if too many continuation lines, accept and let the
+        // server return an error rather than hanging forever
+        let line_count = input.lines().count();
+        if line_count >= MAX_CONTINUATION_LINES {
+            return Ok(ValidationResult::Valid(None));
+        }
+
+        // If the first word is not a known SQL keyword, don't wait for more
+        // input — accept immediately and let the server report the error
+        let first_word = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_uppercase();
+        let is_sql = SQL_START_KEYWORDS
+            .iter()
+            .any(|kw| first_word == *kw);
+
+        if !is_sql {
+            return Ok(ValidationResult::Valid(None));
+        }
+
+        // Otherwise, request more input (multi-line SQL)
         Ok(ValidationResult::Incomplete)
     }
 }
@@ -383,12 +413,13 @@ impl Repl {
         Ok(())
     }
 
-    /// Gets the current prompt.
+    /// Gets the current prompt, including the current database name.
     fn get_prompt(&self) -> String {
+        let db = self.config.database.as_deref().unwrap_or("nexusdb");
         if self.in_transaction {
-            "nexus*> ".to_string()
+            format!("nexus({})* > ", db)
         } else {
-            PROMPT.to_string()
+            format!("nexus({})> ", db)
         }
     }
 
@@ -415,9 +446,9 @@ impl Repl {
                 println!("{}", msg);
                 Ok(false)
             }
-            CommandResult::ToggleTiming(enabled) => {
-                self.timing = enabled;
-                if enabled {
+            CommandResult::ToggleTiming => {
+                self.timing = !self.timing;
+                if self.timing {
                     println!("Timing is on.");
                 } else {
                     println!("Timing is off.");
@@ -429,6 +460,19 @@ impl Repl {
                 println!("Output format set to {:?}.", format);
                 Ok(false)
             }
+            CommandResult::SwitchDatabase(db) => {
+                self.switch_database(&db);
+                println!("You are now connected to database \"{}\".", db);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Switches the active database on both the CLI config and the client.
+    fn switch_database(&mut self, db: &str) {
+        self.config.database = Some(db.to_string());
+        if let Some(ref client) = self.client {
+            client.set_database(db);
         }
     }
 
@@ -453,6 +497,18 @@ impl Repl {
             Ok(result) => {
                 let elapsed = start.elapsed();
                 self.print_result(&result, elapsed);
+
+                // Intercept successful USE commands: update the active database
+                // on the client so subsequent requests use the new database context.
+                if sql_upper.starts_with("USE ") {
+                    if let Some(db_name) = sql.trim().strip_prefix("USE ").or_else(|| sql.trim().strip_prefix("use ")) {
+                        let db_name = db_name.trim().trim_end_matches(';').trim();
+                        if !db_name.is_empty() {
+                            self.switch_database(db_name);
+                        }
+                    }
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -480,6 +536,11 @@ impl Repl {
                 result.rows_affected,
                 if result.rows_affected == 1 { "" } else { "s" }
             );
+        } else if !result.columns.is_empty() {
+            // Query returned column headers but no rows (e.g. empty table, DESCRIBE on empty)
+            let output = formatter::format_result(result, self.format);
+            println!("{}", output);
+            println!("(0 rows)");
         } else {
             // DDL or empty result
             println!("OK");
