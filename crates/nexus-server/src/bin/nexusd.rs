@@ -222,16 +222,34 @@ async fn run_server(config: ServerConfig) -> Result<()> {
 
     // Bootstrap admin user when auth is enabled
     if config.auth_enabled {
-        let password = config.admin_password.as_deref().unwrap_or("admin");
+        let password = match config.admin_password.as_deref() {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => {
+                // Generate a random password instead of using a hard-coded default
+                let random_pw: String = (0..16)
+                    .map(|_| {
+                        let idx = rand::random::<u8>() % 62;
+                        match idx {
+                            0..=9 => (b'0' + idx) as char,
+                            10..=35 => (b'a' + idx - 10) as char,
+                            _ => (b'A' + idx - 36) as char,
+                        }
+                    })
+                    .collect();
+                warn!(
+                    "No admin password provided — generated random password. \
+                     Set NEXUS_ADMIN_PASSWORD for production!"
+                );
+                info!("Generated admin password: {}", random_pw);
+                random_pw
+            }
+        };
         let authenticator = db.authenticator();
-        match authenticator.create_user(&config.admin_user, password, vec!["superuser".to_string()]) {
+        match authenticator.create_user(&config.admin_user, &password, vec!["superuser".to_string()]) {
             Ok(_) => info!("Created admin user \"{}\"", config.admin_user),
             Err(_) => info!("Admin user \"{}\" already exists", config.admin_user),
         }
         info!("Authentication enforcement ENABLED");
-        if password == "admin" {
-            warn!("Using default admin password — set NEXUS_ADMIN_PASSWORD for production!");
-        }
     }
 
     let db = Arc::new(db);

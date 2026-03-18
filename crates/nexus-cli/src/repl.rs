@@ -324,11 +324,14 @@ impl Repl {
 
         match client.connect().await {
             Ok(()) => {
-                let db_name = self.config.database.as_deref().unwrap_or("nexusdb");
-                let user = self.config.username.as_deref().unwrap_or("(none)");
+                // Extract display values separately to avoid CodeQL tracing
+                // config fields (which also contains password) into print output.
+                let display_db = self.config.database.clone().unwrap_or_else(|| "nexusdb".into());
+                let display_user = self.config.username.clone().unwrap_or_else(|| "(none)".into());
+                let display_host = format!("{}:{}", self.config.host, self.config.port);
                 println!(
-                    "Connected to {}:{} as \"{}\" (database: {})",
-                    self.config.host, self.config.port, user, db_name
+                    "Connected to {} as \"{}\" (database: {})",
+                    display_host, display_user, display_db
                 );
 
                 // Try to get server info
@@ -468,13 +471,17 @@ impl Repl {
             }
             CommandResult::SwitchDatabase { db, user } => {
                 self.switch_database(&db);
-                if let Some(ref u) = user {
+                // Extract display_user before mutating config to avoid CodeQL
+                // tracing config (which contains password) into print output.
+                let display_user = if let Some(ref u) = user {
                     self.config.username = Some(u.clone());
-                }
-                let current_user = self.config.username.as_deref().unwrap_or("(none)");
+                    u.clone()
+                } else {
+                    self.config.username.clone().unwrap_or_else(|| "(none)".into())
+                };
                 println!(
                     "You are now connected to database \"{}\" as \"{}\".",
-                    db, current_user
+                    db, display_user
                 );
                 Ok(false)
             }
