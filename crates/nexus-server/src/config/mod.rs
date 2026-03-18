@@ -63,6 +63,21 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls_ca_cert: Option<PathBuf>,
 
+    /// Enable authentication enforcement.
+    /// When true, all requests must carry valid credentials.
+    /// A default admin user is created on first startup.
+    #[serde(default)]
+    pub auth_enabled: bool,
+
+    /// Default admin username (created on first startup when auth is enabled).
+    #[serde(default = "default_admin_user")]
+    pub admin_user: String,
+
+    /// Default admin password (created on first startup when auth is enabled).
+    /// Use NEXUS_ADMIN_PASSWORD env var for security.
+    #[serde(default)]
+    pub admin_password: Option<String>,
+
     /// Enable Raft consensus for distributed mode.
     #[serde(default)]
     pub enable_raft: bool,
@@ -74,6 +89,10 @@ pub struct ServerConfig {
     /// Raft peer addresses.
     #[serde(default)]
     pub raft_peers: Vec<String>,
+}
+
+fn default_admin_user() -> String {
+    "admin".to_string()
 }
 
 fn default_host() -> String {
@@ -120,6 +139,9 @@ impl Default for ServerConfig {
             tls_cert: None,
             tls_key: None,
             tls_ca_cert: None,
+            auth_enabled: false,
+            admin_user: default_admin_user(),
+            admin_password: None,
             enable_raft: false,
             node_id: default_node_id(),
             raft_peers: Vec::new(),

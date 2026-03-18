@@ -451,7 +451,8 @@ impl Client {
             }
         };
 
-        let request = tonic::Request::new(ServerInfoRequest {});
+        let mut request = tonic::Request::new(ServerInfoRequest {});
+        self.attach_auth(&mut request);
 
         let response = client
             .get_server_info(request)
@@ -689,11 +690,12 @@ impl Client {
 
         let txn_id = if let Some(mut client) = client_opt {
             // Execute BEGIN via gRPC
-            let request = tonic::Request::new(BeginTransactionRequest {
+            let mut request = tonic::Request::new(BeginTransactionRequest {
                 isolation_level: 0, // Default: READ_UNCOMMITTED
                 read_only: false,
                 timeout_ms: self.config.query_timeout.as_millis() as u32,
             });
+            self.attach_auth(&mut request);
 
             let response = client
                 .begin_transaction(request)
@@ -751,9 +753,10 @@ impl Client {
 
         if let Some(mut client) = client_opt {
             // Execute COMMIT via gRPC
-            let request = tonic::Request::new(CommitRequest {
+            let mut request = tonic::Request::new(CommitRequest {
                 transaction_id: txn_id,
             });
+            self.attach_auth(&mut request);
 
             let response = client
                 .commit(request)
@@ -806,9 +809,10 @@ impl Client {
         };
 
         if let Some(mut client) = client_opt {
-            let request = tonic::Request::new(RollbackRequest {
+            let mut request = tonic::Request::new(RollbackRequest {
                 transaction_id: txn_id,
             });
+            self.attach_auth(&mut request);
 
             let _ = client.rollback(request).await; // Ignore errors on rollback
         }
@@ -856,6 +860,23 @@ impl Client {
         }
     }
 
+    /// Attaches authentication metadata to a gRPC request.
+    ///
+    /// Injects `x-nexus-username` and `x-nexus-password` headers from
+    /// `ClientConfig` so the server's `authenticate()` can verify them.
+    fn attach_auth<T>(&self, request: &mut tonic::Request<T>) {
+        if let Some(ref user) = self.config.username {
+            if let Ok(val) = user.parse() {
+                request.metadata_mut().insert("x-nexus-username", val);
+            }
+        }
+        if let Some(ref pass) = self.config.password {
+            if let Ok(val) = pass.parse() {
+                request.metadata_mut().insert("x-nexus-password", val);
+            }
+        }
+    }
+
     /// Internal query execution.
     async fn execute_query_internal(
         &self,
@@ -878,7 +899,7 @@ impl Client {
         };
 
         // Execute the query via gRPC
-        let request = tonic::Request::new(ExecuteRequest {
+        let mut request = tonic::Request::new(ExecuteRequest {
             sql: sql.to_string(),
             parameters: vec![],
             transaction_id: None,
@@ -886,6 +907,7 @@ impl Client {
             timeout_ms: self.config.query_timeout.as_millis() as u32,
             database: self.database(),
         });
+        self.attach_auth(&mut request);
 
         let response = client
             .execute(request)

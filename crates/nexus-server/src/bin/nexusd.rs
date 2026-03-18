@@ -32,7 +32,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use nexus_server::config::ServerConfig;
-use nexus_server::database::Database;
+use nexus_server::database::{Database, DatabaseConfig};
 use nexus_server::grpc::GrpcServer;
 
 /// NexusDB Server Daemon
@@ -85,6 +85,18 @@ struct Args {
     /// WAL directory (defaults to data_dir/wal)
     #[arg(long, value_name = "DIR", env = "NEXUS_WAL_DIR")]
     wal_dir: Option<PathBuf>,
+
+    /// Enable authentication (creates default admin user on first start)
+    #[arg(long, env = "NEXUS_AUTH")]
+    auth: bool,
+
+    /// Admin username (used with --auth for bootstrap)
+    #[arg(long, default_value = "admin", env = "NEXUS_ADMIN_USER")]
+    admin_user: String,
+
+    /// Admin password (used with --auth for bootstrap; required when --auth is set)
+    #[arg(long, env = "NEXUS_ADMIN_PASSWORD")]
+    admin_password: Option<String>,
 
     /// Print configuration and exit
     #[arg(long)]
@@ -162,6 +174,13 @@ fn load_config(args: &Args) -> Result<ServerConfig> {
         config.wal_dir = Some(dir.clone());
     }
 
+    // Auth configuration
+    if args.auth {
+        config.auth_enabled = true;
+        config.admin_user = args.admin_user.clone();
+        config.admin_password = args.admin_password.clone();
+    }
+
     Ok(config)
 }
 
@@ -182,21 +201,38 @@ fn print_banner() {
 }
 
 async fn run_server(config: ServerConfig) -> Result<()> {
-    // Create the database
-    let db = if config.memory_mode {
+    // Build DatabaseConfig with auth settings
+    let mut db_config = if config.memory_mode {
         info!("Starting in memory-only mode (data will not be persisted)");
-        Database::open_memory().context("Failed to create in-memory database")?
+        DatabaseConfig::in_memory()
     } else if let Some(ref dir) = config.data_dir {
         info!("Data directory: {}", dir.display());
-        
-        // Ensure directory exists
         std::fs::create_dir_all(dir).context("Failed to create data directory")?;
-        
-        Database::open_path(dir).context("Failed to open database at data directory")?
+        DatabaseConfig::with_path(dir.to_string_lossy().to_string())
     } else {
         info!("No data directory specified, using memory mode");
-        Database::open_memory().context("Failed to create in-memory database")?
+        DatabaseConfig::in_memory()
     };
+
+    // Wire auth settings from ServerConfig → DatabaseConfig
+    db_config.auth_enabled = config.auth_enabled;
+    db_config.authz_enabled = config.auth_enabled; // enable RBAC when auth is on
+
+    let db = Database::open(db_config).context("Failed to open database")?;
+
+    // Bootstrap admin user when auth is enabled
+    if config.auth_enabled {
+        let password = config.admin_password.as_deref().unwrap_or("admin");
+        let authenticator = db.authenticator();
+        match authenticator.create_user(&config.admin_user, password, vec!["superuser".to_string()]) {
+            Ok(_) => info!("Created admin user \"{}\"", config.admin_user),
+            Err(_) => info!("Admin user \"{}\" already exists", config.admin_user),
+        }
+        info!("Authentication enforcement ENABLED");
+        if password == "admin" {
+            warn!("Using default admin password — set NEXUS_ADMIN_PASSWORD for production!");
+        }
+    }
 
     let db = Arc::new(db);
 
@@ -210,6 +246,7 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     info!("  Max connections: {}", config.max_connections);
     info!("  Buffer pool: {} MB", config.buffer_pool_mb);
     info!("  Memory mode: {}", config.memory_mode);
+    info!("  Auth enabled: {}", config.auth_enabled);
 
     // Create the gRPC server
     let grpc_server = GrpcServer::new(db.clone(), addr);

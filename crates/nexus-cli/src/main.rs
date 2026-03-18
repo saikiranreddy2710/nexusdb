@@ -191,6 +191,19 @@ fn load_config(args: &Args) -> Result<CliConfig> {
 
     config.mock_mode = args.mock;
 
+    // If username is set but no password, prompt interactively
+    if config.username.is_some() && config.password.is_none() {
+        if atty::is(atty::Stream::Stdin) {
+            eprint!("Password for user \"{}\": ", config.username.as_deref().unwrap_or(""));
+            let password = rpassword::read_password().ok();
+            if let Some(pass) = password {
+                if !pass.is_empty() {
+                    config.password = Some(pass);
+                }
+            }
+        }
+    }
+
     Ok(config)
 }
 
