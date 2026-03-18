@@ -17,6 +17,8 @@ pub enum CommandResult {
     Output(String),
     /// Toggle timing mode.
     ToggleTiming,
+    /// Toggle expanded/vertical display mode.
+    ToggleExpanded,
     /// Set output format.
     SetFormat(OutputFormat),
     /// Switch to a different database (and optionally user).
@@ -41,6 +43,8 @@ pub enum Command {
     ConnectDatabase { db: String, user: Option<String> },
     /// Toggle timing.
     Timing,
+    /// Toggle expanded/vertical display.
+    Expanded,
     /// Set output format.
     Format(String),
     /// Show version.
@@ -95,6 +99,7 @@ impl Command {
                 None => Command::ConnectionInfo,
             },
             "timing" | "t" => Command::Timing,
+            "x" | "expanded" => Command::Expanded,
             "format" | "f" => Command::Format(args.unwrap_or_else(|| "table".to_string())),
             "version" | "v" => Command::Version,
             "clear" | "cls" => Command::Clear,
@@ -150,6 +155,7 @@ impl Command {
             }
             
             Command::Timing => Ok(CommandResult::ToggleTiming),
+            Command::Expanded => Ok(CommandResult::ToggleExpanded),
             
             Command::Format(format) => {
                 let fmt = match format.to_lowercase().as_str() {
@@ -241,6 +247,7 @@ Transaction:
   \rollback       Rollback the transaction
 
 Display:
+  \x, \expanded   Toggle expanded/vertical display (one column per line)
   \t, \timing     Toggle timing display
   \f FORMAT       Set output format: table, json, csv, raw
 

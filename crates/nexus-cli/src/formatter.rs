@@ -33,12 +33,75 @@ impl std::fmt::Display for OutputFormat {
 
 /// Formats a query result according to the specified format.
 pub fn format_result(result: &QueryResult, format: OutputFormat) -> String {
+    format_result_ex(result, format, false)
+}
+
+/// Formats a query result with optional expanded (vertical) mode.
+pub fn format_result_ex(result: &QueryResult, format: OutputFormat, expanded: bool) -> String {
+    if expanded && format == OutputFormat::Table {
+        return format_expanded(result);
+    }
     match format {
         OutputFormat::Table => format_table(result),
         OutputFormat::Json => format_json(result),
         OutputFormat::Csv => format_csv(result),
         OutputFormat::Raw => format_raw(result),
     }
+}
+
+/// Formats the result in expanded/vertical mode (one column per line).
+///
+/// Output looks like:
+/// ```text
+/// -[ RECORD 1 ]---
+/// id     | 1
+/// name   | Alice
+/// active | true
+/// -[ RECORD 2 ]---
+/// id     | 2
+/// name   | Bob
+/// active | false
+/// ```
+fn format_expanded(result: &QueryResult) -> String {
+    if result.rows.is_empty() && result.columns.is_empty() {
+        return String::new();
+    }
+
+    let max_col_width = result.columns.iter().map(|c| c.len()).max().unwrap_or(0);
+
+    let mut output = String::new();
+
+    for (row_idx, row) in result.rows.iter().enumerate() {
+        // Record separator
+        let label = format!("-[ RECORD {} ]", row_idx + 1);
+        let separator_len = (max_col_width + 3 + 20).max(label.len());
+        output.push_str(&label);
+        for _ in label.len()..separator_len {
+            output.push('-');
+        }
+        output.push('\n');
+
+        // Column: value pairs
+        for (col_idx, value) in row.iter().enumerate() {
+            let col_name = result
+                .columns
+                .get(col_idx)
+                .map(|s| s.as_str())
+                .unwrap_or("?");
+            let display = match value {
+                nexus_client::Value::Null => "(null)".to_string(),
+                v => v.to_string(),
+            };
+            output.push_str(&format!(
+                "{:<width$} | {}\n",
+                col_name,
+                display,
+                width = max_col_width
+            ));
+        }
+    }
+
+    output
 }
 
 /// Formats the result as a table.

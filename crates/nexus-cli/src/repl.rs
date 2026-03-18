@@ -248,6 +248,8 @@ pub struct Repl {
     in_transaction: bool,
     /// Timing mode enabled.
     timing: bool,
+    /// Expanded/vertical display mode.
+    expanded: bool,
     /// Whether running in mock mode (no real server).
     mock_mode: bool,
 }
@@ -281,6 +283,7 @@ impl Repl {
             history_file,
             in_transaction: false,
             timing: config.timing,
+            expanded: false,
             mock_mode: config.mock_mode,
         })
     }
@@ -449,6 +452,15 @@ impl Repl {
                 }
                 Ok(false)
             }
+            CommandResult::ToggleExpanded => {
+                self.expanded = !self.expanded;
+                if self.expanded {
+                    println!("Expanded display is on.");
+                } else {
+                    println!("Expanded display is off.");
+                }
+                Ok(false)
+            }
             CommandResult::SetFormat(format) => {
                 self.format = format;
                 println!("Output format set to {}.", format);
@@ -525,7 +537,7 @@ impl Repl {
     fn print_result(&self, result: &QueryResult, elapsed: Duration) {
         if result.has_rows() {
             // Format and print the result set
-            let output = formatter::format_result(result, self.format);
+            let output = formatter::format_result_ex(result, self.format, self.expanded);
             println!("{}", output);
             println!(
                 "({} row{})",
@@ -541,7 +553,7 @@ impl Repl {
             );
         } else if !result.columns.is_empty() {
             // Query returned column headers but no rows (e.g. empty table, DESCRIBE on empty)
-            let output = formatter::format_result(result, self.format);
+            let output = formatter::format_result_ex(result, self.format, self.expanded);
             println!("{}", output);
             println!("(0 rows)");
         } else {
