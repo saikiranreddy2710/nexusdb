@@ -48,6 +48,9 @@ tarpaulin-report.html
 # Benchmark results
 /benchmark_results/
 
+# Agent coding guide (local only)
+AGENTS.md
+
 # Environment
 .env
 .env.local
