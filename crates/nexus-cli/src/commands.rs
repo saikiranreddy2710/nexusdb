@@ -19,8 +19,8 @@ pub enum CommandResult {
     ToggleTiming,
     /// Set output format.
     SetFormat(OutputFormat),
-    /// Switch to a different database.
-    SwitchDatabase(String),
+    /// Switch to a different database (and optionally user).
+    SwitchDatabase { db: String, user: Option<String> },
 }
 
 /// A parsed command.
@@ -37,8 +37,8 @@ pub enum Command {
     ListDatabases,
     /// Show connection info.
     ConnectionInfo,
-    /// Switch to a different database.
-    ConnectDatabase(String),
+    /// Switch to a different database (and optionally user).
+    ConnectDatabase { db: String, user: Option<String> },
     /// Toggle timing.
     Timing,
     /// Set output format.
@@ -85,7 +85,13 @@ impl Command {
             "l" | "list" => Command::ListDatabases,
             "conninfo" => Command::ConnectionInfo,
             "c" => match args {
-                Some(dbname) => Command::ConnectDatabase(dbname),
+                Some(connect_args) => {
+                    // \c dbname [username]  — like psql
+                    let parts: Vec<&str> = connect_args.splitn(2, char::is_whitespace).collect();
+                    let db = parts[0].trim().to_string();
+                    let user = parts.get(1).map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
+                    Command::ConnectDatabase { db, user }
+                }
                 None => Command::ConnectionInfo,
             },
             "timing" | "t" => Command::Timing,
@@ -122,12 +128,15 @@ impl Command {
             
             Command::ConnectionInfo => self.connection_info(repl).await,
             
-            Command::ConnectDatabase(db) => {
+            Command::ConnectDatabase { db, user } => {
                 // Validate database exists by executing USE on the server
                 if let Some(client) = repl.client() {
                     let sql = format!("USE {}", db);
                     match client.execute(&sql).await {
-                        Ok(_) => Ok(CommandResult::SwitchDatabase(db.clone())),
+                        Ok(_) => Ok(CommandResult::SwitchDatabase {
+                            db: db.clone(),
+                            user: user.clone(),
+                        }),
                         Err(e) => Ok(CommandResult::Output(format!(
                             "ERROR: could not switch to database \"{}\": {}",
                             db, e
@@ -216,9 +225,9 @@ General:
   \clear, \cls    Clear screen
 
 Connection:
-  \c DBNAME       Switch to a different database
-  \c, \conninfo   Show connection information
-  \s, \status     Show server status (uptime, connections, features)
+  \c DBNAME [USER] Switch to database (optionally as user)
+  \c, \conninfo    Show connection information
+  \s, \status      Show server status (uptime, connections, features)
 
 Schema:
   \d NAME         Describe table (columns, types, nullable, primary key)

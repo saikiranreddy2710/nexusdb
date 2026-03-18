@@ -454,9 +454,16 @@ impl Repl {
                 println!("Output format set to {}.", format);
                 Ok(false)
             }
-            CommandResult::SwitchDatabase(db) => {
+            CommandResult::SwitchDatabase { db, user } => {
                 self.switch_database(&db);
-                println!("You are now connected to database \"{}\".", db);
+                if let Some(ref u) = user {
+                    self.config.username = Some(u.clone());
+                }
+                let current_user = self.config.username.as_deref().unwrap_or("(none)");
+                println!(
+                    "You are now connected to database \"{}\" as \"{}\".",
+                    db, current_user
+                );
                 Ok(false)
             }
         }
