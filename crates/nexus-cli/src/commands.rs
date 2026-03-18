@@ -122,7 +122,23 @@ impl Command {
             
             Command::ConnectionInfo => self.connection_info(repl).await,
             
-            Command::ConnectDatabase(db) => Ok(CommandResult::SwitchDatabase(db.clone())),
+            Command::ConnectDatabase(db) => {
+                // Validate database exists by executing USE on the server
+                if let Some(client) = repl.client() {
+                    let sql = format!("USE {}", db);
+                    match client.execute(&sql).await {
+                        Ok(_) => Ok(CommandResult::SwitchDatabase(db.clone())),
+                        Err(e) => Ok(CommandResult::Output(format!(
+                            "ERROR: could not switch to database \"{}\": {}",
+                            db, e
+                        ))),
+                    }
+                } else {
+                    Ok(CommandResult::Output(
+                        "Not connected to server.".to_string(),
+                    ))
+                }
+            }
             
             Command::Timing => Ok(CommandResult::ToggleTiming),
             
@@ -280,17 +296,27 @@ Type SQL statements followed by a semicolon to execute them.
     }
 
     async fn include_file(&self, repl: &mut Repl, path: &str) -> Result<CommandResult> {
-        let content = std::fs::read_to_string(path)?;
-        
-        // Split into statements and execute
-        for line in content.lines() {
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with("--") {
-                repl.execute_and_print(line).await?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Cannot read file '{}': {}", path, e))?;
+
+        // Use proper SQL statement splitting (handles multi-line, comments, strings)
+        let statements = crate::split_statements(&content);
+        let mut count = 0;
+
+        for stmt in &statements {
+            let trimmed = stmt.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with("--") {
+                repl.execute_and_print(trimmed).await?;
+                count += 1;
             }
         }
-        
-        Ok(CommandResult::Continue)
+
+        Ok(CommandResult::Output(format!(
+            "Executed {} statement{} from {}",
+            count,
+            if count == 1 { "" } else { "s" },
+            path
+        )))
     }
 
     async fn server_status(&self, repl: &mut Repl) -> Result<CommandResult> {

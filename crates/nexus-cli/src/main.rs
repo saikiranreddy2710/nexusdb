@@ -234,28 +234,36 @@ async fn run_repl(config: &CliConfig, format: OutputFormat, quiet: bool) -> Resu
 }
 
 /// Split SQL content into individual statements.
-fn split_statements(content: &str) -> Vec<&str> {
+///
+/// Correctly handles:
+/// - String literals ('single' and "double") with escaped quotes
+/// - Line comments (-- to end of line)
+/// - Block comments (/* ... */)
+/// - Non-ASCII content (UTF-8 safe via char_indices)
+pub fn split_statements(content: &str) -> Vec<&str> {
     let mut statements = Vec::new();
-    let mut start = 0;
+    let mut start_byte = 0;
     let mut in_string = false;
     let mut string_char = ' ';
     let mut in_comment = false;
     let mut in_block_comment = false;
 
-    let chars: Vec<char> = content.chars().collect();
-    let len = chars.len();
-
+    let bytes = content.as_bytes();
+    let len = bytes.len();
     let mut i = 0;
+
+    // Iterate by byte offset — only check ASCII-range chars for syntax,
+    // which is safe because SQL delimiters are all ASCII.
     while i < len {
-        let c = chars[i];
+        let c = bytes[i];
 
         // Handle block comments
-        if !in_string && i + 1 < len && c == '/' && chars[i + 1] == '*' {
+        if !in_string && !in_comment && i + 1 < len && c == b'/' && bytes[i + 1] == b'*' {
             in_block_comment = true;
             i += 2;
             continue;
         }
-        if in_block_comment && i + 1 < len && c == '*' && chars[i + 1] == '/' {
+        if in_block_comment && i + 1 < len && c == b'*' && bytes[i + 1] == b'/' {
             in_block_comment = false;
             i += 2;
             continue;
@@ -266,12 +274,12 @@ fn split_statements(content: &str) -> Vec<&str> {
         }
 
         // Handle line comments
-        if !in_string && i + 1 < len && c == '-' && chars[i + 1] == '-' {
+        if !in_string && i + 1 < len && c == b'-' && bytes[i + 1] == b'-' {
             in_comment = true;
             i += 2;
             continue;
         }
-        if in_comment && c == '\n' {
+        if in_comment && c == b'\n' {
             in_comment = false;
             i += 1;
             continue;
@@ -282,15 +290,15 @@ fn split_statements(content: &str) -> Vec<&str> {
         }
 
         // Handle strings
-        if !in_string && (c == '\'' || c == '"') {
+        if !in_string && (c == b'\'' || c == b'"') {
             in_string = true;
-            string_char = c;
+            string_char = c as char;
             i += 1;
             continue;
         }
-        if in_string && c == string_char {
-            // Check for escaped quote
-            if i + 1 < len && chars[i + 1] == string_char {
+        if in_string && c == string_char as u8 {
+            // Check for escaped quote ('')
+            if i + 1 < len && bytes[i + 1] == string_char as u8 {
                 i += 2;
                 continue;
             }
@@ -300,19 +308,19 @@ fn split_statements(content: &str) -> Vec<&str> {
         }
 
         // Statement separator
-        if !in_string && c == ';' {
-            statements.push(&content[start..i]);
-            start = i + 1;
+        if !in_string && c == b';' {
+            statements.push(&content[start_byte..i]);
+            start_byte = i + 1;
         }
 
         i += 1;
     }
 
     // Don't forget the last statement
-    if start < len {
-        let last = content[start..].trim();
+    if start_byte < len {
+        let last = content[start_byte..].trim();
         if !last.is_empty() {
-            statements.push(&content[start..]);
+            statements.push(&content[start_byte..]);
         }
     }
 

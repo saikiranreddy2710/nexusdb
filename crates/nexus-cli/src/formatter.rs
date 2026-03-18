@@ -20,6 +20,17 @@ pub enum OutputFormat {
     Raw,
 }
 
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputFormat::Table => write!(f, "table"),
+            OutputFormat::Json => write!(f, "json"),
+            OutputFormat::Csv => write!(f, "csv"),
+            OutputFormat::Raw => write!(f, "raw"),
+        }
+    }
+}
+
 /// Formats a query result according to the specified format.
 pub fn format_result(result: &QueryResult, format: OutputFormat) -> String {
     match format {

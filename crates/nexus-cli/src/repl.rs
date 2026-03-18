@@ -22,10 +22,6 @@ use crate::commands::{Command, CommandResult};
 use crate::config::CliConfig;
 use crate::formatter::{self, OutputFormat};
 
-/// The continuation prompt for multi-line input.
-#[allow(dead_code)]
-const CONTINUATION_PROMPT: &str = "    -> ";
-
 /// REPL helper for rustyline.
 struct ReplHelper {
     /// SQL keywords for completion.
@@ -252,6 +248,8 @@ pub struct Repl {
     in_transaction: bool,
     /// Timing mode enabled.
     timing: bool,
+    /// Whether running in mock mode (no real server).
+    mock_mode: bool,
 }
 
 impl Repl {
@@ -276,13 +274,14 @@ impl Repl {
         }
 
         Ok(Self {
-            config,
+            config: config.clone(),
             client: None,
             editor,
             format,
             history_file,
             in_transaction: false,
-            timing: false,
+            timing: config.timing,
+            mock_mode: config.mock_mode,
         })
     }
 
@@ -295,46 +294,38 @@ impl Repl {
     /// Connects to the database.
     pub async fn connect(&mut self) -> Result<()> {
         if self.config.mock_mode {
-            // Use mock client for testing
+            // Use mock client for testing — explicit opt-in only
+            self.mock_mode = true;
             let client = Client::connect_default()?;
             self.client = Some(client);
-            println!(
-                "Connected to NexusDB (mock mode)"
-            );
+            println!("Connected to NexusDB (mock mode — no data is persisted)");
             return Ok(());
         }
 
-        let client_config = ClientConfig::new()
+        let mut client_config = ClientConfig::new()
             .host(&self.config.host)
             .port(self.config.port)
             .application_name("nexus-cli");
 
-        let client_config = if let Some(ref db) = self.config.database {
-            client_config.database(db)
-        } else {
-            client_config
-        };
-
-        let client_config = if let Some(ref user) = self.config.username {
-            client_config.username(user)
-        } else {
-            client_config
-        };
-
-        let client_config = if let Some(ref pass) = self.config.password {
-            client_config.password(pass)
-        } else {
-            client_config
-        };
+        if let Some(ref db) = self.config.database {
+            client_config = client_config.database(db);
+        }
+        if let Some(ref user) = self.config.username {
+            client_config = client_config.username(user);
+        }
+        if let Some(ref pass) = self.config.password {
+            client_config = client_config.password(pass);
+        }
 
         let client = Client::new(client_config);
 
         match client.connect().await {
             Ok(()) => {
                 let db_name = self.config.database.as_deref().unwrap_or("nexusdb");
+                let user = self.config.username.as_deref().unwrap_or("(none)");
                 println!(
-                    "Connected to {}:{} (database: {})",
-                    self.config.host, self.config.port, db_name
+                    "Connected to {}:{} as \"{}\" (database: {})",
+                    self.config.host, self.config.port, user, db_name
                 );
 
                 // Try to get server info
@@ -342,17 +333,19 @@ impl Repl {
                     println!("Server: {} v{}", info.server_name, info.version);
                 }
 
+                self.mock_mode = false;
                 self.client = Some(client);
                 Ok(())
             }
             Err(e) => {
-                // Fall back to mock mode if connection fails
-                eprintln!("Warning: Could not connect to server: {}", e);
-                eprintln!("Starting in mock mode...\n");
-                
-                let mock_client = Client::connect_default()?;
-                self.client = Some(mock_client);
-                Ok(())
+                // Fail hard — no silent mock fallback
+                anyhow::bail!(
+                    "Could not connect to {}:{} — {}\n\
+                     Hint: Is the server running? Use --mock for offline testing.",
+                    self.config.host,
+                    self.config.port,
+                    e
+                );
             }
         }
     }
@@ -416,10 +409,11 @@ impl Repl {
     /// Gets the current prompt, including the current database name.
     fn get_prompt(&self) -> String {
         let db = self.config.database.as_deref().unwrap_or("nexusdb");
+        let mock = if self.mock_mode { "[mock]" } else { "" };
         if self.in_transaction {
-            format!("nexus({})* > ", db)
+            format!("nexus({}){}* > ", db, mock)
         } else {
-            format!("nexus({})> ", db)
+            format!("nexus({}){}> ", db, mock)
         }
     }
 
@@ -457,7 +451,7 @@ impl Repl {
             }
             CommandResult::SetFormat(format) => {
                 self.format = format;
-                println!("Output format set to {:?}.", format);
+                println!("Output format set to {}.", format);
                 Ok(false)
             }
             CommandResult::SwitchDatabase(db) => {
@@ -484,28 +478,30 @@ impl Repl {
             .context("Not connected to database")?;
 
         let start = Instant::now();
-
-        // Check for transaction control statements
         let sql_upper = sql.to_uppercase();
-        if sql_upper.starts_with("BEGIN") {
-            self.in_transaction = true;
-        } else if sql_upper.starts_with("COMMIT") || sql_upper.starts_with("ROLLBACK") {
-            self.in_transaction = false;
-        }
 
         match client.execute(sql).await {
             Ok(result) => {
                 let elapsed = start.elapsed();
                 self.print_result(&result, elapsed);
 
+                // Update transaction state only AFTER server confirms success.
+                // Use word-boundary check to avoid matching e.g. "BEGINNING".
+                let first_word = sql_upper.split_whitespace().next().unwrap_or("");
+                if first_word == "BEGIN" {
+                    self.in_transaction = true;
+                } else if first_word == "COMMIT" || first_word == "ROLLBACK" {
+                    self.in_transaction = false;
+                }
+
                 // Intercept successful USE commands: update the active database
                 // on the client so subsequent requests use the new database context.
-                if sql_upper.starts_with("USE ") {
-                    if let Some(db_name) = sql.trim().strip_prefix("USE ").or_else(|| sql.trim().strip_prefix("use ")) {
-                        let db_name = db_name.trim().trim_end_matches(';').trim();
-                        if !db_name.is_empty() {
-                            self.switch_database(db_name);
-                        }
+                // Case-insensitive, whitespace-tolerant.
+                let trimmed_upper = sql.trim().to_uppercase();
+                if trimmed_upper.starts_with("USE ") || trimmed_upper.starts_with("USE\t") {
+                    let db_name = sql.trim()[3..].trim().trim_end_matches(';').trim();
+                    if !db_name.is_empty() {
+                        self.switch_database(db_name);
                     }
                 }
 
