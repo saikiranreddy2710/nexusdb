@@ -5,12 +5,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use serde::{Deserialize, Serialize};
+
 use crate::logical::Schema;
 
 use super::error::{StorageError, StorageResult};
 
+/// Catalog file name for JSON persistence.
+pub const CATALOG_FILE: &str = "catalog.json";
+
 /// A stored default value expression for a column.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnDefault {
     /// Column index.
     pub col_idx: usize,
@@ -19,18 +24,33 @@ pub struct ColumnDefault {
 }
 
 /// A stored CHECK constraint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckConstraint {
     /// The check expression (parsed AST).
+    /// Not serialized — reconstructed from `sql` on load.
+    #[serde(skip, default = "default_check_expr")]
     pub expr: crate::parser::Expr,
+    /// Original SQL text of the CHECK expression (for persistence).
+    #[serde(default)]
+    pub sql: String,
+}
+
+/// Default placeholder expression used when deserializing CheckConstraints.
+/// The real expression should be re-parsed from `sql` after loading.
+fn default_check_expr() -> crate::parser::Expr {
+    crate::parser::Expr::Literal(crate::parser::Literal::Boolean(true))
 }
 
 /// Information about a table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableInfo {
     /// Table name.
     pub name: String,
     /// Table schema.
+    #[serde(
+        serialize_with = "serialize_arc_schema",
+        deserialize_with = "deserialize_arc_schema"
+    )]
     pub schema: Arc<Schema>,
     /// Primary key column indices.
     pub primary_key: Vec<usize>,
@@ -97,7 +117,7 @@ impl TableInfo {
 }
 
 /// The type of index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IndexType {
     /// Standard B-tree index.
     BTree,
@@ -119,7 +139,7 @@ impl Default for IndexType {
 }
 
 /// Index information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexInfo {
     /// Index name.
     pub name: String,
@@ -163,6 +183,31 @@ impl IndexInfo {
     }
 }
 
+// =========================================================================
+// Serde helpers
+// =========================================================================
+
+fn serialize_arc_schema<S>(schema: &Arc<Schema>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    schema.as_ref().serialize(serializer)
+}
+
+fn deserialize_arc_schema<'de, D>(deserializer: D) -> Result<Arc<Schema>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Schema::deserialize(deserializer).map(Arc::new)
+}
+
+/// Serializable snapshot of the catalog (for persistence).
+#[derive(Debug, Serialize, Deserialize)]
+struct CatalogSnapshot {
+    tables: Vec<TableInfo>,
+    next_table_id: u64,
+}
+
 /// Table catalog for managing table metadata.
 #[derive(Debug)]
 pub struct Catalog {
@@ -179,6 +224,40 @@ impl Catalog {
             tables: RwLock::new(HashMap::new()),
             next_table_id: RwLock::new(1),
         }
+    }
+
+    /// Serializes the catalog to JSON for persistence.
+    pub fn to_json(&self) -> StorageResult<String> {
+        let tables = self.tables.read().unwrap();
+        let next_id = self.next_table_id.read().unwrap();
+        let snapshot = CatalogSnapshot {
+            tables: tables.values().cloned().collect(),
+            next_table_id: *next_id,
+        };
+        serde_json::to_string_pretty(&snapshot).map_err(|e| {
+            StorageError::InvalidOperation(format!("catalog serialization failed: {}", e))
+        })
+    }
+
+    /// Restores a catalog from a JSON string.
+    pub fn from_json(json: &str) -> StorageResult<Self> {
+        let snapshot: CatalogSnapshot = serde_json::from_str(json).map_err(|e| {
+            StorageError::InvalidOperation(format!("catalog deserialization failed: {}", e))
+        })?;
+        let mut table_map = HashMap::new();
+        for info in snapshot.tables {
+            table_map.insert(info.name.clone(), info);
+        }
+        Ok(Self {
+            tables: RwLock::new(table_map),
+            next_table_id: RwLock::new(snapshot.next_table_id),
+        })
+    }
+
+    /// Returns all table infos (for recovery/enumeration).
+    pub fn all_tables(&self) -> Vec<TableInfo> {
+        let tables = self.tables.read().unwrap();
+        tables.values().cloned().collect()
     }
 
     /// Creates a table.

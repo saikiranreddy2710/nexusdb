@@ -847,7 +847,10 @@ impl Session {
             .filter_map(|col| {
                 col.constraints.iter().find_map(|c| {
                     if let ColumnConstraint::Check(expr) = c {
-                        Some(nexus_sql::storage::CheckConstraint { expr: expr.clone() })
+                        Some(nexus_sql::storage::CheckConstraint {
+                            expr: expr.clone(),
+                            sql: format!("{:?}", expr),
+                        })
                     } else {
                         None
                     }
@@ -856,7 +859,10 @@ impl Session {
             .collect();
         for tc in &create.constraints {
             if let nexus_sql::parser::TableConstraint::Check { expr, .. } = tc {
-                check_constraints.push(nexus_sql::storage::CheckConstraint { expr: expr.clone() });
+                check_constraints.push(nexus_sql::storage::CheckConstraint {
+                    expr: expr.clone(),
+                    sql: format!("{:?}", expr),
+                });
             }
         }
 

@@ -29,8 +29,20 @@ pub struct TableStore {
 }
 
 impl TableStore {
-    /// Creates a new table store.
+    /// Creates a new table store with an in-memory SageTree.
     pub fn new(info: TableInfo) -> Self {
+        Self::with_tree(info, SageTree::new())
+    }
+
+    /// Creates a table store with a pre-built SageTree.
+    ///
+    /// Use this to inject a `FilePager`-backed tree for disk persistence:
+    /// ```ignore
+    /// let pager = FilePager::open("table.sage")?;
+    /// let tree = SageTree::with_pager(config, Box::new(pager));
+    /// let store = TableStore::with_tree(info, tree);
+    /// ```
+    pub fn with_tree(info: TableInfo, tree: SageTree) -> Self {
         // If no primary key is specified, use the first column as the default
         // This ensures rows can be uniquely identified
         let primary_key = if info.primary_key.is_empty() && !info.schema.is_empty() {
@@ -44,7 +56,7 @@ impl TableStore {
 
         Self {
             info,
-            tree: SageTree::new(),
+            tree,
             encoder,
             decoder,
         }
@@ -259,6 +271,13 @@ impl TableStore {
     /// Forces consolidation of delta chains.
     pub fn consolidate(&self) {
         self.tree.consolidate_all();
+    }
+
+    /// Flushes the underlying SageTree pager to disk.
+    pub fn flush(&self) -> StorageResult<()> {
+        self.tree
+            .flush()
+            .map_err(|e| StorageError::InvalidOperation(format!("flush failed: {}", e)))
     }
 
     /// Clears all data from the table.

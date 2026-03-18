@@ -4,12 +4,16 @@
 //! It manages the table catalog and provides query execution methods.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+use nexus_storage::sagetree::pager::FilePager;
+use nexus_storage::sagetree::{SageTree, SageTreeConfig};
 
 use crate::executor::{RecordBatch, Row, Value};
 use crate::logical::Schema;
 
-use super::catalog::{Catalog, TableInfo};
+use super::catalog::{Catalog, TableInfo, CATALOG_FILE};
 use super::encoder::EncodingFormat;
 use super::error::{StorageError, StorageResult};
 use super::table::TableStore;
@@ -27,16 +31,82 @@ pub struct StorageEngine {
     tables: RwLock<HashMap<String, Arc<TableStore>>>,
     /// Default encoding format.
     encoding_format: EncodingFormat,
+    /// Data directory for disk persistence (None = in-memory only).
+    data_dir: Option<PathBuf>,
 }
 
 impl StorageEngine {
-    /// Creates a new storage engine.
+    /// Creates a new in-memory storage engine.
     pub fn new() -> Self {
         Self {
             catalog: Catalog::new(),
             tables: RwLock::new(HashMap::new()),
             encoding_format: EncodingFormat::Binary,
+            data_dir: None,
         }
+    }
+
+    /// Opens a disk-backed storage engine from a data directory.
+    ///
+    /// If the directory contains an existing `catalog.json`, the catalog and
+    /// all table data are recovered from disk. Otherwise a fresh engine is
+    /// created and the directory structure is initialized.
+    pub fn with_data_dir(path: impl Into<PathBuf>) -> StorageResult<Self> {
+        let data_dir = path.into();
+        let tables_dir = data_dir.join("tables");
+
+        // Ensure directory structure exists
+        std::fs::create_dir_all(&tables_dir).map_err(|e| {
+            StorageError::InvalidOperation(format!(
+                "failed to create data directory {}: {}",
+                tables_dir.display(),
+                e
+            ))
+        })?;
+
+        let catalog_path = data_dir.join(CATALOG_FILE);
+        if catalog_path.exists() {
+            // Recovery: load catalog + open file-backed trees
+            let json = std::fs::read_to_string(&catalog_path).map_err(|e| {
+                StorageError::InvalidOperation(format!("failed to read catalog: {}", e))
+            })?;
+            let catalog = Catalog::from_json(&json)?;
+            let all_tables = catalog.all_tables();
+
+            let mut table_map = HashMap::new();
+            for info in &all_tables {
+                let sage_path = tables_dir.join(format!("{}.sage", info.name));
+                let pager = FilePager::open(&sage_path).map_err(|e| {
+                    StorageError::InvalidOperation(format!(
+                        "failed to open pager for table '{}': {}",
+                        info.name, e
+                    ))
+                })?;
+                let tree = SageTree::with_pager(SageTreeConfig::default(), Box::new(pager));
+                let store = Arc::new(TableStore::with_tree(info.clone(), tree));
+                table_map.insert(info.name.clone(), store);
+            }
+
+            Ok(Self {
+                catalog,
+                tables: RwLock::new(table_map),
+                encoding_format: EncodingFormat::Binary,
+                data_dir: Some(data_dir),
+            })
+        } else {
+            // Fresh engine with disk backing
+            Ok(Self {
+                catalog: Catalog::new(),
+                tables: RwLock::new(HashMap::new()),
+                encoding_format: EncodingFormat::Binary,
+                data_dir: Some(data_dir),
+            })
+        }
+    }
+
+    /// Returns the data directory path, if set.
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
     }
 
     /// Sets the default encoding format for new tables.
@@ -59,8 +129,20 @@ impl StorageEngine {
         // Register in catalog
         self.catalog.create_table(info.clone())?;
 
-        // Create table store
-        let store = Arc::new(TableStore::new(info.clone()));
+        // Create table store (disk-backed if data_dir is set)
+        let store = if let Some(ref dir) = self.data_dir {
+            let sage_path = dir.join("tables").join(format!("{}.sage", info.name));
+            let pager = FilePager::open(&sage_path).map_err(|e| {
+                StorageError::InvalidOperation(format!(
+                    "failed to create pager for table '{}': {}",
+                    info.name, e
+                ))
+            })?;
+            let tree = SageTree::with_pager(SageTreeConfig::default(), Box::new(pager));
+            Arc::new(TableStore::with_tree(info.clone(), tree))
+        } else {
+            Arc::new(TableStore::new(info.clone()))
+        };
 
         // Add to tables map
         let mut tables = self.tables.write().unwrap();
@@ -91,6 +173,14 @@ impl StorageEngine {
         // Remove table store
         let mut tables = self.tables.write().unwrap();
         tables.remove(name);
+
+        // Delete .sage file if disk-backed
+        if let Some(ref dir) = self.data_dir {
+            let sage_path = dir.join("tables").join(format!("{}.sage", name));
+            if sage_path.exists() {
+                let _ = std::fs::remove_file(&sage_path);
+            }
+        }
 
         Ok(())
     }
@@ -328,6 +418,31 @@ impl StorageEngine {
         for store in tables.values() {
             store.consolidate();
         }
+    }
+
+    /// Flushes all table data and the catalog to disk.
+    ///
+    /// No-op if the engine is in-memory only.
+    pub fn flush_all(&self) -> StorageResult<()> {
+        let data_dir = match &self.data_dir {
+            Some(dir) => dir,
+            None => return Ok(()),
+        };
+
+        // 1. Flush each table's SageTree pager to disk
+        let tables = self.tables.read().unwrap();
+        for store in tables.values() {
+            store.flush()?;
+        }
+
+        // 2. Persist catalog to JSON
+        let json = self.catalog.to_json()?;
+        let catalog_path = data_dir.join(CATALOG_FILE);
+        std::fs::write(&catalog_path, json).map_err(|e| {
+            StorageError::InvalidOperation(format!("failed to write catalog: {}", e))
+        })?;
+
+        Ok(())
     }
 
     /// Returns statistics about the storage engine.

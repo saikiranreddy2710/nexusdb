@@ -124,7 +124,15 @@ pub struct Database {
 impl Database {
     /// Opens a database with the given configuration.
     pub fn open(config: DatabaseConfig) -> DatabaseResult<Self> {
-        let storage = Arc::new(StorageEngine::new());
+        // Create storage engine — disk-backed if data_dir is set
+        let storage = if let Some(ref data_dir) = config.data_dir {
+            let db_dir = PathBuf::from(data_dir).join(DEFAULT_DATABASE_NAME);
+            Arc::new(StorageEngine::with_data_dir(&db_dir).map_err(|e| {
+                DatabaseError::Internal(format!("failed to open storage at {:?}: {}", db_dir, e))
+            })?)
+        } else {
+            Arc::new(StorageEngine::new())
+        };
 
         // Initialize WAL if enabled and data directory is specified
         let wal = if config.wal_enabled {
@@ -286,9 +294,28 @@ impl Database {
         if let Some(storage) = dbs.get(name) {
             return Arc::clone(storage);
         }
-        let storage = Arc::new(StorageEngine::new());
+        let storage = Arc::new(self.create_storage_engine(name));
         dbs.insert(name.to_string(), Arc::clone(&storage));
         storage
+    }
+
+    /// Creates a StorageEngine for a database, using disk-backing if data_dir is set.
+    fn create_storage_engine(&self, db_name: &str) -> StorageEngine {
+        if let Some(ref data_dir) = self.config.data_dir {
+            let db_dir = PathBuf::from(data_dir).join(db_name);
+            match StorageEngine::with_data_dir(&db_dir) {
+                Ok(engine) => engine,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create disk-backed storage for '{}': {}, falling back to in-memory",
+                        db_name, e
+                    );
+                    StorageEngine::new()
+                }
+            }
+        } else {
+            StorageEngine::new()
+        }
     }
 
     /// Creates a new database. No-op if it already exists (unless if_not_exists is false).
@@ -304,7 +331,7 @@ impl Database {
                 )))
             };
         }
-        dbs.insert(name.to_string(), Arc::new(StorageEngine::new()));
+        dbs.insert(name.to_string(), Arc::new(self.create_storage_engine(name)));
         Ok(())
     }
 
@@ -556,8 +583,16 @@ impl Database {
             }
         }
 
-        // Consolidate storage
-        self.storage().consolidate_all();
+        // Flush all databases to disk, then consolidate
+        {
+            let dbs = self.databases.read().unwrap();
+            for (name, engine) in dbs.iter() {
+                if let Err(e) = engine.flush_all() {
+                    tracing::error!("Failed to flush database '{}': {}", name, e);
+                }
+                engine.consolidate_all();
+            }
+        }
     }
 }
 

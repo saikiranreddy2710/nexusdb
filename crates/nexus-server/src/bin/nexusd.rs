@@ -192,9 +192,7 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         // Ensure directory exists
         std::fs::create_dir_all(dir).context("Failed to create data directory")?;
         
-        // For now, use memory mode since file-based storage needs more setup
-        warn!("File-based storage not yet fully implemented, using memory mode");
-        Database::open_memory().context("Failed to create database")?
+        Database::open_path(dir).context("Failed to open database at data directory")?
     } else {
         info!("No data directory specified, using memory mode");
         Database::open_memory().context("Failed to create in-memory database")?
