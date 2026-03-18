@@ -709,6 +709,14 @@ impl Session {
                 Ok(StatementResult::ddl("DROP DATABASE"))
             }
             Statement::UseDatabase(name) => {
+                // Verify the database exists before switching
+                let existing = self.database.list_databases();
+                if !existing.iter().any(|db| db == name) {
+                    return Err(DatabaseError::ExecutionError(format!(
+                        "database \"{}\" does not exist",
+                        name
+                    )));
+                }
                 self.set_current_database(name);
                 self.plan_cache.clear();
                 self.result_cache.clear();
