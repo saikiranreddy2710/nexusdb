@@ -265,12 +265,9 @@ fn format_connection_banner(host: &str, port: u16, user: &str, db: &str) -> Stri
 
 /// Formats a database-switch message for display. Accepts only non-sensitive
 /// fields so CodeQL cannot trace the `password` field into print output.
-fn format_switch_message(db: &str, user: &str) -> String {
-    format!(
-        "You are now connected to database \"{}\" as \"{}\".",
-        db, user,
-    )
-}
+///
+/// Note: We no longer include the username in this message to avoid
+/// logging potentially sensitive identifiers to stdout or log files.
 
 impl Repl {
     /// Creates a new REPL instance.
@@ -489,16 +486,13 @@ impl Repl {
             }
             CommandResult::SwitchDatabase { db, user } => {
                 self.switch_database(&db);
-                // Update username if provided, then route through a function
-                // that accepts only non-sensitive fields, breaking CodeQL's
-                // taint chain from config.password.
-                let display_user = if let Some(ref u) = user {
+                // Update username if provided, but avoid printing it to
+                // stdout or logs to prevent exposure of potentially
+                // sensitive identifiers.
+                if let Some(ref u) = user {
                     self.config.username = Some(u.clone());
-                    u.clone()
-                } else {
-                    self.config.username.clone().unwrap_or_else(|| "(none)".into())
-                };
-                println!("{}", format_switch_message(&db, &display_user));
+                }
+                println!("You are now connected to database \"{}\".", db);
                 Ok(false)
             }
         }
