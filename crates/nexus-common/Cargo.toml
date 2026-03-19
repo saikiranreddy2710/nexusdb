@@ -15,6 +15,7 @@ parking_lot = { workspace = true }
 crc32fast = { workspace = true }
 chrono = { workspace = true }
 humantime = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
