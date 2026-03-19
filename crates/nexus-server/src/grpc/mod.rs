@@ -360,10 +360,14 @@ impl NexusDb for NexusDbService {
         } else {
             // Create a temporary authenticated session (autocommit)
             let session_id = self.db.create_authenticated_session(database, identity);
-            let result = {
-                let session_arc = self.db.get_session(session_id).unwrap();
+            let result = if let Some(session_arc) = self.db.get_session(session_id) {
                 let mut session = session_arc.write().unwrap();
                 session.execute(&req.sql)
+            } else {
+                Err(crate::database::DatabaseError::SessionError(format!(
+                    "failed to retrieve newly created session: {}",
+                    session_id
+                )))
             };
             self.db.close_session(session_id);
             result
@@ -410,10 +414,14 @@ impl NexusDb for NexusDbService {
 
         // Execute the query on the requested database with authenticated identity
         let session_id = self.db.create_authenticated_session(database, identity);
-        let result = {
-            let session_arc = self.db.get_session(session_id).unwrap();
-            let mut session = session_arc.write().unwrap();
-            session.execute(&req.sql)
+        let result = if let Some(session_arc) = self.db.get_session(session_id) {
+             let mut session = session_arc.write().unwrap();
+             session.execute(&req.sql)
+        } else {
+            Err(crate::database::DatabaseError::SessionError(format!(
+                "failed to retrieve newly created session for streaming query: {}",
+                session_id
+            )))
         };
         self.db.close_session(session_id);
 

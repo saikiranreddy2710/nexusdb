@@ -302,56 +302,116 @@ impl Authenticator {
     }
 
     /// Verify a password credential using PBKDF2-HMAC-SHA256.
+    ///
+    /// This function is carefully structured to prevent two classes of attacks:
+    /// 1. **DoS via lock contention**: The expensive PBKDF2 hashing is performed
+    ///    *outside* any lock, so concurrent requests are not blocked.
+    /// 2. **User enumeration via timing**: Hashing is performed unconditionally
+    ///    (with a dummy salt for non-existent users), so the response time is
+    ///    constant regardless of whether the username exists.
     fn authenticate_password(&self, username: &str, password: &str) -> AuthResult<Identity> {
-        let mut users = self.users.write();
-        let user = users
-            .get_mut(username)
-            .ok_or(AuthError::InvalidCredentials)?;
+        // Step 1: Acquire a READ lock and extract user data (or dummy values).
+        let (salt, stored_hash, locked, locked_until, roles, stored_username, user_exists) = {
+            let users = self.users.read();
+            if let Some(user) = users.get(username) {
+                (
+                    user.salt,
+                    user.password_hash,
+                    user.locked,
+                    user.locked_until,
+                    user.roles.clone(),
+                    user.username.clone(),
+                    true,
+                )
+            } else {
+                // Generate a dummy salt so hashing takes the same time as for
+                // a real user, preventing user-enumeration timing attacks.
+                let dummy_salt_vec = generate_random_bytes(16);
+                let dummy_salt: [u8; 16] = dummy_salt_vec
+                    .as_slice()
+                    .try_into()
+                    .expect("dummy salt must be 16 bytes");
+                let dummy_hash = [0u8; 32];
+                (
+                    dummy_salt,
+                    dummy_hash,
+                    false,
+                    None,
+                    vec![],
+                    String::new(),
+                    false,
+                )
+            }
+        };
+        // Read lock is dropped here — no lock is held during hashing.
 
-        // Check lockout: if locked, see if the timeout has expired.
-        if user.locked {
-            if let Some(until) = user.locked_until {
+        // Step 2: Unconditional hashing (constant-time regardless of user existence).
+        let hash = pbkdf2_hmac_sha256(password.as_bytes(), &salt, self.pbkdf2_iterations);
+
+        // Step 3: If the user does not exist, reject (after hashing).
+        if !user_exists {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // Step 4: Check lockout using the snapshot taken under the read lock.
+        let lockout_expired = if locked {
+            if let Some(until) = locked_until {
                 if now_epoch() >= until {
-                    // Lockout period expired — auto-unlock
-                    user.locked = false;
-                    user.locked_until = None;
-                    user.failed_attempts = 0;
-                    tracing::info!(
-                        user = username,
-                        "account auto-unlocked after lockout timeout"
-                    );
+                    true // lockout expired, will auto-unlock below
                 } else {
                     return Err(AuthError::AccountLocked(username.to_string()));
                 }
             } else {
                 return Err(AuthError::AccountLocked(username.to_string()));
             }
-        }
+        } else {
+            false
+        };
 
-        let hash = pbkdf2_hmac_sha256(password.as_bytes(), &user.salt, self.pbkdf2_iterations);
+        // Step 5: Constant-time comparison.
+        let password_valid = constant_time_eq(&hash, &stored_hash);
 
-        // Constant-time comparison to prevent timing attacks
-        if !constant_time_eq(&hash, &user.password_hash) {
-            user.failed_attempts += 1;
-            if user.failed_attempts >= MAX_FAILED_ATTEMPTS {
-                user.locked = true;
-                user.locked_until = Some(now_epoch() + LOCKOUT_DURATION_SECS);
-                tracing::warn!(
-                    user = username,
-                    attempts = user.failed_attempts,
-                    lockout_secs = LOCKOUT_DURATION_SECS,
-                    "account locked after too many failed attempts"
-                );
+        // Step 6: State mutation — reacquire WRITE lock only for the brief
+        //         update of failed_attempts / locked / locked_until.
+        if !password_valid {
+            let mut users = self.users.write();
+            if let Some(user) = users.get_mut(username) {
+                user.failed_attempts += 1;
+                if user.failed_attempts >= MAX_FAILED_ATTEMPTS {
+                    user.locked = true;
+                    user.locked_until = Some(now_epoch() + LOCKOUT_DURATION_SECS);
+                    tracing::warn!(
+                        user = username,
+                        attempts = user.failed_attempts,
+                        lockout_secs = LOCKOUT_DURATION_SECS,
+                        "account locked after too many failed attempts"
+                    );
+                }
             }
+            // Write lock dropped here.
             return Err(AuthError::InvalidCredentials);
         }
 
-        // Success: reset failed attempts
-        user.failed_attempts = 0;
+        // Success: reset failed attempts (and auto-unlock if lockout just expired).
+        {
+            let mut users = self.users.write();
+            if let Some(user) = users.get_mut(username) {
+                if lockout_expired {
+                    user.locked = false;
+                    user.locked_until = None;
+                    tracing::info!(
+                        user = username,
+                        "account auto-unlocked after lockout timeout"
+                    );
+                }
+                user.failed_attempts = 0;
+            }
+            // Write lock dropped here.
+        }
 
         Ok(Identity {
-            username: user.username.clone(),
-            roles: user.roles.clone(),
+            username: stored_username,
+            roles,
             authenticated_at: now_epoch(),
             method: AuthMethod::Password,
         })

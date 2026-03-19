@@ -401,7 +401,7 @@ impl Repl {
         }
 
         // Save history
-        self.save_history();
+        self.save_history().await;
 
         // Disconnect
         if let Some(ref client) = self.client {
@@ -573,12 +573,12 @@ impl Repl {
         }
     }
 
-    /// Saves command history.
-    fn save_history(&mut self) {
+    /// Saves command history (async, non-blocking directory creation).
+    async fn save_history(&mut self) {
         if let Some(ref path) = self.history_file {
-            // Ensure parent directory exists
+            // Ensure parent directory exists (non-blocking)
             if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                let _ = tokio::fs::create_dir_all(parent).await;
             }
             if let Err(e) = self.editor.save_history(path) {
                 debug!("Failed to save history: {}", e);

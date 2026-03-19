@@ -100,46 +100,46 @@ impl CliConfig {
         Self::default()
     }
 
-    /// Loads configuration from a file.
-    pub fn from_file(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+    /// Loads configuration from a file (async, non-blocking).
+    pub async fn from_file(path: &Path) -> Result<Self> {
+        let content = tokio::fs::read_to_string(path).await?;
         let config: Self = toml::from_str(&content)?;
         Ok(config)
     }
 
-    /// Saves configuration to a file.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    /// Saves configuration to a file (async, non-blocking).
+    pub async fn save(&self, path: &Path) -> Result<()> {
         let content = toml::to_string_pretty(self)?;
 
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
 
-        std::fs::write(path, content)?;
+        tokio::fs::write(path, content).await?;
         Ok(())
     }
 
-    /// Loads the default configuration file.
+    /// Loads the default configuration file (async, non-blocking).
     ///
     /// Looks in the following locations:
     /// 1. ~/.config/nexusdb/config.toml
     /// 2. ~/.nexusdb/config.toml
     /// 3. Returns default if not found
-    pub fn load_default() -> Result<Self> {
+    pub async fn load_default() -> Result<Self> {
         // Try XDG config first
         if let Some(config_dir) = dirs::config_dir() {
             let path = config_dir.join("nexusdb").join("config.toml");
-            if path.exists() {
-                return Self::from_file(&path);
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                return Self::from_file(&path).await;
             }
         }
 
         // Try home directory
         if let Some(home) = dirs::home_dir() {
             let path = home.join(".nexusdb").join("config.toml");
-            if path.exists() {
-                return Self::from_file(&path);
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                return Self::from_file(&path).await;
             }
         }
 
@@ -246,8 +246,8 @@ mod tests {
         assert_eq!(config.username, Some("user".to_string()));
     }
 
-    #[test]
-    fn test_save_and_load() {
+    #[tokio::test]
+    async fn test_save_and_load() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("config.toml");
 
@@ -257,9 +257,9 @@ mod tests {
             .database("testdb")
             .build();
 
-        config.save(&path).unwrap();
+        config.save(&path).await.unwrap();
 
-        let loaded = CliConfig::from_file(&path).unwrap();
+        let loaded = CliConfig::from_file(&path).await.unwrap();
         assert_eq!(loaded.host, "test.host");
         assert_eq!(loaded.port, 9999);
         assert_eq!(loaded.database, Some("testdb".to_string()));

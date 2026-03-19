@@ -138,7 +138,7 @@ async fn run() -> Result<()> {
     init_logging(args.verbose);
 
     // Load configuration
-    let config = load_config(&args)?;
+    let config = load_config(&args).await?;
 
     // Determine execution mode
     if let Some(command) = &args.command {
@@ -167,12 +167,12 @@ fn init_logging(verbose: bool) {
         .init();
 }
 
-fn load_config(args: &Args) -> Result<CliConfig> {
+async fn load_config(args: &Args) -> Result<CliConfig> {
     // Try to load from config file
     let mut config = if let Some(path) = &args.config {
-        CliConfig::from_file(path)?
+        CliConfig::from_file(path).await?
     } else {
-        CliConfig::load_default()?
+        CliConfig::load_default().await?
     };
 
     // Override with command line arguments
@@ -223,7 +223,7 @@ async fn execute_command(config: &CliConfig, sql: &str, format: OutputFormat) ->
 async fn execute_file(config: &CliConfig, path: &PathBuf, format: OutputFormat) -> Result<()> {
     info!("Executing file: {}", path.display());
 
-    let content = std::fs::read_to_string(path)?;
+    let content = tokio::fs::read_to_string(path).await?;
     let mut repl = Repl::new(config.clone(), format)?;
     repl.connect().await?;
 
