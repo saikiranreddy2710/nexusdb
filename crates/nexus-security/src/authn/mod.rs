@@ -2,7 +2,7 @@
 //!
 //! Supports multiple credential types:
 //! - **PBKDF2-HMAC-SHA256**: Password authentication with iterated hashing
-//!   (10 000 rounds by default, configurable)
+//!   (600 000 rounds by default, configurable)
 //! - **API Key**: Simple token-based auth for service accounts
 //! - **JWT**: Stateless HMAC-SHA256 tokens (constant-time signature verification)
 

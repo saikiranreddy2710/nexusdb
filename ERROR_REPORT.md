@@ -9,17 +9,19 @@
 - **Issue:** Used `std::fs::read_to_string`, which blocks the async worker thread during disk I/O.
 - **Resolution:** Replaced with `tokio::fs::read_to_string(...).await`.
 
-### 1.2 [POTENTIAL] Blocking Configuration I/O
+### 1.2 [FIXED] Blocking Configuration I/O
 
 - **Location:** `crates/nexus-cli/src/config.rs`
 - **Functions:** `CliConfig::from_file`, `CliConfig::save`, `CliConfig::load_default`
-- **Issue:** Uses `std::fs` operations. While these are currently called in synchronous contexts or during CLI initialization, they could become bottlenecks if integrated into long-running async loops or if the config file resides on a slow network mount.
+- **Issue:** Used `std::fs` operations in async contexts.
+- **Resolution:** All three functions converted to `async` using `tokio::fs::read_to_string`, `tokio::fs::write`, `tokio::fs::create_dir_all`, and `tokio::fs::try_exists`.
 
-### 1.3 [POTENTIAL] Blocking History Saving
+### 1.3 [FIXED] Blocking History Saving
 
 - **Location:** `crates/nexus-cli/src/repl.rs`
 - **Function:** `Repl::save_history`
-- **Issue:** Uses `std::fs::create_dir_all`. This is called when the REPL exits. While less critical than the main execution loop, it still uses blocking I/O.
+- **Issue:** Used `std::fs::create_dir_all` in an async context.
+- **Resolution:** Converted to `async` using `tokio::fs::create_dir_all(...).await`.
 
 ## 2. Environment & Build Errors
 

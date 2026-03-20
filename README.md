@@ -11,7 +11,7 @@ The goal: understand how databases really work under the hood -- not just the th
 ## Features
 
 ### Storage Engine (SageTree)
-- SageTree B-tree variant with Bw-tree-style delta chains and fractional cascading
+- SageTree B+Tree variant with Bw-tree-style delta chains and fractional cascading
 - MVCC-aware index structure designed for snapshot isolation
 - Bloom filter integration for fast negative key lookups
 - Buffer pool with clock-sweep eviction
@@ -42,7 +42,7 @@ The goal: understand how databases really work under the hood -- not just the th
 - Serializable isolation level support
 
 ### Security (Zero Trust)
-- **Authentication**: PBKDF2-HMAC-SHA256 password hashing (10 000 iterations), API keys with O(1) reverse-index lookup, HMAC-SHA256 JWT tokens with constant-time signature verification
+- **Authentication**: PBKDF2-HMAC-SHA256 password hashing (600,000 iterations), API keys with O(1) reverse-index lookup, HMAC-SHA256 JWT tokens with constant-time signature verification
 - **Authorization**: Role-Based Access Control (RBAC) with role inheritance, table/database/global permission granularity, built-in protected superuser role
 - **Audit**: Tamper-proof hash-chained audit log (SHA-256), thread-safe with single-lock atomicity, integrity verification survives entry eviction, SIEM-exportable JSON
 - **Transport**: TLS 1.2+ encryption, mutual TLS (mTLS) client certificate verification
@@ -104,6 +104,7 @@ crates/
 ├── nexus-txn        # Transaction manager (2PL, deadlock detection)
 ├── nexus-mvcc       # Multi-version concurrency control
 ├── nexus-security   # Authentication, RBAC authorization, audit log
+├── nexus-hnsw       # HNSW vector index for similarity search
 ├── nexus-server     # Database server, session management, gRPC API
 ├── nexus-client     # Rust client library
 ├── nexus-proto      # gRPC protocol definitions (protobuf)
@@ -175,7 +176,7 @@ cargo test -p nexus-security
 cargo test -p nexus-sql test_select_where
 ```
 
-Currently at **1020+ passing tests** across 18 crates.
+Currently at **1216+ passing tests** across 19 crates.
 
 ## Configuration
 
@@ -233,7 +234,7 @@ NexusDB implements a Zero Trust security model:
 
 | Method | Description |
 |--------|-------------|
-| PBKDF2-HMAC-SHA256 | Password auth with 10 000 iterations, random 16-byte salt |
+| PBKDF2-HMAC-SHA256 | Password auth with 600,000 iterations, random 16-byte salt |
 | API Keys | `nxk_` prefixed tokens, O(1) lookup via reverse index |
 | JWT (HMAC-SHA256) | Stateless tokens with constant-time signature verification |
 

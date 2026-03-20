@@ -11,7 +11,7 @@
 If you discover a security vulnerability in NexusDB, please report it responsibly:
 
 1. **Do not** open a public GitHub issue for security vulnerabilities.
-2. Email the maintainers at **saikiranreddy2710@github.com** with a detailed description of the vulnerability.
+2. Email the maintainers at **saikiranreddy.j@stonybrook.edu** with a detailed description of the vulnerability.
 3. Include steps to reproduce, affected components, and potential impact.
 
 ### What to expect
@@ -26,7 +26,7 @@ If you discover a security vulnerability in NexusDB, please report it responsibl
 NexusDB implements a Zero Trust security model:
 
 - **Authentication**: PBKDF2-HMAC-SHA256 with 600,000 iterations, per-user salts
-- **Authorization**: Role-Based Access Control (RBAC) with `admin`, `readwrite`, and `readonly` roles
+- **Authorization**: Role-Based Access Control (RBAC) with role inheritance and built-in `superuser` role
 - **Audit**: Comprehensive audit logging of all authentication and authorization events
 - **Transport**: gRPC with TLS support
 

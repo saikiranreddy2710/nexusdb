@@ -74,4 +74,10 @@ To resolve both vulnerabilities simultaneously, the `authenticate_password` func
      - Acquire a `write()` lock on the users map.
      - Re-fetch the user (to ensure we don't overwrite concurrent changes).
      - Update `failed_attempts`, `locked`, and `locked_until` as necessary.
-     - Drop the write lock immediately.
+      - Drop the write lock immediately.
+
+---
+
+## Resolution Status
+
+**Both vulnerabilities have been FIXED.** The `authenticate_password` function in `crates/nexus-security/src/authn/mod.rs` was refactored following the remediation plan above. All 40 security crate tests pass after the fix.
