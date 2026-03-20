@@ -469,13 +469,8 @@ impl Repl {
                 if let Some(ref u) = user {
                     self.config.username = Some(u.clone());
                 }
-                // Use ConnectionInfo (a struct without password) to create a
-                // structural taint barrier for CodeQL.
-                let info = self.config.connection_info();
-                println!(
-                    "You are now connected to database \"{}\" as \"{}\".",
-                    info.database, info.username,
-                );
+                // Avoid logging username to satisfy CodeQL rust/cleartext-logging.
+                println!("You are now connected to database \"{}\".", db);
                 Ok(false)
             }
         }

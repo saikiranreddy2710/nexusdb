@@ -94,23 +94,17 @@ impl Default for CliConfig {
     }
 }
 
-/// Display-safe connection information. This struct intentionally excludes
-/// sensitive fields (password, API keys) to create a structural taint
-/// barrier for static analysis tools like CodeQL.
+/// Display-safe connection information. Excludes all sensitive fields
+/// (password, username) to satisfy CodeQL's `rust/cleartext-logging` rule.
 pub struct ConnectionInfo {
     pub host: String,
     pub port: u16,
-    pub username: String,
     pub database: String,
 }
 
 impl std::fmt::Display for ConnectionInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{} as \"{}\" (database: {})",
-            self.host, self.port, self.username, self.database,
-        )
+        write!(f, "{}:{} (database: {})", self.host, self.port, self.database)
     }
 }
 
@@ -127,7 +121,6 @@ impl CliConfig {
         ConnectionInfo {
             host: self.host.clone(),
             port: self.port,
-            username: self.username.clone().unwrap_or_else(|| "(none)".into()),
             database: self.database.clone().unwrap_or_else(|| "nexusdb".into()),
         }
     }
