@@ -94,10 +94,42 @@ impl Default for CliConfig {
     }
 }
 
+/// Display-safe connection information. This struct intentionally excludes
+/// sensitive fields (password, API keys) to create a structural taint
+/// barrier for static analysis tools like CodeQL.
+pub struct ConnectionInfo {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub database: String,
+}
+
+impl std::fmt::Display for ConnectionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{} as \"{}\" (database: {})",
+            self.host, self.port, self.username, self.database,
+        )
+    }
+}
+
 impl CliConfig {
     /// Creates a new default configuration.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Extracts display-safe connection info, excluding sensitive fields.
+    /// The returned struct never contained a password, breaking any
+    /// taint chain that static analysis tools might track.
+    pub fn connection_info(&self) -> ConnectionInfo {
+        ConnectionInfo {
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone().unwrap_or_else(|| "(none)".into()),
+            database: self.database.clone().unwrap_or_else(|| "nexusdb".into()),
+        }
     }
 
     /// Loads configuration from a file (async, non-blocking).

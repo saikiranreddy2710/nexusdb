@@ -254,21 +254,6 @@ pub struct Repl {
     mock_mode: bool,
 }
 
-/// Formats a connection banner for display. Accepts only non-sensitive fields
-/// so CodeQL cannot trace the `password` field into print output.
-fn format_connection_banner(host: &str, port: u16, user: &str, db: &str) -> String {
-    format!(
-        "Connected to {}:{} as \"{}\" (database: {})",
-        host, port, user, db,
-    )
-}
-
-/// Formats a database-switch message for display. Accepts only non-sensitive
-/// fields so CodeQL cannot trace the `password` field into print output.
-///
-/// Note: We no longer include the username in this message to avoid
-/// logging potentially sensitive identifiers to stdout or log files.
-
 impl Repl {
     /// Creates a new REPL instance.
     pub fn new(config: CliConfig, format: OutputFormat) -> Result<Self> {
@@ -339,15 +324,10 @@ impl Repl {
 
         match client.connect().await {
             Ok(()) => {
-                // Route through a function that accepts only non-sensitive
-                // fields, breaking CodeQL's taint chain from config.password.
-                let banner = format_connection_banner(
-                    &self.config.host,
-                    self.config.port,
-                    self.config.username.as_deref().unwrap_or("(none)"),
-                    self.config.database.as_deref().unwrap_or("nexusdb"),
-                );
-                println!("{}", banner);
+                // Use ConnectionInfo (a struct without password) to create a
+                // structural taint barrier for CodeQL.
+                let info = self.config.connection_info();
+                println!("Connected to {}", info);
 
                 // Try to get server info
                 if let Ok(info) = client.server_info().await {
@@ -486,13 +466,16 @@ impl Repl {
             }
             CommandResult::SwitchDatabase { db, user } => {
                 self.switch_database(&db);
-                // Update username if provided, but avoid printing it to
-                // stdout or logs to prevent exposure of potentially
-                // sensitive identifiers.
                 if let Some(ref u) = user {
                     self.config.username = Some(u.clone());
                 }
-                println!("You are now connected to database \"{}\".", db);
+                // Use ConnectionInfo (a struct without password) to create a
+                // structural taint barrier for CodeQL.
+                let info = self.config.connection_info();
+                println!(
+                    "You are now connected to database \"{}\" as \"{}\".",
+                    info.database, info.username,
+                );
                 Ok(false)
             }
         }

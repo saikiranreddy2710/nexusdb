@@ -133,7 +133,10 @@ pub fn current_numa_node() -> NumaNode {
             let cpu = unsafe { libc::sched_getcpu() };
             if cpu >= 0 {
                 // Map CPU to NUMA node via sysfs
-                let path = format!("/sys/devices/system/cpu/cpu{}/topology/physical_package_id", cpu);
+                let path = format!(
+                    "/sys/devices/system/cpu/cpu{}/topology/physical_package_id",
+                    cpu
+                );
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(node_id) = content.trim().parse::<u32>() {
                         return NumaNode::new(node_id);
@@ -142,9 +145,7 @@ pub fn current_numa_node() -> NumaNode {
                 // Fallback: try /sys/devices/system/node/nodeN/cpulist
                 let node_count = numa_node_count();
                 for node in 0..node_count {
-                    let cpulist_path = format!(
-                        "/sys/devices/system/node/node{}/cpulist", node
-                    );
+                    let cpulist_path = format!("/sys/devices/system/node/node{}/cpulist", node);
                     if let Ok(cpulist) = std::fs::read_to_string(&cpulist_path) {
                         if cpu_in_list(&cpulist, cpu as u32) {
                             return NumaNode::new(node as u32);
@@ -256,12 +257,7 @@ impl NumaAllocator {
     /// * `alignment` - Required alignment (must be power of 2)
     /// * `node` - NUMA node preference (falls back if not available)
     #[must_use]
-    pub fn allocate_aligned(
-        &self,
-        size: usize,
-        alignment: usize,
-        _node: NumaNode,
-    ) -> AlignedBuffer {
+    pub fn allocate_aligned(&self, size: usize, alignment: usize, node: NumaNode) -> AlignedBuffer {
         #[cfg(target_os = "linux")]
         {
             if self.numa_available && !node.is_any() {
@@ -271,6 +267,7 @@ impl NumaAllocator {
                 }
             }
         }
+        let _ = node; // suppress unused-variable warning on non-Linux
 
         // Fallback to standard aligned allocation
         AlignedBuffer::new(size, alignment)
@@ -368,11 +365,7 @@ impl NumaAllocator {
         // We wrap it using standard AlignedBuffer and copy from mmap
         let mut buffer = AlignedBuffer::new(size, alignment.max(page_size));
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                ptr as *const u8,
-                buffer.as_mut_ptr(),
-                size,
-            );
+            std::ptr::copy_nonoverlapping(ptr as *const u8, buffer.as_mut_ptr(), size);
             libc::munmap(ptr, alloc_size);
         }
 

@@ -1052,8 +1052,7 @@ mod tests {
         let result = auth.authenticate(&good_cred);
         assert!(
             result.is_ok(),
-            "account should auto-unlock after lockout timeout, got: {:?}",
-            result
+            "account should auto-unlock after lockout timeout"
         );
         assert_eq!(result.unwrap().username, "lockauto");
 
