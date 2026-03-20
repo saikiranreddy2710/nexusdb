@@ -75,24 +75,24 @@ pub enum Expr {
         /// Whether this is NOT IN.
         negated: bool,
     },
-    /// IN subquery.
+    /// IN subquery: `expr IN (SELECT ...)`.
     InSubquery {
         /// Expression to test.
         expr: Box<Expr>,
-        /// Subquery.
-        subquery: Box<SelectExpr>,
+        /// Subquery producing the value set.
+        subquery: Box<super::SelectStatement>,
         /// Whether this is NOT IN.
         negated: bool,
     },
-    /// EXISTS subquery.
+    /// EXISTS subquery: `EXISTS (SELECT ...)`.
     Exists {
-        /// Subquery.
-        subquery: Box<SelectExpr>,
+        /// Subquery to test for non-empty result.
+        subquery: Box<super::SelectStatement>,
         /// Whether this is NOT EXISTS.
         negated: bool,
     },
-    /// Scalar subquery.
-    Subquery(Box<SelectExpr>),
+    /// Scalar subquery: `(SELECT max(id) FROM t)`.
+    Subquery(Box<super::SelectStatement>),
     /// A parameter placeholder ($1, $2, etc.).
     Parameter(usize),
     /// Wildcard (*).
@@ -293,6 +293,22 @@ impl Expr {
                     })
                 }
             }
+            sql_ast::Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => Ok(Expr::InSubquery {
+                expr: Box::new(Expr::from_sql_ast(*expr)?),
+                subquery: Box::new(super::SelectStatement::from_sql_ast(*subquery)?),
+                negated,
+            }),
+            sql_ast::Expr::Exists { subquery, negated } => Ok(Expr::Exists {
+                subquery: Box::new(super::SelectStatement::from_sql_ast(*subquery)?),
+                negated,
+            }),
+            sql_ast::Expr::Subquery(query) => Ok(Expr::Subquery(Box::new(
+                super::SelectStatement::from_sql_ast(*query)?,
+            ))),
             _ => Err(ParseError::Unsupported(format!("Expression: {:?}", expr))),
         }
     }
@@ -354,7 +370,21 @@ impl fmt::Display for Expr {
             Expr::QualifiedWildcard(table) => write!(f, "{}.*", table),
             Expr::Nested(expr) => write!(f, "({})", expr),
             Expr::Parameter(n) => write!(f, "${}", n),
-            _ => write!(f, "?"),
+            Expr::InSubquery { expr, negated, .. } => {
+                if *negated {
+                    write!(f, "{} NOT IN (SELECT ...)", expr)
+                } else {
+                    write!(f, "{} IN (SELECT ...)", expr)
+                }
+            }
+            Expr::Exists { negated, .. } => {
+                if *negated {
+                    write!(f, "NOT EXISTS (SELECT ...)")
+                } else {
+                    write!(f, "EXISTS (SELECT ...)")
+                }
+            }
+            Expr::Subquery(_) => write!(f, "(SELECT ...)"),
         }
     }
 }
@@ -766,13 +796,8 @@ impl fmt::Display for OrderByExpr {
     }
 }
 
-/// Placeholder for SELECT expressions in subqueries.
-/// The actual SelectStatement will be defined in statement.rs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SelectExpr {
-    /// Placeholder - actual implementation references SelectStatement.
-    _placeholder: (),
-}
+// SelectExpr placeholder removed — subquery expressions now reference
+// SelectStatement directly, enabling end-to-end subquery execution.
 
 #[cfg(test)]
 mod tests {

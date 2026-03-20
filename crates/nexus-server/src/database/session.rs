@@ -1747,6 +1747,9 @@ impl Session {
         sql: &str,
         start: Instant,
     ) -> DatabaseResult<StatementResult> {
+        // ── Resolve subqueries (materialize before planning) ────
+        let statement = &self.resolve_subqueries_in_statement(statement)?;
+
         // ── Result cache lookup (only outside transactions) ─────
         let cache_key = if !self.in_transaction() {
             let key = ResultCacheKey::new(sql, &[&self.current_database]);
@@ -1833,6 +1836,205 @@ impl Session {
         }
 
         Ok(StatementResult::Query(execute_result))
+    }
+
+    // =========================================================================
+    // Subquery Resolution
+    // =========================================================================
+
+    /// Executes a subquery `SelectStatement` through the full pipeline and
+    /// returns the result rows. Used to materialize uncorrelated subqueries
+    /// before they enter the standard planning pipeline.
+    fn execute_subquery_select(
+        &self,
+        subquery: &nexus_sql::parser::SelectStatement,
+    ) -> DatabaseResult<Vec<Row>> {
+        let stmt = Statement::Select(subquery.clone());
+        let mut catalog = MemoryCatalog::new();
+        for table_name in self.storage().list_tables() {
+            if let Some(table_info) = self.storage().get_table_info(&table_name) {
+                let meta = nexus_sql::logical::TableMeta::new(
+                    table_name.clone(),
+                    (*table_info.schema).clone(),
+                );
+                catalog.add_table(meta);
+            }
+        }
+
+        let logical_plan =
+            build_plan(&stmt, &catalog).map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        let optimizer = Optimizer::new(OptimizerConfig::default());
+        let optimized = optimizer
+            .optimize(logical_plan)
+            .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        let ctx = ExecutionContext::default();
+        let physical_planner = PhysicalPlanner::new(&ctx);
+        let plan = physical_planner
+            .create_physical_plan(&optimized.root)
+            .map_err(|e| DatabaseError::PlanError(e.to_string()))?;
+
+        let mut executor = nexus_sql::executor::QueryExecutor::new(ctx);
+        for table_name in self.storage().list_tables() {
+            if let Ok(batches) = self.storage().execute_scan(&table_name) {
+                executor.register_table(table_name, batches);
+            }
+        }
+
+        let result = executor.execute(&plan)?;
+        let mut rows = Vec::new();
+        for batch in &result.batches {
+            rows.extend(batch.rows());
+        }
+        Ok(rows)
+    }
+
+    /// Resolves subquery expressions in a SQL expression by executing them
+    /// and replacing with literal values. This handles uncorrelated subqueries
+    /// (IN, EXISTS, scalar) before they reach the standard planning pipeline.
+    ///
+    /// This approach is extensible for future ML integration: a learned cost
+    /// model could decide whether to materialize or convert to a semi-join.
+    fn resolve_subqueries_in_expr(&self, expr: &Expr) -> DatabaseResult<Expr> {
+        match expr {
+            // IN (SELECT ...) → IN (literal values)
+            Expr::InSubquery {
+                expr: inner_expr,
+                subquery,
+                negated,
+            } => {
+                let resolved_expr = self.resolve_subqueries_in_expr(inner_expr)?;
+                let rows = self.execute_subquery_select(subquery)?;
+                let literals: Vec<Expr> = rows
+                    .iter()
+                    .filter_map(|row| row.get(0).cloned())
+                    .map(|v| Expr::Literal(value_to_literal(&v)))
+                    .collect();
+                Ok(Expr::InList {
+                    expr: Box::new(resolved_expr),
+                    list: literals,
+                    negated: *negated,
+                })
+            }
+            // EXISTS (SELECT ...) → true / false
+            Expr::Exists { subquery, negated } => {
+                let rows = self.execute_subquery_select(subquery)?;
+                let exists = !rows.is_empty();
+                let result = if *negated { !exists } else { exists };
+                Ok(Expr::Literal(Literal::Boolean(result)))
+            }
+            // Scalar subquery → single value
+            Expr::Subquery(subquery) => {
+                let rows = self.execute_subquery_select(subquery)?;
+                if let Some(row) = rows.first() {
+                    if let Some(val) = row.get(0) {
+                        Ok(Expr::Literal(value_to_literal(val)))
+                    } else {
+                        Ok(Expr::Literal(Literal::Null))
+                    }
+                } else {
+                    Ok(Expr::Literal(Literal::Null))
+                }
+            }
+            // Recurse into compound expressions
+            Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+                left: Box::new(self.resolve_subqueries_in_expr(left)?),
+                op: *op,
+                right: Box::new(self.resolve_subqueries_in_expr(right)?),
+            }),
+            Expr::UnaryOp { op, expr: inner } => Ok(Expr::UnaryOp {
+                op: *op,
+                expr: Box::new(self.resolve_subqueries_in_expr(inner)?),
+            }),
+            Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
+                self.resolve_subqueries_in_expr(inner)?,
+            ))),
+            Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(
+                self.resolve_subqueries_in_expr(inner)?,
+            ))),
+            Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
+                self.resolve_subqueries_in_expr(inner)?,
+            ))),
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => Ok(Expr::Between {
+                expr: Box::new(self.resolve_subqueries_in_expr(inner)?),
+                low: Box::new(self.resolve_subqueries_in_expr(low)?),
+                high: Box::new(self.resolve_subqueries_in_expr(high)?),
+                negated: *negated,
+            }),
+            Expr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let resolved_list: DatabaseResult<Vec<Expr>> = list
+                    .iter()
+                    .map(|e| self.resolve_subqueries_in_expr(e))
+                    .collect();
+                Ok(Expr::InList {
+                    expr: Box::new(self.resolve_subqueries_in_expr(inner)?),
+                    list: resolved_list?,
+                    negated: *negated,
+                })
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                let operand = operand
+                    .as_ref()
+                    .map(|e| self.resolve_subqueries_in_expr(e))
+                    .transpose()?
+                    .map(Box::new);
+                let when_clauses: DatabaseResult<Vec<_>> = when_clauses
+                    .iter()
+                    .map(|(w, t)| {
+                        Ok((
+                            self.resolve_subqueries_in_expr(w)?,
+                            self.resolve_subqueries_in_expr(t)?,
+                        ))
+                    })
+                    .collect();
+                let else_clause = else_clause
+                    .as_ref()
+                    .map(|e| self.resolve_subqueries_in_expr(e))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(Expr::Case {
+                    operand,
+                    when_clauses: when_clauses?,
+                    else_clause,
+                })
+            }
+            // Leaf expressions — return as-is
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    /// Resolves all subquery expressions in a parsed statement by executing
+    /// them and replacing with materialized literal values.
+    fn resolve_subqueries_in_statement(&self, statement: &Statement) -> DatabaseResult<Statement> {
+        match statement {
+            Statement::Select(select) => {
+                let mut select = select.clone();
+                // Resolve subqueries in WHERE
+                if let Some(ref where_clause) = select.where_clause {
+                    select.where_clause = Some(self.resolve_subqueries_in_expr(where_clause)?);
+                }
+                // Resolve subqueries in HAVING
+                if let Some(ref having) = select.having {
+                    select.having = Some(self.resolve_subqueries_in_expr(having)?);
+                }
+                Ok(Statement::Select(select))
+            }
+            _ => Ok(statement.clone()),
+        }
     }
 
     /// Executes EXPLAIN or EXPLAIN ANALYZE for a statement.
@@ -2830,6 +3032,30 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// Converts an executor `Value` to a parser `Literal` for subquery
+/// materialization. This bridges the execution layer back to the AST layer
+/// so that subquery results can be inlined as literal expressions.
+fn value_to_literal(value: &Value) -> Literal {
+    match value {
+        Value::Null => Literal::Null,
+        Value::Boolean(b) => Literal::Boolean(*b),
+        Value::TinyInt(i) => Literal::Integer(*i as i64),
+        Value::SmallInt(i) => Literal::Integer(*i as i64),
+        Value::Int(i) => Literal::Integer(*i as i64),
+        Value::BigInt(i) => Literal::Integer(*i),
+        Value::Float(f) => Literal::Float(*f as f64),
+        Value::Double(f) => Literal::Float(*f),
+        Value::Decimal { value, scale } => {
+            Literal::Float(*value as f64 / 10f64.powi(*scale as i32))
+        }
+        Value::String(s) => Literal::String(s.clone()),
+        Value::Date(d) => Literal::Integer(*d as i64),
+        Value::Time(t) => Literal::Integer(*t),
+        Value::Timestamp(t) => Literal::Integer(*t),
+        Value::Bytes(_) | Value::Vector(_) => Literal::Null,
     }
 }
 
@@ -5749,6 +5975,164 @@ mod tests {
         let result = session.execute("DESCRIBE t").unwrap();
         if let StatementResult::Query(qr) = result {
             assert!(qr.total_rows >= 2, "should have at least 2 columns");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    // =========================================================================
+    // Subquery Tests (#14 — IN/EXISTS subqueries)
+    // =========================================================================
+
+    /// Helper: set up two tables for subquery tests.
+    fn setup_subquery_tables(session: &mut Session) {
+        session
+            .execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active INT)")
+            .unwrap();
+        session
+            .execute("CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT)")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (1, 'Alice', 1)")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (2, 'Bob', 1)")
+            .unwrap();
+        session
+            .execute("INSERT INTO users VALUES (3, 'Charlie', 0)")
+            .unwrap();
+        session
+            .execute("INSERT INTO orders VALUES (100, 1, 50)")
+            .unwrap();
+        session
+            .execute("INSERT INTO orders VALUES (101, 1, 30)")
+            .unwrap();
+        session
+            .execute("INSERT INTO orders VALUES (102, 2, 75)")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_in_subquery_basic() {
+        let mut session = create_session();
+        setup_subquery_tables(&mut session);
+
+        // Users who have orders
+        let result = session
+            .execute("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 2, "Alice and Bob have orders");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_not_in_subquery() {
+        let mut session = create_session();
+        setup_subquery_tables(&mut session);
+
+        // Users who have NO orders
+        let result = session
+            .execute("SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1, "only Charlie has no orders");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery() {
+        let mut session = create_session();
+        setup_subquery_tables(&mut session);
+
+        // EXISTS returns true when subquery has rows
+        let result = session
+            .execute("SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders)")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 3, "EXISTS is true, all users returned");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_not_exists_subquery() {
+        let mut session = create_session();
+        setup_subquery_tables(&mut session);
+
+        // NOT EXISTS returns true when subquery is empty
+        let result = session
+            .execute(
+                "SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE amount > 1000)",
+            )
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(
+                qr.total_rows, 3,
+                "NOT EXISTS is true (no orders > 1000), all users returned"
+            );
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_scalar_subquery() {
+        let mut session = create_session();
+        setup_subquery_tables(&mut session);
+
+        // Scalar subquery returning max amount
+        let result = session
+            .execute(
+                "SELECT name FROM users WHERE id = (SELECT user_id FROM orders WHERE amount = 75)",
+            )
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 1, "only Bob has an order of 75");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_in_subquery_empty_result() {
+        let mut session = create_session();
+        setup_subquery_tables(&mut session);
+
+        // Subquery returns empty set
+        let result = session
+            .execute(
+                "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 1000)",
+            )
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            assert_eq!(qr.total_rows, 0, "no orders > 1000, no users matched");
+        } else {
+            panic!("expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_in_subquery_with_filter() {
+        let mut session = create_session();
+        setup_subquery_tables(&mut session);
+
+        // IN subquery with WHERE in both outer and inner query
+        let result = session
+            .execute("SELECT name FROM users WHERE active = 1 AND id IN (SELECT user_id FROM orders WHERE amount > 40)")
+            .unwrap();
+        if let StatementResult::Query(qr) = result {
+            // Alice (id=1, active=1) has orders 50 and 30 → 50 > 40 qualifies
+            // Bob (id=2, active=1) has order 75 → qualifies
+            assert_eq!(
+                qr.total_rows, 2,
+                "Alice and Bob are active with orders > 40"
+            );
         } else {
             panic!("expected Query result");
         }
