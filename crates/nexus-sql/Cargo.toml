@@ -10,11 +10,15 @@ repository.workspace = true
 [dependencies]
 nexus-common = { workspace = true }
 nexus-storage = { workspace = true }
+nexus-kv = { workspace = true }
 nexus-hnsw = { workspace = true }
 thiserror = { workspace = true }
 sqlparser = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

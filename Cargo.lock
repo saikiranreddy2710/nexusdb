@@ -1410,14 +1410,18 @@ dependencies = [
 name = "nexus-sql"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "nexus-common",
  "nexus-hnsw",
+ "nexus-kv",
  "nexus-storage",
+ "parking_lot",
  "proptest",
  "serde",
  "serde_json",
  "sqlparser",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

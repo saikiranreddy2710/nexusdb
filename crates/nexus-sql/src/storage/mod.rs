@@ -35,6 +35,7 @@ mod catalog;
 mod encoder;
 mod engine;
 mod error;
+pub mod hybrid;
 mod table;
 
 pub use catalog::{Catalog, CheckConstraint, ColumnDefault, IndexInfo, IndexType, TableInfo};

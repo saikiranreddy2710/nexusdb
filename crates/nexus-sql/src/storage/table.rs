@@ -1,7 +1,14 @@
-//! Per-table storage wrapper around SageTree.
+//! Per-table storage wrapper with hybrid SageLSM engine.
 //!
-//! This module provides `TableStore`, which wraps a SageTree instance
-//! and provides table-level operations for INSERT, GET, DELETE, and SCAN.
+//! This module provides `TableStore`, which wraps a `HybridStore` instance
+//! (LSM MemTable + SageTree B+Tree) and provides table-level operations
+//! for INSERT, GET, DELETE, and SCAN.
+//!
+//! The hybrid architecture provides:
+//! - **Fast writes**: MemTable absorbs all writes (lock-free skiplist)
+//! - **Fast reads**: MemTable checked first, then B+Tree on disk
+//! - **Persistence**: Background flush merges MemTable into SageTree
+//! - **ML-ready**: HybridStats exposed for learned cost models
 
 use nexus_common::types::Key;
 use nexus_storage::sagetree::{CursorEntry, KeyRange, SageTree};
@@ -11,17 +18,19 @@ use crate::executor::{Row, Value};
 use super::catalog::TableInfo;
 use super::encoder::{RowDecoder, RowEncoder};
 use super::error::{StorageError, StorageResult};
+use super::hybrid::HybridStore;
 
-/// Per-table storage wrapper around SageTree.
+/// Per-table storage wrapper with hybrid SageLSM engine.
 ///
 /// `TableStore` provides a high-level interface for table operations,
-/// handling the encoding/decoding between SQL rows and SageTree key-value pairs.
+/// handling the encoding/decoding between SQL rows and the hybrid
+/// MemTable + SageTree storage.
 #[derive(Debug)]
 pub struct TableStore {
     /// Table metadata.
     info: TableInfo,
-    /// The underlying SageTree.
-    tree: SageTree,
+    /// The hybrid storage engine (MemTable + SageTree).
+    hybrid: HybridStore,
     /// Row encoder.
     encoder: RowEncoder,
     /// Row decoder.
@@ -36,13 +45,21 @@ impl TableStore {
 
     /// Creates a table store with a pre-built SageTree.
     ///
-    /// Use this to inject a `FilePager`-backed tree for disk persistence:
+    /// The SageTree is wrapped in a `HybridStore` that adds an LSM MemTable
+    /// write buffer for high-throughput writes.
+    ///
     /// ```ignore
     /// let pager = FilePager::open("table.sage")?;
     /// let tree = SageTree::with_pager(config, Box::new(pager));
     /// let store = TableStore::with_tree(info, tree);
     /// ```
     pub fn with_tree(info: TableInfo, tree: SageTree) -> Self {
+        let hybrid = HybridStore::with_tree(tree);
+        Self::with_hybrid(info, hybrid)
+    }
+
+    /// Creates a table store with a pre-built HybridStore.
+    pub fn with_hybrid(info: TableInfo, hybrid: HybridStore) -> Self {
         // If no primary key is specified, use the first column as the default
         // This ensures rows can be uniquely identified
         let primary_key = if info.primary_key.is_empty() && !info.schema.is_empty() {
@@ -56,7 +73,7 @@ impl TableStore {
 
         Self {
             info,
-            tree,
+            hybrid,
             encoder,
             decoder,
         }
@@ -74,12 +91,17 @@ impl TableStore {
 
     /// Returns the number of rows in the table (approximate).
     pub fn row_count(&self) -> usize {
-        self.tree.len()
+        self.hybrid.len()
     }
 
     /// Returns true if the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.tree.is_empty()
+        self.hybrid.is_empty()
+    }
+
+    /// Returns the hybrid storage statistics (for EXPLAIN ANALYZE / ML models).
+    pub fn hybrid_stats(&self) -> super::hybrid::HybridStats {
+        self.hybrid.stats()
     }
 
     // =========================================================================
@@ -103,17 +125,16 @@ impl TableStore {
         let key = self.encoder.encode_key(&row)?;
         let value = self.encoder.encode_value(&row)?;
 
-        // Insert into tree
-        self.tree.insert(key, value).map_err(|e| {
-            if matches!(e, nexus_storage::sagetree::SageTreeError::DuplicateKey) {
-                StorageError::PrimaryKeyViolation(format!(
-                    "Duplicate primary key in table '{}'",
-                    self.info.name
-                ))
-            } else {
-                StorageError::from(e)
-            }
-        })
+        // Check for duplicate primary key via hybrid get
+        if self.hybrid.get(key.as_ref())?.is_some() {
+            return Err(StorageError::PrimaryKeyViolation(format!(
+                "Duplicate primary key in table '{}'",
+                self.info.name
+            )));
+        }
+
+        // Insert into hybrid store (MemTable write buffer)
+        self.hybrid.insert(key.to_vec(), value.to_vec())
     }
 
     /// Gets a row by primary key values.
@@ -132,10 +153,11 @@ impl TableStore {
         let temp_row = Row::new(temp_row_values);
         let key = self.encoder.encode_key(&temp_row)?;
 
-        // Get from tree
-        match self.tree.get(&key)? {
-            Some(value) => {
-                let row = self.decoder.decode(&value)?;
+        // Get from hybrid store (MemTable → frozen → SageTree)
+        match self.hybrid.get(key.as_ref())? {
+            Some(value_bytes) => {
+                let sv = nexus_common::types::Value::from_bytes(&value_bytes);
+                let row = self.decoder.decode(&sv)?;
                 Ok(Some(row))
             }
             None => Ok(None),
@@ -154,12 +176,12 @@ impl TableStore {
         let temp_row = Row::new(temp_row_values);
         let key = self.encoder.encode_key(&temp_row)?;
 
-        // Delete from tree
-        match self.tree.delete(&key) {
-            Ok(()) => Ok(true),
-            Err(nexus_storage::sagetree::SageTreeError::KeyNotFound) => Ok(false),
-            Err(e) => Err(StorageError::from(e)),
+        // Check if key exists, then write tombstone
+        if self.hybrid.get(key.as_ref())?.is_none() {
+            return Ok(false);
         }
+        self.hybrid.delete(key.as_ref())?;
+        Ok(true)
     }
 
     /// Updates a row by primary key.
@@ -179,12 +201,12 @@ impl TableStore {
         let key = self.encoder.encode_key(&row)?;
         let value = self.encoder.encode_value(&row)?;
 
-        // Update in tree
-        match self.tree.update(&key, value) {
-            Ok(()) => Ok(true),
-            Err(nexus_storage::sagetree::SageTreeError::KeyNotFound) => Ok(false),
-            Err(e) => Err(StorageError::from(e)),
+        // Check if key exists, then overwrite via hybrid
+        if self.hybrid.get(key.as_ref())?.is_none() {
+            return Ok(false);
         }
+        self.hybrid.update(key.to_vec(), value.to_vec())?;
+        Ok(true)
     }
 
     /// Upserts a row (insert or update).
@@ -202,8 +224,8 @@ impl TableStore {
         let key = self.encoder.encode_key(&row)?;
         let value = self.encoder.encode_value(&row)?;
 
-        // Upsert in tree
-        self.tree.upsert(key, value)?;
+        // Upsert via hybrid store
+        self.hybrid.upsert(key.to_vec(), value.to_vec())?;
         Ok(())
     }
 
@@ -233,18 +255,32 @@ impl TableStore {
     }
 
     /// Scans all rows and returns them as a vector.
+    ///
+    /// Merges results from MemTable + SageTree, honoring tombstones.
     pub fn scan_all(&self) -> StorageResult<Vec<Row>> {
-        let entries = self.tree.scan(KeyRange::all())?;
-        self.decode_entries(entries)
+        let kv_pairs = self.hybrid.scan_all()?;
+        self.decode_kv_pairs(kv_pairs)
     }
 
     /// Scans rows with a limit.
     pub fn scan_with_limit(&self, limit: usize) -> StorageResult<Vec<Row>> {
-        let entries = self.tree.scan_with_limit(KeyRange::all(), limit)?;
-        self.decode_entries(entries)
+        let kv_pairs = self.hybrid.scan_all()?;
+        let limited: Vec<_> = kv_pairs.into_iter().take(limit).collect();
+        self.decode_kv_pairs(limited)
     }
 
-    /// Decodes a vector of cursor entries into rows.
+    /// Decodes key-value pairs from the hybrid store into rows.
+    fn decode_kv_pairs(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<Vec<Row>> {
+        pairs
+            .into_iter()
+            .map(|(_key, value_bytes)| {
+                let sv = nexus_common::types::Value::from_bytes(&value_bytes);
+                self.decoder.decode(&sv)
+            })
+            .collect()
+    }
+
+    /// Decodes a vector of cursor entries into rows (for direct tree access).
     fn decode_entries(&self, entries: Vec<CursorEntry>) -> StorageResult<Vec<Row>> {
         entries
             .into_iter()
@@ -268,21 +304,19 @@ impl TableStore {
     // Maintenance
     // =========================================================================
 
-    /// Forces consolidation of delta chains.
+    /// Forces consolidation of SageTree delta chains.
     pub fn consolidate(&self) {
-        self.tree.consolidate_all();
+        self.hybrid.tree().consolidate_all();
     }
 
-    /// Flushes the underlying SageTree pager to disk.
+    /// Flushes MemTable to SageTree and SageTree to disk.
     pub fn flush(&self) -> StorageResult<()> {
-        self.tree
-            .flush()
-            .map_err(|e| StorageError::InvalidOperation(format!("flush failed: {}", e)))
+        self.hybrid.flush()
     }
 
-    /// Clears all data from the table.
+    /// Clears all data from the table (MemTable + SageTree).
     pub fn clear(&self) {
-        self.tree.clear();
+        self.hybrid.clear();
     }
 }
 
@@ -311,15 +345,45 @@ pub struct TableScanIterator {
 
 impl TableScanIterator {
     /// Creates a new table scan iterator.
+    ///
+    /// Uses the hybrid store for full scans (merging MemTable + SageTree),
+    /// falls back to direct tree access for range/prefix scans.
     fn new(store: &TableStore, range: ScanRange) -> Self {
-        // Fetch all matching entries
         let result = match range {
-            ScanRange::All => store.tree.scan(KeyRange::all()),
+            ScanRange::All => {
+                // Use hybrid scan for full table scan (merges MemTable + tree)
+                return match store.hybrid.scan_all() {
+                    Ok(pairs) => {
+                        let mut rows = Vec::with_capacity(pairs.len());
+                        let mut error = None;
+                        for (_key, value_bytes) in pairs {
+                            let sv = nexus_common::types::Value::from_bytes(&value_bytes);
+                            match store.decoder.decode(&sv) {
+                                Ok(row) => rows.push(row),
+                                Err(e) => {
+                                    error = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        Self {
+                            rows,
+                            position: 0,
+                            error,
+                        }
+                    }
+                    Err(e) => Self {
+                        rows: Vec::new(),
+                        position: 0,
+                        error: Some(e),
+                    },
+                };
+            }
             ScanRange::Range { start, end } => {
-                // Build keys from values
+                // Range scans use direct tree access (MemTable entries flushed first)
                 match (store.build_key(&start), store.build_key(&end)) {
                     (Ok(start_key), Ok(end_key)) => {
-                        store.tree.scan(KeyRange::new(start_key, end_key))
+                        store.hybrid.tree().scan(KeyRange::new(start_key, end_key))
                     }
                     (Err(e), _) | (_, Err(e)) => Err(
                         nexus_storage::sagetree::SageTreeError::structure_error(&e.to_string()),
@@ -327,7 +391,7 @@ impl TableScanIterator {
                 }
             }
             ScanRange::Prefix(prefix) => match store.build_key(&prefix) {
-                Ok(prefix_key) => store.tree.scan_prefix(&prefix_key),
+                Ok(prefix_key) => store.hybrid.tree().scan_prefix(&prefix_key),
                 Err(e) => Err(nexus_storage::sagetree::SageTreeError::structure_error(
                     &e.to_string(),
                 )),
