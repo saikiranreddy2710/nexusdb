@@ -45,7 +45,7 @@
 //! - Write/read counters, MemTable hit rate, flush latency
 //! - These feed into EXPLAIN ANALYZE and future ML-based query optimization
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -150,6 +150,9 @@ pub struct HybridStore {
     sequence: AtomicU64,
     /// MemTable ID counter.
     next_memtable_id: AtomicU64,
+    /// Atomic entry count — tracks net live entries (inserts - deletes).
+    /// Updated on insert/delete/upsert to avoid O(n) full-scan for len().
+    entry_count: AtomicI64,
     /// Configuration.
     config: HybridConfig,
     /// Flush policy (pluggable for ML).
@@ -181,6 +184,8 @@ impl HybridStore {
 
     /// Creates a hybrid store with custom config.
     pub fn with_tree_and_config(tree: SageTree, config: HybridConfig) -> Self {
+        // Initialize entry count from tree's existing data
+        let initial_count = tree.len() as i64;
         let memtable = Arc::new(MemTable::new(1, config.memtable_size, 1));
         Self {
             active: RwLock::new(memtable),
@@ -188,6 +193,7 @@ impl HybridStore {
             tree,
             sequence: AtomicU64::new(1),
             next_memtable_id: AtomicU64::new(2),
+            entry_count: AtomicI64::new(initial_count),
             config,
             flush_policy: Box::new(ThresholdFlushPolicy),
             stats: RwLock::new(HybridStats::default()),
@@ -204,10 +210,10 @@ impl HybridStore {
     // Write Path
     // =====================================================================
 
-    /// Inserts a key-value pair into the MemTable.
+    /// Inserts a new key-value pair into the MemTable.
     ///
-    /// Returns `Ok(())` on success. The data is in the MemTable only —
-    /// call `flush()` to persist to the SageTree.
+    /// The caller is responsible for checking duplicates if needed.
+    /// This is a pure append to the MemTable — no disk I/O.
     pub fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> StorageResult<()> {
         self.maybe_freeze();
 
@@ -216,6 +222,7 @@ impl HybridStore {
             .put(Bytes::from(key), Bytes::from(value))
             .map_err(|e| StorageError::InvalidOperation(format!("memtable put failed: {}", e)))?;
 
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
         self.stats.write().memtable_writes += 1;
         Ok(())
     }
@@ -229,19 +236,43 @@ impl HybridStore {
             StorageError::InvalidOperation(format!("memtable delete failed: {}", e))
         })?;
 
+        self.entry_count.fetch_sub(1, Ordering::Relaxed);
         self.stats.write().memtable_writes += 1;
         Ok(())
     }
 
-    /// Updates a key-value pair (insert with overwrite semantics).
+    /// Updates a key-value pair (overwrite — no net count change).
     pub fn update(&self, key: Vec<u8>, value: Vec<u8>) -> StorageResult<()> {
-        // In LSM, update = insert (newer sequence wins)
-        self.insert(key, value)
+        self.maybe_freeze();
+
+        let memtable = self.active.read().clone();
+        memtable
+            .put(Bytes::from(key), Bytes::from(value))
+            .map_err(|e| StorageError::InvalidOperation(format!("memtable put failed: {}", e)))?;
+
+        // No entry_count change — overwrite of existing key
+        self.stats.write().memtable_writes += 1;
+        Ok(())
     }
 
-    /// Upserts a key-value pair.
+    /// Upserts a key-value pair (insert or update).
+    ///
+    /// Increments entry count only if the key doesn't already exist.
     pub fn upsert(&self, key: Vec<u8>, value: Vec<u8>) -> StorageResult<()> {
-        self.insert(key, value)
+        let is_new = self.get(&key)?.is_none();
+
+        self.maybe_freeze();
+
+        let memtable = self.active.read().clone();
+        memtable
+            .put(Bytes::from(key), Bytes::from(value))
+            .map_err(|e| StorageError::InvalidOperation(format!("memtable put failed: {}", e)))?;
+
+        if is_new {
+            self.entry_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.stats.write().memtable_writes += 1;
+        Ok(())
     }
 
     // =====================================================================
@@ -307,98 +338,100 @@ impl HybridStore {
         self.scan_range_internal(range)
     }
 
-    /// Internal scan implementation — merge-sorts MemTable + SageTree entries.
+    /// Internal scan implementation — merges MemTable + SageTree entries.
+    ///
+    /// Uses a single BTreeMap pass: tree entries first, then MemTable entries
+    /// override (newest wins). Tombstones filtered at the end.
     fn scan_range_internal(&self, range: KeyRange) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
         self.stats.write().scan_count += 1;
 
-        // Collect all MemTable entries (active + frozen)
-        let mut mem_entries = self.collect_memtable_entries();
-
-        // Collect SageTree entries
+        // Collect SageTree entries into a BTreeMap (sorted by key)
         let tree_entries = self
             .tree
             .scan(range)
             .map_err(|e| StorageError::InvalidOperation(format!("tree scan failed: {}", e)))?;
 
-        // Build a merged result: MemTable entries override tree entries
-        // (because MemTable has newer data)
-        let mut result_map: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+        // Pre-allocate with tree size estimate
+        let mut merged: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
             std::collections::BTreeMap::new();
 
-        // Insert tree entries first (will be overridden by memtable)
         for entry in &tree_entries {
-            result_map.insert(
+            merged.insert(
                 entry.key.as_ref().to_vec(),
                 Some(entry.value.as_ref().to_vec()),
             );
         }
 
-        // Override with MemTable entries (sorted by key, newest seq first)
-        // Only keep the latest version per key
-        mem_entries.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1))); // key ASC, seq DESC
-        let mut seen_keys = std::collections::HashSet::new();
-        for (key, _seq, vtype, value) in &mem_entries {
-            if seen_keys.contains(key) {
-                continue; // already have a newer version
-            }
-            seen_keys.insert(key.clone());
-            match vtype {
-                ValueType::Value => {
-                    result_map.insert(key.clone(), Some(value.clone()));
-                }
-                ValueType::Deletion => {
-                    result_map.insert(key.clone(), None); // tombstone
-                }
-            }
-        }
+        // Overlay MemTable entries (active + frozen).
+        // MemTable iterators return entries in (user_key ASC, sequence DESC) order.
+        // For each key, the first entry we see is the newest version.
+        self.overlay_memtable_entries(&mut merged);
 
-        // Filter out tombstones and collect
-        let result: Vec<(Vec<u8>, Vec<u8>)> = result_map
+        // Filter out tombstones (None values) and collect
+        Ok(merged
             .into_iter()
             .filter_map(|(k, v)| v.map(|val| (k, val)))
-            .collect();
-
-        Ok(result)
+            .collect())
     }
 
-    /// Collects all entries from active + frozen MemTables.
-    /// Returns (key, sequence, value_type, value) tuples.
-    fn collect_memtable_entries(&self) -> Vec<(Vec<u8>, u64, ValueType, Vec<u8>)> {
-        let mut entries = Vec::new();
+    /// Overlays MemTable entries onto the merged result map.
+    ///
+    /// Processes all MemTables (active + frozen) and for each unique key,
+    /// takes the newest version (highest sequence number).
+    fn overlay_memtable_entries(
+        &self,
+        merged: &mut std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) {
+        // Collect the latest version per key from all MemTables.
+        // We use a temporary map keyed by user_key → (sequence, value_type, value)
+        // to deduplicate across multiple MemTables.
+        let mut latest: std::collections::HashMap<Vec<u8>, (u64, ValueType, Vec<u8>)> =
+            std::collections::HashMap::new();
 
-        // Active MemTable
-        let memtable = self.active.read().clone();
-        let mut iter = memtable.iter();
-        while iter.valid() {
-            if let Some((ikey, value)) = iter.current() {
-                entries.push((
-                    ikey.user_key.to_vec(),
-                    ikey.sequence,
-                    ikey.value_type,
-                    value.to_vec(),
-                ));
-            }
-            iter.next();
-        }
-
-        // Frozen MemTables
+        // Process frozen MemTables (oldest first)
         let frozen = self.frozen.read();
         for imm in frozen.iter() {
             let mut iter = imm.iter();
             while iter.valid() {
                 if let Some((ikey, value)) = iter.current() {
-                    entries.push((
-                        ikey.user_key.to_vec(),
-                        ikey.sequence,
-                        ikey.value_type,
-                        value.to_vec(),
-                    ));
+                    let user_key = ikey.user_key.to_vec();
+                    let seq = ikey.sequence;
+                    let existing_seq = latest.get(&user_key).map(|e| e.0).unwrap_or(0);
+                    if seq > existing_seq {
+                        latest.insert(user_key, (seq, ikey.value_type, value.to_vec()));
+                    }
                 }
                 iter.next();
             }
         }
+        drop(frozen);
 
-        entries
+        // Process active MemTable (newest — always wins over frozen)
+        let memtable = self.active.read().clone();
+        let mut iter = memtable.iter();
+        while iter.valid() {
+            if let Some((ikey, value)) = iter.current() {
+                let user_key = ikey.user_key.to_vec();
+                let seq = ikey.sequence;
+                let existing_seq = latest.get(&user_key).map(|e| e.0).unwrap_or(0);
+                if seq > existing_seq {
+                    latest.insert(user_key, (seq, ikey.value_type, value.to_vec()));
+                }
+            }
+            iter.next();
+        }
+
+        // Apply to merged map
+        for (key, (_seq, vtype, value)) in latest {
+            match vtype {
+                ValueType::Value => {
+                    merged.insert(key, Some(value));
+                }
+                ValueType::Deletion => {
+                    merged.insert(key, None); // tombstone masks tree entry
+                }
+            }
+        }
     }
 
     // =====================================================================
@@ -509,18 +542,16 @@ impl HybridStore {
     // Metadata
     // =====================================================================
 
-    /// Returns the total number of unique live entries (deduplicates MemTable + SageTree).
+    /// Returns the total number of live entries (O(1), atomic counter).
     ///
-    /// This performs a full merge scan for accuracy. For approximate counts,
-    /// use `tree().len()` directly.
+    /// Maintained incrementally on insert/delete/upsert — no scan required.
     pub fn len(&self) -> usize {
-        // Use scan_all which deduplicates and filters tombstones
-        self.scan_all().map(|v| v.len()).unwrap_or(0)
+        self.entry_count.load(Ordering::Relaxed).max(0) as usize
     }
 
-    /// Returns true if the store has no entries.
+    /// Returns true if the store has no entries (O(1)).
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.entry_count.load(Ordering::Relaxed) <= 0
     }
 
     /// Returns a snapshot of the statistics (for EXPLAIN ANALYZE / ML models).
@@ -540,6 +571,7 @@ impl HybridStore {
         self.frozen.write().clear();
         self.tree.clear();
         self.sequence.store(1, Ordering::Relaxed);
+        self.entry_count.store(0, Ordering::Relaxed);
         *self.stats.write() = HybridStats::default();
     }
 }
