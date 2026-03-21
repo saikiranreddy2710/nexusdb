@@ -55,6 +55,9 @@ pub mod router;
 /// Server configuration.
 pub mod config;
 
+/// PostgreSQL wire protocol handler.
+pub mod pgwire_handler;
+
 // Re-export commonly used types
 pub use database::{
     Database, DatabaseConfig, DatabaseError, DatabaseResult, DatabaseStats, ExecuteResult, Session,

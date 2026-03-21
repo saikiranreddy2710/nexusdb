@@ -28,7 +28,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use nexus_server::config::ServerConfig;
@@ -267,17 +267,36 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     info!("  Auth enabled: {}", config.auth_enabled);
 
     // Create the gRPC server
-    let grpc_server = GrpcServer::new(db.clone(), addr);
+    let grpc_addr = addr;
+    let grpc_server = GrpcServer::new(db.clone(), grpc_addr);
 
-    // Start the server with graceful shutdown
-    info!("Starting gRPC server on {}...", addr);
+    // Create the PostgreSQL wire protocol server
+    let pg_port = config.port.saturating_sub(1).max(5432);
+    let pg_addr: SocketAddr = format!("{}:{}", config.host, pg_port)
+        .parse()
+        .context("Invalid PG wire address")?;
+
+    let pg_factory = Arc::new(nexus_server::pgwire_handler::NexusPgWireFactory::new(
+        db.clone(),
+    ));
+
+    // Start both servers with graceful shutdown
+    info!("Starting gRPC server on {}...", grpc_addr);
+    info!("Starting PostgreSQL wire protocol on {}...", pg_addr);
+    info!("  Connect with: psql -h {} -p {}", config.host, pg_port);
     info!("Press Ctrl+C to shutdown");
 
     tokio::select! {
         result = grpc_server.serve() => {
             if let Err(e) = result {
-                error!("Server error: {}", e);
-                return Err(anyhow::anyhow!("Server error: {}", e));
+                error!("gRPC server error: {}", e);
+                return Err(anyhow::anyhow!("gRPC server error: {}", e));
+            }
+        }
+        result = run_pgwire_server(pg_addr, pg_factory) => {
+            if let Err(e) = result {
+                error!("pgwire server error: {}", e);
+                return Err(anyhow::anyhow!("pgwire server error: {}", e));
             }
         }
         _ = shutdown_signal() => {
@@ -296,6 +315,24 @@ async fn run_server(config: ServerConfig) -> Result<()> {
 
     info!("Server stopped. Goodbye!");
     Ok(())
+}
+
+/// Runs the PostgreSQL wire protocol listener.
+async fn run_pgwire_server(
+    addr: SocketAddr,
+    factory: Arc<nexus_server::pgwire_handler::NexusPgWireFactory>,
+) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    loop {
+        let (socket, peer) = listener.accept().await?;
+        debug!("pgwire connection from {}", peer);
+        let f = factory.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pgwire::tokio::process_socket(socket, None, f).await {
+                error!("pgwire connection error from {}: {}", peer, e);
+            }
+        });
+    }
 }
 
 async fn shutdown_signal() {

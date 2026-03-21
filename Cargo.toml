@@ -115,6 +115,11 @@ libc = "0.2"
 # Metrics
 metrics = "0.22"
 
+# PostgreSQL wire protocol
+pgwire = { version = "0.25", default-features = true }
+async-trait = "0.1"
+futures = "0.3"
+
 # CLI tools
 clap = { version = "4.4", features = ["derive", "env"] }
 rustyline = "13.0"
