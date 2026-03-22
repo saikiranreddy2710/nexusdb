@@ -9,7 +9,7 @@ use crate::logical::{AggregateFunc, BinaryOp, LogicalExpr, Schema, UnaryOp};
 use crate::parser::{DataType, Literal};
 
 /// A physical expression that can be evaluated on data.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum PhysicalExpr {
     /// Column reference by index.
     Column {
@@ -107,6 +107,63 @@ pub enum PhysicalExpr {
         /// Case insensitive (ILIKE).
         case_insensitive: bool,
     },
+
+    /// IN subquery: `expr IN (SELECT ...)`.
+    InSubquery {
+        /// Expression to check.
+        expr: Box<PhysicalExpr>,
+        /// Physical plan for the subquery.
+        subquery: super::PhysicalPlan,
+        /// Whether negated (NOT IN).
+        negated: bool,
+    },
+
+    /// EXISTS subquery: `EXISTS (SELECT ...)`.
+    ExistsSubquery {
+        /// Physical plan for the subquery.
+        subquery: super::PhysicalPlan,
+        /// Whether negated (NOT EXISTS).
+        negated: bool,
+    },
+
+    /// Scalar subquery: `(SELECT max(id) FROM t)`.
+    ScalarSubquery {
+        /// Physical plan for the subquery (must return exactly one row, one column).
+        subquery: super::PhysicalPlan,
+    },
+}
+
+impl PartialEq for PhysicalExpr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Column { index: a, .. }, Self::Column { index: b, .. }) => a == b,
+            (Self::Literal(a), Self::Literal(b)) => a == b,
+            (
+                Self::BinaryExpr {
+                    left: l1,
+                    op: o1,
+                    right: r1,
+                },
+                Self::BinaryExpr {
+                    left: l2,
+                    op: o2,
+                    right: r2,
+                },
+            ) => l1 == l2 && o1 == o2 && r1 == r2,
+            (Self::IsNull(a), Self::IsNull(b)) => a == b,
+            (Self::IsNotNull(a), Self::IsNotNull(b)) => a == b,
+            // Subquery expressions: compare by Arc pointer identity
+            (Self::InSubquery { negated: n1, .. }, Self::InSubquery { negated: n2, .. }) => {
+                n1 == n2
+            }
+            (
+                Self::ExistsSubquery { negated: n1, .. },
+                Self::ExistsSubquery { negated: n2, .. },
+            ) => n1 == n2,
+            (Self::ScalarSubquery { .. }, Self::ScalarSubquery { .. }) => true,
+            _ => false,
+        }
+    }
 }
 
 impl PhysicalExpr {
@@ -183,7 +240,10 @@ impl PhysicalExpr {
             PhysicalExpr::ScalarFunction { return_type, .. } => return_type.clone(),
             PhysicalExpr::InList { .. }
             | PhysicalExpr::Between { .. }
-            | PhysicalExpr::Like { .. } => DataType::Boolean,
+            | PhysicalExpr::Like { .. }
+            | PhysicalExpr::InSubquery { .. }
+            | PhysicalExpr::ExistsSubquery { .. } => DataType::Boolean,
+            PhysicalExpr::ScalarSubquery { .. } => DataType::Text, // runtime-determined
         }
     }
 
@@ -243,6 +303,17 @@ impl PhysicalExpr {
                     op
                 )
             }
+            PhysicalExpr::InSubquery { expr, negated, .. } => {
+                format!(
+                    "{} {}IN (SELECT ...)",
+                    expr.name(),
+                    if *negated { "NOT " } else { "" }
+                )
+            }
+            PhysicalExpr::ExistsSubquery { negated, .. } => {
+                format!("{}EXISTS (SELECT ...)", if *negated { "NOT " } else { "" })
+            }
+            PhysicalExpr::ScalarSubquery { .. } => "(SELECT ...)".to_string(),
         }
     }
 }
@@ -632,9 +703,35 @@ pub fn create_physical_expr(expr: &LogicalExpr, schema: &Schema) -> Result<Physi
         LogicalExpr::WindowFunction { .. } => {
             Err("Window functions should be handled separately".to_string())
         }
-        LogicalExpr::ScalarSubquery(_) => Err("Scalar subqueries not yet supported".to_string()),
-        LogicalExpr::InSubquery { .. } => Err("IN subqueries not yet supported".to_string()),
-        LogicalExpr::Exists { .. } => Err("EXISTS subqueries not yet supported".to_string()),
+        LogicalExpr::ScalarSubquery(plan) => {
+            let physical_plan = super::create_physical_plan(&plan.root)
+                .map_err(|e| format!("Failed to plan scalar subquery: {}", e))?;
+            Ok(PhysicalExpr::ScalarSubquery {
+                subquery: physical_plan,
+            })
+        }
+        LogicalExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let phys_expr = create_physical_expr(expr, schema)?;
+            let physical_plan = super::create_physical_plan(&subquery.root)
+                .map_err(|e| format!("Failed to plan IN subquery: {}", e))?;
+            Ok(PhysicalExpr::InSubquery {
+                expr: Box::new(phys_expr),
+                subquery: physical_plan,
+                negated: *negated,
+            })
+        }
+        LogicalExpr::Exists { subquery, negated } => {
+            let physical_plan = super::create_physical_plan(&subquery.root)
+                .map_err(|e| format!("Failed to plan EXISTS subquery: {}", e))?;
+            Ok(PhysicalExpr::ExistsSubquery {
+                subquery: physical_plan,
+                negated: *negated,
+            })
+        }
         LogicalExpr::Placeholder(_) => {
             Err("Placeholders should be bound before execution".to_string())
         }

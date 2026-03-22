@@ -67,6 +67,21 @@ impl PhysicalPlan {
         self
     }
 
+    /// Executes the plan and collects all result rows.
+    ///
+    /// Used by subquery evaluation to materialize subquery results inline.
+    /// This is a standalone execution path that doesn't require a QueryExecutor
+    /// or pre-registered tables — the plan must be self-contained (e.g., SeqScan
+    /// operators already hold their data).
+    pub fn execute_collect(&self) -> Result<Vec<crate::executor::Row>, String> {
+        let ctx = super::ExecutionContext::default();
+        let executor = crate::executor::QueryExecutor::new(ctx);
+        let result = executor
+            .execute(self)
+            .map_err(|e| format!("subquery execution failed: {}", e))?;
+        Ok(result.batches.iter().flat_map(|b| b.rows()).collect())
+    }
+
     /// Sets the estimated rows.
     pub fn with_estimated_rows(mut self, rows: usize) -> Self {
         self.metadata.estimated_rows = Some(rows);

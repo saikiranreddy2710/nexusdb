@@ -110,7 +110,51 @@ pub fn evaluate_expr(expr: &PhysicalExpr, row: &Row, schema: &Schema) -> Result<
             let matches = match_like(&val_str, &pattern_str, *case_insensitive);
             Ok(Value::Boolean(if *negated { !matches } else { matches }))
         }
+
+        // ── Subquery expressions ────────────────────────────────────
+        PhysicalExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let val = evaluate_expr(expr, row, schema)?;
+            if val.is_null() {
+                return Ok(Value::Null);
+            }
+            // Execute the subquery plan to get all result values
+            let subquery_values = execute_subquery_column(subquery)?;
+            let found = subquery_values.iter().any(|sv| *sv == val);
+            Ok(Value::Boolean(if *negated { !found } else { found }))
+        }
+
+        PhysicalExpr::ExistsSubquery { subquery, negated } => {
+            let rows = execute_subquery_rows(subquery)?;
+            let exists = !rows.is_empty();
+            Ok(Value::Boolean(if *negated { !exists } else { exists }))
+        }
+
+        PhysicalExpr::ScalarSubquery { subquery } => {
+            let rows = execute_subquery_rows(subquery)?;
+            match rows.first() {
+                Some(row) => Ok(row.get(0).cloned().unwrap_or(Value::Null)),
+                None => Ok(Value::Null),
+            }
+        }
     }
+}
+
+/// Executes a subquery plan and returns all rows.
+fn execute_subquery_rows(plan: &crate::physical::PhysicalPlan) -> Result<Vec<Row>, EvalError> {
+    let rows = plan
+        .execute_collect()
+        .map_err(|e| EvalError::SubqueryError(e))?;
+    Ok(rows)
+}
+
+/// Executes a subquery plan and returns the first column's values.
+fn execute_subquery_column(plan: &crate::physical::PhysicalPlan) -> Result<Vec<Value>, EvalError> {
+    let rows = execute_subquery_rows(plan)?;
+    Ok(rows.iter().filter_map(|r| r.get(0).cloned()).collect())
 }
 
 /// Evaluates a physical expression on all rows in a batch, returning a column.
@@ -921,6 +965,8 @@ pub enum EvalError {
     UnknownFunction(String),
     /// Invalid argument.
     InvalidArgument(String),
+    /// Subquery execution error.
+    SubqueryError(String),
 }
 
 impl std::fmt::Display for EvalError {
@@ -932,6 +978,7 @@ impl std::fmt::Display for EvalError {
             EvalError::Cast(msg) => write!(f, "Cast error: {}", msg),
             EvalError::UnknownFunction(name) => write!(f, "Unknown function: {}", name),
             EvalError::InvalidArgument(msg) => write!(f, "Invalid argument: {}", msg),
+            EvalError::SubqueryError(msg) => write!(f, "Subquery error: {}", msg),
         }
     }
 }
