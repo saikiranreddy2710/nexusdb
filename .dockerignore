@@ -1,0 +1,14 @@
+target/
+.git/
+*.md
+!README.md
+LICENSE
+.gitignore
+.github/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+data/
+tmp/

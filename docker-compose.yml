@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  nexusdb:
+    build: .
+    image: nexusdb/nexusdb:latest
+    container_name: nexusdb
+    ports:
+      - "5431:5431"   # PostgreSQL wire protocol
+      - "5432:5432"   # gRPC
+    volumes:
+      - nexusdb-data:/var/lib/nexusdb/data
+      - ./initdb:/docker-entrypoint-initdb.d  # mount init SQL scripts
+    environment:
+      - NEXUS_HOST=0.0.0.0
+      - NEXUS_PORT=5432
+      - NEXUS_LOG_LEVEL=info
+      # Uncomment to enable auth:
+      # - NEXUS_AUTH=true
+      # - NEXUS_ADMIN_PASSWORD=changeme
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nexusd", "--version"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  nexusdb-data:
+    driver: local
