@@ -29,6 +29,8 @@ pub struct StorageEngine {
     catalog: Catalog,
     /// Table stores by name.
     tables: RwLock<HashMap<String, Arc<TableStore>>>,
+    /// View definitions (name → SQL query string).
+    views: RwLock<HashMap<String, String>>,
     /// Default encoding format.
     encoding_format: EncodingFormat,
     /// Data directory for disk persistence (None = in-memory only).
@@ -41,6 +43,7 @@ impl StorageEngine {
         Self {
             catalog: Catalog::new(),
             tables: RwLock::new(HashMap::new()),
+            views: RwLock::new(HashMap::new()),
             encoding_format: EncodingFormat::Binary,
             data_dir: None,
         }
@@ -90,6 +93,7 @@ impl StorageEngine {
             Ok(Self {
                 catalog,
                 tables: RwLock::new(table_map),
+                views: RwLock::new(HashMap::new()),
                 encoding_format: EncodingFormat::Binary,
                 data_dir: Some(data_dir),
             })
@@ -98,6 +102,7 @@ impl StorageEngine {
             Ok(Self {
                 catalog: Catalog::new(),
                 tables: RwLock::new(HashMap::new()),
+                views: RwLock::new(HashMap::new()),
                 encoding_format: EncodingFormat::Binary,
                 data_dir: Some(data_dir),
             })
@@ -411,6 +416,47 @@ impl StorageEngine {
     // =========================================================================
     // Maintenance
     // =========================================================================
+
+    // =========================================================================
+    // View Operations
+    // =========================================================================
+
+    /// Creates or replaces a view.
+    pub fn create_view(&self, name: &str, sql: String, or_replace: bool) -> StorageResult<()> {
+        let mut views = self.views.write().unwrap();
+        if views.contains_key(name) && !or_replace {
+            return Err(StorageError::InvalidOperation(format!(
+                "view \"{}\" already exists",
+                name
+            )));
+        }
+        views.insert(name.to_string(), sql);
+        Ok(())
+    }
+
+    /// Drops a view.
+    pub fn drop_view(&self, name: &str, if_exists: bool) -> StorageResult<()> {
+        let mut views = self.views.write().unwrap();
+        if views.remove(name).is_none() && !if_exists {
+            return Err(StorageError::InvalidOperation(format!(
+                "view \"{}\" does not exist",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the SQL definition of a view, if it exists.
+    pub fn get_view(&self, name: &str) -> Option<String> {
+        let views = self.views.read().unwrap();
+        views.get(name).cloned()
+    }
+
+    /// Lists all view names.
+    pub fn list_views(&self) -> Vec<String> {
+        let views = self.views.read().unwrap();
+        views.keys().cloned().collect()
+    }
 
     /// Consolidates all delta chains in all tables.
     pub fn consolidate_all(&self) {

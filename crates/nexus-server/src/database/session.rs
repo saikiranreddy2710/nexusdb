@@ -723,6 +723,33 @@ impl Session {
                 Ok(StatementResult::transaction("USE"))
             }
 
+            Statement::CreateView {
+                name,
+                query,
+                or_replace,
+            } => {
+                // Execute the view query to validate it and infer schema.
+                // Store the original SQL for later expansion.
+                let view_sql = sql.to_string();
+                // Extract just the SELECT portion from "CREATE VIEW name AS SELECT ..."
+                let select_sql = if let Some(pos) = view_sql.to_uppercase().find(" AS ") {
+                    view_sql[pos + 4..].trim().trim_end_matches(';').to_string()
+                } else {
+                    format!("{:?}", query)
+                };
+                self.storage()
+                    .create_view(name, select_sql, *or_replace)
+                    .map_err(|e| DatabaseError::ExecutionError(e.to_string()))?;
+                Ok(StatementResult::ddl("CREATE VIEW"))
+            }
+
+            Statement::DropView { name, if_exists } => {
+                self.storage()
+                    .drop_view(name, *if_exists)
+                    .map_err(|e| DatabaseError::ExecutionError(e.to_string()))?;
+                Ok(StatementResult::ddl("DROP VIEW"))
+            }
+
             _ => Err(DatabaseError::NotImplemented(
                 "statement type not yet supported".to_string(),
             )),

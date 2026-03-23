@@ -71,6 +71,22 @@ pub enum Statement {
     DropDatabase { name: String, if_exists: bool },
     /// USE database statement (switch current database).
     UseDatabase(String),
+    /// CREATE VIEW statement.
+    CreateView {
+        /// View name.
+        name: String,
+        /// The SQL query defining the view.
+        query: Box<SelectStatement>,
+        /// Whether to use OR REPLACE semantics.
+        or_replace: bool,
+    },
+    /// DROP VIEW statement.
+    DropView {
+        /// View name.
+        name: String,
+        /// IF EXISTS flag.
+        if_exists: bool,
+    },
     /// Set operation (UNION / INTERSECT / EXCEPT).
     SetOperation {
         /// Left side of the set operation.
@@ -234,6 +250,31 @@ impl Statement {
             }
             sql_ast::Statement::Use { db_name } => {
                 Ok(Statement::UseDatabase(db_name.value.clone()))
+            }
+            // CREATE VIEW
+            sql_ast::Statement::CreateView {
+                name,
+                query,
+                or_replace,
+                ..
+            } => {
+                let view_name = object_name_to_single_ident(&name)?;
+                let select = SelectStatement::from_sql_ast(*query)?;
+                Ok(Statement::CreateView {
+                    name: view_name,
+                    query: Box::new(select),
+                    or_replace,
+                })
+            }
+            // DROP VIEW
+            sql_ast::Statement::Drop {
+                object_type: sql_ast::ObjectType::View,
+                if_exists,
+                names,
+                ..
+            } if names.len() == 1 => {
+                let name = object_name_to_single_ident(&names[0])?;
+                Ok(Statement::DropView { name, if_exists })
             }
             // Handle DESCRIBE table
             sql_ast::Statement::ExplainTable {
