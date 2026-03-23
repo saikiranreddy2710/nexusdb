@@ -13,7 +13,9 @@ use super::{
     TopNExec, Value, ValuesExec, WindowExec,
 };
 use crate::logical::Schema;
-use crate::physical::{ExecutionContext, ExecutionMetrics, PhysicalOperator, PhysicalPlan};
+use crate::physical::{
+    ExecutionContext, ExecutionMetrics, PhysicalExpr, PhysicalOperator, PhysicalPlan,
+};
 
 /// Query executor that runs physical plans.
 #[derive(Debug)]
@@ -173,17 +175,44 @@ impl QueryExecutor {
             }
 
             PhysicalOperator::IndexScan(scan) => {
-                // Fall back to sequential scan for now
+                // Execute as filtered sequential scan with index conditions applied.
+                // The planner chose this path because an index exists — the executor
+                // applies all conditions as filters for correctness.
                 let data = self
                     .tables
                     .get(&scan.table_name)
                     .cloned()
                     .unwrap_or_default();
-                Ok(Box::new(SeqScanExec::new(
-                    scan.projected_schema.clone(),
+                let base: Box<dyn Operator> = Box::new(SeqScanExec::new(
+                    scan.table_schema.clone(),
                     scan.table_name.clone(),
                     data,
-                )))
+                ));
+
+                // Chain index conditions + remaining filters as FilterExec
+                let all_filters: Vec<_> = scan
+                    .index_conditions
+                    .iter()
+                    .chain(scan.filters.iter())
+                    .cloned()
+                    .collect();
+
+                let filtered: Box<dyn Operator> = if all_filters.is_empty() {
+                    base
+                } else {
+                    // Combine all filter predicates with AND
+                    let combined = all_filters
+                        .into_iter()
+                        .reduce(|a, b| PhysicalExpr::BinaryExpr {
+                            left: Box::new(a),
+                            op: crate::logical::BinaryOp::And,
+                            right: Box::new(b),
+                        })
+                        .unwrap();
+                    Box::new(FilterExec::new(base, combined))
+                };
+
+                Ok(filtered)
             }
 
             PhysicalOperator::Filter(filter) => {

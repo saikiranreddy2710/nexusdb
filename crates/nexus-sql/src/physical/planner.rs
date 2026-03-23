@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::logical::Schema;
 use crate::logical::{
     AggregateOperator, CteOperator, DistinctOperator, EmptyRelationOperator, FilterOperator,
     JoinOperator, JoinType, LimitOperator, LogicalOperator, ProjectionOperator, ScanOperator,
@@ -20,10 +21,10 @@ use super::expr::{
 };
 use super::operator::{
     AggregationMode, DistinctPhysicalOperator, EmptyOperator, FilterPhysicalOperator,
-    HashAggregateOperator, HashJoinOperator, JoinKey, LimitPhysicalOperator, MergeJoinOperator,
-    NestedLoopJoinOperator, PhysicalOperator, ProjectionPhysicalOperator, SeqScanOperator,
-    SetOperationPhysicalOperator, SortAggregateOperator, SortPhysicalOperator, TopNOperator,
-    ValuesPhysicalOperator,
+    HashAggregateOperator, HashJoinOperator, IndexScanOperator, JoinKey, LimitPhysicalOperator,
+    MergeJoinOperator, NestedLoopJoinOperator, PhysicalOperator, ProjectionPhysicalOperator,
+    SeqScanOperator, SetOperationPhysicalOperator, SortAggregateOperator, SortPhysicalOperator,
+    TopNOperator, ValuesPhysicalOperator,
 };
 use super::plan::PhysicalPlan;
 
@@ -72,10 +73,14 @@ impl<'a> PhysicalPlanner<'a> {
         }
     }
 
-    /// Plans a table scan.
+    /// Plans a table scan — chooses IndexScan when a suitable index exists.
     fn plan_scan(&self, scan: &ScanOperator) -> Result<PhysicalOperator, PlanningError> {
-        // For now, always use sequential scan
-        // TODO: Use index scan when appropriate based on filters and available indexes
+        // Check if an index scan is beneficial
+        if let Some(index_scan) = self.try_index_scan(scan)? {
+            return Ok(PhysicalOperator::IndexScan(index_scan));
+        }
+
+        // Fallback: sequential scan
         let mut phys_scan =
             SeqScanOperator::new(scan.table_name.clone(), (*scan.table_schema).clone());
 
@@ -100,6 +105,75 @@ impl<'a> PhysicalPlanner<'a> {
         }
 
         Ok(PhysicalOperator::SeqScan(phys_scan))
+    }
+
+    /// Attempts to build an IndexScan if a suitable index exists for the scan's filters.
+    ///
+    /// Checks each filter for equality/comparison on indexed columns.
+    /// Returns `None` if no index can be used.
+    fn try_index_scan(
+        &self,
+        scan: &ScanOperator,
+    ) -> Result<Option<IndexScanOperator>, PlanningError> {
+        let table_meta = match &scan.table_meta {
+            Some(meta) => meta,
+            None => return Ok(None), // no metadata, can't check indexes
+        };
+
+        if table_meta.indexes.is_empty() || scan.filters.is_empty() {
+            return Ok(None);
+        }
+
+        // For each filter, check if it's a simple equality/comparison on an indexed column
+        for filter in &scan.filters {
+            if let Some((col_name, _op)) = extract_column_comparison(filter) {
+                // Find an index whose first column matches
+                for index in &table_meta.indexes {
+                    if index.columns.first().map(|c| c.as_str()) == Some(col_name.as_str()) {
+                        // Convert filter to physical expression
+                        let mut index_conditions = Vec::new();
+                        let mut remaining_filters = Vec::new();
+
+                        for f in &scan.filters {
+                            let phys_f = create_physical_expr(f, &scan.table_schema)
+                                .map_err(|e| PlanningError::Internal(e))?;
+                            if let Some((cn, _)) = extract_column_comparison(f) {
+                                if index.columns.contains(&cn) {
+                                    index_conditions.push(phys_f);
+                                    continue;
+                                }
+                            }
+                            remaining_filters.push(phys_f);
+                        }
+
+                        let projected_schema = scan.projection.as_ref().map_or_else(
+                            || scan.table_schema.clone(),
+                            |proj| {
+                                let fields: Vec<_> = proj
+                                    .iter()
+                                    .filter_map(|&i| scan.table_schema.field(i).cloned())
+                                    .collect();
+                                std::sync::Arc::new(Schema::new(fields))
+                            },
+                        );
+
+                        return Ok(Some(IndexScanOperator {
+                            table_name: scan.table_name.clone(),
+                            index_name: index.name.clone(),
+                            table_schema: scan.table_schema.clone(),
+                            projected_schema,
+                            index_conditions,
+                            filters: remaining_filters,
+                            is_range_scan: false,
+                            ordering: None,
+                            limit: scan.limit,
+                        }));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Plans a projection.
@@ -464,19 +538,19 @@ impl<'a> PhysicalPlanner<'a> {
     /// Window functions require sorting the input by partition and order keys,
     /// then computing the window function for each partition.
     fn plan_window(&self, window: &WindowOperator) -> Result<PhysicalOperator, PlanningError> {
-        use crate::logical::{WindowFunc as LogicalWindowFunc, LogicalExpr};
         use super::operator::{
-            WindowExpr, WindowFrame, WindowFrameBound, WindowFrameType, WindowFunc, 
-            WindowPhysicalOperator, SortExpr as PhysSortExpr,
+            SortExpr as PhysSortExpr, WindowExpr, WindowFrame, WindowFrameBound, WindowFrameType,
+            WindowFunc, WindowPhysicalOperator,
         };
-        
+        use crate::logical::{LogicalExpr, WindowFunc as LogicalWindowFunc};
+
         // Plan the child operator
         let input = Arc::new(self.plan_operator(&window.input)?);
         let input_schema = window.input.schema();
-        
+
         // Convert logical window expressions to physical
         let mut physical_window_exprs = Vec::new();
-        
+
         for (i, expr) in window.window_exprs.iter().enumerate() {
             if let LogicalExpr::WindowFunction {
                 func,
@@ -499,28 +573,33 @@ impl<'a> PhysicalPlanner<'a> {
                     LogicalWindowFunc::NthValue => WindowFunc::NthValue,
                     LogicalWindowFunc::Aggregate(agg) => WindowFunc::Aggregate(*agg),
                     LogicalWindowFunc::PercentRank | LogicalWindowFunc::CumeDist => {
-                        return Err(PlanningError::Unsupported(
-                            format!("Window function {:?} not yet implemented", func),
-                        ));
+                        return Err(PlanningError::Unsupported(format!(
+                            "Window function {:?} not yet implemented",
+                            func
+                        )));
                     }
                 };
-                
+
                 // Convert arguments
                 let physical_args: Result<Vec<PhysicalExpr>, PlanningError> = args
                     .iter()
-                    .map(|a| create_physical_expr(a, &input_schema)
-                        .map_err(|e| PlanningError::ExpressionError(e.to_string())))
+                    .map(|a| {
+                        create_physical_expr(a, &input_schema)
+                            .map_err(|e| PlanningError::ExpressionError(e.to_string()))
+                    })
                     .collect();
                 let physical_args = physical_args?;
-                
+
                 // Convert partition by (if any)
                 let physical_partition_by: Result<Vec<PhysicalExpr>, PlanningError> = partition_by
                     .iter()
-                    .map(|e| create_physical_expr(e, &input_schema)
-                        .map_err(|e| PlanningError::ExpressionError(e.to_string())))
+                    .map(|e| {
+                        create_physical_expr(e, &input_schema)
+                            .map_err(|e| PlanningError::ExpressionError(e.to_string()))
+                    })
                     .collect();
                 let physical_partition_by = physical_partition_by?;
-                
+
                 // Convert order by (if any)
                 let physical_order_by: Vec<PhysSortExpr> = order_by
                     .iter()
@@ -534,17 +613,17 @@ impl<'a> PhysicalPlanner<'a> {
                             })
                     })
                     .collect();
-                
+
                 // Convert window frame (if any)
                 let physical_frame = window_frame.as_ref().map(|f| {
                     use crate::logical::{WindowFrameBound as LB, WindowFrameType as LT};
-                    
+
                     let frame_type = match f.frame_type {
                         LT::Rows => WindowFrameType::Rows,
                         LT::Range => WindowFrameType::Range,
                         LT::Groups => WindowFrameType::Groups,
                     };
-                    
+
                     let convert_bound = |b: &LB| match b {
                         LB::UnboundedPreceding => WindowFrameBound::UnboundedPreceding,
                         LB::UnboundedFollowing => WindowFrameBound::UnboundedFollowing,
@@ -552,14 +631,14 @@ impl<'a> PhysicalPlanner<'a> {
                         LB::Preceding(n) => WindowFrameBound::Preceding(*n),
                         LB::Following(n) => WindowFrameBound::Following(*n),
                     };
-                    
+
                     WindowFrame {
                         frame_type,
                         start: convert_bound(&f.start),
                         end: convert_bound(&f.end),
                     }
                 });
-                
+
                 physical_window_exprs.push(WindowExpr {
                     func: physical_func,
                     args: physical_args,
@@ -574,7 +653,7 @@ impl<'a> PhysicalPlanner<'a> {
                 ));
             }
         }
-        
+
         Ok(PhysicalOperator::Window(WindowPhysicalOperator {
             input,
             window_exprs: physical_window_exprs,
@@ -588,6 +667,34 @@ impl<'a> PhysicalPlanner<'a> {
         // For now, just plan the main query
         self.plan_operator(&cte.input)
     }
+}
+
+/// Extracts column name and operator from a simple comparison filter.
+///
+/// Returns `Some((column_name, op))` for patterns like:
+///   `column = value`, `column > value`, `column < value`
+/// Returns `None` for complex expressions.
+fn extract_column_comparison(
+    expr: &crate::logical::LogicalExpr,
+) -> Option<(String, crate::logical::BinaryOp)> {
+    use crate::logical::{BinaryOp, LogicalExpr};
+
+    if let LogicalExpr::BinaryOp { left, op, .. } = expr {
+        match op {
+            BinaryOp::Eq
+            | BinaryOp::Lt
+            | BinaryOp::Gt
+            | BinaryOp::LtEq
+            | BinaryOp::GtEq
+            | BinaryOp::NotEq => {
+                if let LogicalExpr::Column(col) = left.as_ref() {
+                    return Some((col.name.clone(), op.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Helper function to create a physical planner with default context.
