@@ -1817,9 +1817,20 @@ impl Session {
         let ctx = ExecutionContext::default();
         let mut executor = nexus_sql::executor::QueryExecutor::new(ctx);
 
+        // Register real tables
         for table_name in self.storage().list_tables() {
             if let Ok(batches) = self.storage().execute_scan(&table_name) {
                 executor.register_table(table_name, batches);
+            }
+        }
+
+        // Materialize CTEs: execute each CTE query and register results
+        // as virtual tables so the main query can reference them via SeqScan.
+        if let Statement::Select(select) = statement {
+            for cte in &select.ctes {
+                if let Ok(cte_result) = self.execute_cte_query(&cte.query) {
+                    executor.register_table(cte.name.clone(), cte_result);
+                }
             }
         }
 
@@ -2019,6 +2030,56 @@ impl Session {
 
     /// Resolves all subquery expressions in a parsed statement by executing
     /// them and replacing with materialized literal values.
+    /// Executes a CTE subquery and returns its results as RecordBatches.
+    ///
+    /// Used to materialize CTE definitions before the main query runs.
+    fn execute_cte_query(
+        &self,
+        cte_select: &nexus_sql::parser::SelectStatement,
+    ) -> DatabaseResult<Vec<nexus_sql::executor::RecordBatch>> {
+        let cte_stmt = Statement::Select(cte_select.clone());
+
+        // Build plan for the CTE query
+        let mut catalog = MemoryCatalog::new();
+        for table_name in self.storage().list_tables() {
+            if let Some(table_info) = self.storage().get_table_info(&table_name) {
+                let meta = nexus_sql::logical::TableMeta::new(
+                    table_name.clone(),
+                    (*table_info.schema).clone(),
+                );
+                catalog.add_table(meta);
+            }
+        }
+
+        let logical_plan = build_plan(&cte_stmt, &catalog)
+            .map_err(|e| DatabaseError::PlanError(format!("CTE plan error: {}", e)))?;
+        let optimizer = Optimizer::new(OptimizerConfig::default());
+        let optimized = optimizer
+            .optimize(logical_plan)
+            .map_err(|e| DatabaseError::PlanError(format!("CTE optimize error: {}", e)))?;
+
+        let ctx = ExecutionContext::default();
+        let physical_planner = PhysicalPlanner::new(&ctx);
+        let plan = physical_planner
+            .create_physical_plan(&optimized.root)
+            .map_err(|e| DatabaseError::PlanError(format!("CTE physical plan error: {}", e)))?;
+
+        // Execute
+        let exec_ctx = ExecutionContext::default();
+        let mut executor = nexus_sql::executor::QueryExecutor::new(exec_ctx);
+        for table_name in self.storage().list_tables() {
+            if let Ok(batches) = self.storage().execute_scan(&table_name) {
+                executor.register_table(table_name, batches);
+            }
+        }
+
+        let result = executor
+            .execute(&plan)
+            .map_err(|e| DatabaseError::ExecutionError(format!("CTE execution error: {}", e)))?;
+
+        Ok(result.batches)
+    }
+
     fn resolve_subqueries_in_statement(&self, statement: &Statement) -> DatabaseResult<Statement> {
         match statement {
             Statement::Select(select) => {
