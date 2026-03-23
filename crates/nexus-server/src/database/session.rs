@@ -901,6 +901,46 @@ impl Session {
             }
         }
 
+        // Extract foreign key constraints from table-level constraints
+        let mut foreign_keys = Vec::new();
+        for tc in &create.constraints {
+            if let nexus_sql::parser::TableConstraint::ForeignKey {
+                columns: fk_cols,
+                ref_table,
+                ref_columns: fk_ref_cols,
+                ..
+            } = tc
+            {
+                let col_indices: Vec<usize> = fk_cols
+                    .iter()
+                    .filter_map(|col_name| create.columns.iter().position(|c| c.name == *col_name))
+                    .collect();
+                foreign_keys.push(nexus_sql::storage::ForeignKeyConstraint {
+                    columns: col_indices,
+                    ref_table: ref_table.clone(),
+                    ref_columns: fk_ref_cols.clone(),
+                });
+            }
+        }
+
+        // Also extract column-level REFERENCES
+        for (i, col) in create.columns.iter().enumerate() {
+            for constraint in &col.constraints {
+                if let nexus_sql::parser::ColumnConstraint::References {
+                    table,
+                    column: ref_col,
+                } = constraint
+                {
+                    let ref_columns = ref_col.iter().cloned().collect();
+                    foreign_keys.push(nexus_sql::storage::ForeignKeyConstraint {
+                        columns: vec![i],
+                        ref_table: table.clone(),
+                        ref_columns,
+                    });
+                }
+            }
+        }
+
         // Create table info
         let mut info = TableInfo::new(name.clone(), schema);
         if !primary_key.is_empty() {
@@ -909,6 +949,7 @@ impl Session {
         info.unique_columns = unique_columns;
         info.defaults = defaults;
         info.check_constraints = check_constraints;
+        info.foreign_keys = foreign_keys;
 
         self.storage().create_table(info)?;
 
@@ -1524,6 +1565,11 @@ impl Session {
             Self::apply_defaults(row, &table_info);
             self.validate_row(row, &table_info)?;
             self.validate_unique(row, table_name, &table_info, None)?;
+        }
+
+        // Validate foreign key constraints
+        for row in &rows {
+            self.validate_foreign_keys(row, &table_info)?;
         }
 
         let count = self.storage().execute_insert(table_name, rows.clone())?;
@@ -2573,6 +2619,73 @@ impl Session {
     ///
     /// Checks each unique column to ensure no other row has the same value.
     /// `exclude_pk` allows skipping the row being updated (identified by PK).
+    /// Validates foreign key constraints for a row.
+    ///
+    /// For each FK, checks that the referenced row exists in the referenced table.
+    fn validate_foreign_keys(
+        &self,
+        row: &Row,
+        table_info: &nexus_sql::storage::TableInfo,
+    ) -> DatabaseResult<()> {
+        for fk in &table_info.foreign_keys {
+            // Get the FK column values from the row
+            let fk_values: Vec<&Value> = fk.columns.iter().filter_map(|&i| row.get(i)).collect();
+
+            // Skip if any FK value is NULL (NULLs don't violate FK constraints)
+            if fk_values.iter().any(|v| v.is_null()) {
+                continue;
+            }
+
+            // Check that the referenced table exists and has a matching row
+            let ref_table = self.storage().get_table(&fk.ref_table);
+            if ref_table.is_none() {
+                return Err(DatabaseError::ExecutionError(format!(
+                    "foreign key references non-existent table \"{}\"",
+                    fk.ref_table
+                )));
+            }
+            let ref_store = ref_table.unwrap();
+
+            // Scan the referenced table for a matching PK
+            let all_rows = ref_store
+                .scan_all()
+                .map_err(|e| DatabaseError::ExecutionError(e.to_string()))?;
+
+            let ref_schema = ref_store.info().schema.clone();
+            let ref_col_indices: Vec<usize> = fk
+                .ref_columns
+                .iter()
+                .filter_map(|name| ref_schema.fields().iter().position(|f| f.name() == name))
+                .collect();
+
+            let found = all_rows.iter().any(|ref_row| {
+                fk_values
+                    .iter()
+                    .zip(ref_col_indices.iter())
+                    .all(|(fk_val, &ref_idx)| {
+                        ref_row
+                            .get(ref_idx)
+                            .map_or(false, |ref_val| *fk_val == ref_val)
+                    })
+            });
+
+            if !found {
+                let fk_col_names: Vec<&str> = fk
+                    .columns
+                    .iter()
+                    .filter_map(|&i| table_info.schema.field(i).map(|f| f.name()))
+                    .collect();
+                return Err(DatabaseError::ExecutionError(format!(
+                    "foreign key violation: values ({}) not found in \"{}.{}\"",
+                    fk_col_names.join(", "),
+                    fk.ref_table,
+                    fk.ref_columns.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_unique(
         &self,
         row: &Row,

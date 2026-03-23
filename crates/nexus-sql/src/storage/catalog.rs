@@ -66,6 +66,20 @@ pub struct TableInfo {
     pub defaults: Vec<ColumnDefault>,
     /// CHECK constraints.
     pub check_constraints: Vec<CheckConstraint>,
+    /// Foreign key constraints.
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
+}
+
+/// A foreign key constraint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForeignKeyConstraint {
+    /// Column indices in this table.
+    pub columns: Vec<usize>,
+    /// Referenced table name.
+    pub ref_table: String,
+    /// Referenced column names.
+    pub ref_columns: Vec<String>,
 }
 
 impl TableInfo {
@@ -81,6 +95,7 @@ impl TableInfo {
             unique_columns: Vec::new(),
             defaults: Vec::new(),
             check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 

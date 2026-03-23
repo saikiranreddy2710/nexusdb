@@ -38,7 +38,9 @@ mod error;
 pub mod hybrid;
 mod table;
 
-pub use catalog::{Catalog, CheckConstraint, ColumnDefault, IndexInfo, IndexType, TableInfo};
+pub use catalog::{
+    Catalog, CheckConstraint, ColumnDefault, ForeignKeyConstraint, IndexInfo, IndexType, TableInfo,
+};
 pub use encoder::{EncodingFormat, RowDecoder, RowEncoder};
 pub use engine::{QuerySession, StorageEngine};
 pub use error::{StorageError, StorageResult};
