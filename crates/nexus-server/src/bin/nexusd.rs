@@ -98,6 +98,18 @@ struct Args {
     #[arg(long, env = "NEXUS_ADMIN_PASSWORD")]
     admin_password: Option<String>,
 
+    /// Enable Raft distributed consensus
+    #[arg(long, env = "NEXUS_RAFT")]
+    raft: bool,
+
+    /// Raft node ID (unique per cluster member)
+    #[arg(long, default_value_t = 1, env = "NEXUS_NODE_ID")]
+    node_id: u64,
+
+    /// Raft peer addresses (comma-separated: "2=host2:7001,3=host3:7001")
+    #[arg(long, env = "NEXUS_RAFT_PEERS", value_delimiter = ',')]
+    raft_peers: Vec<String>,
+
     /// Print configuration and exit
     #[arg(long)]
     print_config: bool,
@@ -172,6 +184,13 @@ fn load_config(args: &Args) -> Result<ServerConfig> {
 
     if let Some(dir) = &args.wal_dir {
         config.wal_dir = Some(dir.clone());
+    }
+
+    // Raft configuration
+    if args.raft {
+        config.enable_raft = true;
+        config.node_id = args.node_id;
+        config.raft_peers = args.raft_peers.clone();
     }
 
     // Auth configuration
@@ -259,19 +278,58 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         .parse()
         .context("Invalid server address")?;
 
+    // Start Raft node if enabled
+    if config.enable_raft {
+        let raft_config = nexus_raft::RaftConfig::new(config.node_id)
+            .with_peers(
+                config
+                    .raft_peers
+                    .iter()
+                    .filter_map(|p| p.split('=').next().and_then(|id| id.parse().ok()))
+                    .collect(),
+            );
+        let state_machine =
+            nexus_server::database::DatabaseStateMachine::new(db.clone());
+        let raft_node = nexus_raft::RaftNode::new(raft_config, state_machine);
+
+        info!(
+            "Raft consensus ENABLED (node_id={}, peers={:?})",
+            config.node_id, config.raft_peers
+        );
+
+        // Start Raft tick loop in background
+        let raft = std::sync::Arc::new(parking_lot::Mutex::new(raft_node));
+        let raft_clone = raft.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+            loop {
+                interval.tick().await;
+                let mut node = raft_clone.lock();
+                let _messages = node.tick();
+                // TODO: send messages via Transport
+                node.apply_committed();
+            }
+        });
+    }
+
     info!("Server configuration:");
     info!("  Listen address: {}", addr);
     info!("  Max connections: {}", config.max_connections);
     info!("  Buffer pool: {} MB", config.buffer_pool_mb);
     info!("  Memory mode: {}", config.memory_mode);
     info!("  Auth enabled: {}", config.auth_enabled);
+    info!("  Raft enabled: {}", config.enable_raft);
 
     // Create the gRPC server
     let grpc_addr = addr;
     let grpc_server = GrpcServer::new(db.clone(), grpc_addr);
 
-    // Create the PostgreSQL wire protocol server
-    let pg_port = config.port.saturating_sub(1).max(5432);
+    // pgwire listens on port-1 so it does not share the gRPC port (default: gRPC 5432, pgwire 5431).
+    let pg_port = config
+        .port
+        .checked_sub(1)
+        .filter(|&p| p > 0)
+        .unwrap_or_else(|| config.port.saturating_add(1));
     let pg_addr: SocketAddr = format!("{}:{}", config.host, pg_port)
         .parse()
         .context("Invalid PG wire address")?;

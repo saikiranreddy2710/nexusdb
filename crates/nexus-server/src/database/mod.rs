@@ -65,12 +65,14 @@
 
 mod engine;
 mod error;
+pub mod raft_sm;
 mod result;
 mod session;
 mod vector_index;
 
 pub use engine::{Database, DatabaseConfig, DatabaseStats, DEFAULT_DATABASE_NAME};
 pub use error::{DatabaseError, DatabaseResult};
+pub use raft_sm::{DatabaseStateMachine, RaftCommand};
 pub use result::{ExecuteResult, StatementResult};
 pub use session::{Session, SessionConfig, SessionId, SessionState};
 pub use vector_index::{VectorIndexKey, VectorIndexManager};
