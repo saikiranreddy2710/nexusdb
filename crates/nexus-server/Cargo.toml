@@ -44,6 +44,7 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 pgwire = { workspace = true }
+opensrv-mysql = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 

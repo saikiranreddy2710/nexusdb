@@ -58,6 +58,9 @@ pub mod config;
 /// PostgreSQL wire protocol handler.
 pub mod pgwire_handler;
 
+/// MySQL wire protocol handler.
+pub mod mysql_handler;
+
 // Re-export commonly used types
 pub use database::{
     Database, DatabaseConfig, DatabaseError, DatabaseResult, DatabaseStats, ExecuteResult, Session,

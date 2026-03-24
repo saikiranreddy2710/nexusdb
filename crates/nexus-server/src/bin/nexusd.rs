@@ -338,10 +338,20 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         db.clone(),
     ));
 
-    // Start both servers with graceful shutdown
+    // MySQL wire protocol on port+1 (default: 5433)
+    let mysql_port = config.port.saturating_add(1);
+    let mysql_addr: SocketAddr = format!("{}:{}", config.host, mysql_port)
+        .parse()
+        .context("Invalid MySQL wire address")?;
+
+    let mysql_db = db.clone();
+
+    // Start all three servers with graceful shutdown
     info!("Starting gRPC server on {}...", grpc_addr);
     info!("Starting PostgreSQL wire protocol on {}...", pg_addr);
-    info!("  Connect with: psql -h {} -p {}", config.host, pg_port);
+    info!("Starting MySQL wire protocol on {}...", mysql_addr);
+    info!("  psql:  psql -h {} -p {}", config.host, pg_port);
+    info!("  mysql: mysql -h {} -P {}", config.host, mysql_port);
     info!("Press Ctrl+C to shutdown");
 
     tokio::select! {
@@ -355,6 +365,12 @@ async fn run_server(config: ServerConfig) -> Result<()> {
             if let Err(e) = result {
                 error!("pgwire server error: {}", e);
                 return Err(anyhow::anyhow!("pgwire server error: {}", e));
+            }
+        }
+        result = run_mysql_server(mysql_addr, mysql_db) => {
+            if let Err(e) = result {
+                error!("MySQL server error: {}", e);
+                return Err(anyhow::anyhow!("MySQL server error: {}", e));
             }
         }
         _ = shutdown_signal() => {
@@ -373,6 +389,24 @@ async fn run_server(config: ServerConfig) -> Result<()> {
 
     info!("Server stopped. Goodbye!");
     Ok(())
+}
+
+/// Runs the MySQL wire protocol listener.
+async fn run_mysql_server(addr: SocketAddr, db: Arc<Database>) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        debug!("MySQL connection from {}", peer);
+        let handler = nexus_server::mysql_handler::MysqlQueryHandler::new(db.clone());
+        let (r, w) = stream.into_split();
+        tokio::spawn(async move {
+            if let Err(e) =
+                opensrv_mysql::AsyncMysqlIntermediary::run_on(handler, r, w).await
+            {
+                error!("MySQL connection error from {}: {}", peer, e);
+            }
+        });
+    }
 }
 
 /// Runs the PostgreSQL wire protocol listener.
