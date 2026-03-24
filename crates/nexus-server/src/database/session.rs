@@ -74,6 +74,8 @@ pub struct SessionConfig {
     pub query_timeout: Duration,
     /// Maximum rows to return.
     pub max_rows: Option<usize>,
+    /// Slow query threshold in milliseconds (0 = disabled).
+    pub slow_query_threshold_ms: u64,
 }
 
 impl Default for SessionConfig {
@@ -83,6 +85,7 @@ impl Default for SessionConfig {
             autocommit: true,
             query_timeout: Duration::from_secs(300),
             max_rows: None,
+            slow_query_threshold_ms: 0,
         }
     }
 }
@@ -336,6 +339,21 @@ impl Session {
         self.statement_count += 1;
         let start = Instant::now();
 
+        // Handle virtual schema queries (information_schema, pg_catalog)
+        let sql_lower = sql.to_lowercase();
+        if sql_lower.contains("information_schema.") || sql_lower.contains("pg_catalog.") {
+            return self.execute_virtual_schema(sql, &sql_lower, start);
+        }
+
+        // Handle server variable queries (SELECT version(), SHOW server_version)
+        if sql_lower.starts_with("select version()") || sql_lower.starts_with("show server_version")
+        {
+            return Ok(self.server_version_result());
+        }
+
+        // Log slow queries
+        let slow_threshold = self.config.slow_query_threshold_ms;
+
         // Parse the SQL
         let statement = Parser::parse_one(sql)?;
 
@@ -344,6 +362,17 @@ impl Session {
 
         // Execute based on statement type
         let result = self.execute_statement(&statement, sql, start);
+
+        // Slow query logging
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        if slow_threshold > 0 && elapsed_ms > slow_threshold {
+            tracing::warn!(
+                "Slow query ({}ms > {}ms threshold): {}",
+                elapsed_ms,
+                slow_threshold,
+                sql
+            );
+        }
 
         // Audit the query
         let success = result.is_ok();
@@ -358,6 +387,255 @@ impl Session {
         );
 
         result
+    }
+
+    // =========================================================================
+    // Virtual Schema Queries (information_schema, pg_catalog)
+    // =========================================================================
+
+    /// Handles queries against information_schema and pg_catalog virtual schemas.
+    fn execute_virtual_schema(
+        &self,
+        _sql: &str,
+        sql_lower: &str,
+        start: Instant,
+    ) -> DatabaseResult<StatementResult> {
+        let schema_ref = std::sync::Arc::new(nexus_sql::logical::Schema::empty());
+
+        // information_schema.tables
+        if sql_lower.contains("information_schema.tables") {
+            return self.information_schema_tables(start);
+        }
+        // information_schema.columns
+        if sql_lower.contains("information_schema.columns") {
+            return self.information_schema_columns(start);
+        }
+        // pg_catalog.pg_tables
+        if sql_lower.contains("pg_catalog.pg_tables") || sql_lower.contains("pg_tables") {
+            return self.pg_catalog_tables(start);
+        }
+        // pg_catalog.pg_type
+        if sql_lower.contains("pg_catalog.pg_type") || sql_lower.contains("pg_type") {
+            return self.pg_catalog_types(start);
+        }
+        // pg_catalog.pg_namespace
+        if sql_lower.contains("pg_catalog.pg_namespace") || sql_lower.contains("pg_namespace") {
+            return self.pg_catalog_namespaces(start);
+        }
+
+        Err(DatabaseError::ExecutionError(format!(
+            "unsupported virtual schema query"
+        )))
+    }
+
+    /// SELECT * FROM information_schema.tables
+    fn information_schema_tables(&self, start: Instant) -> DatabaseResult<StatementResult> {
+        use nexus_sql::executor::{RecordBatch, Row, Value};
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        let schema = Schema::new(vec![
+            Field::nullable("table_catalog", DataType::Text),
+            Field::nullable("table_schema", DataType::Text),
+            Field::nullable("table_name", DataType::Text),
+            Field::nullable("table_type", DataType::Text),
+        ]);
+
+        let mut rows = Vec::new();
+        for name in self.storage().list_tables() {
+            rows.push(Row::new(vec![
+                Value::String(self.current_database.clone()),
+                Value::String("public".to_string()),
+                Value::String(name),
+                Value::String("BASE TABLE".to_string()),
+            ]));
+        }
+        for name in self.storage().list_views() {
+            rows.push(Row::new(vec![
+                Value::String(self.current_database.clone()),
+                Value::String("public".to_string()),
+                Value::String(name),
+                Value::String("VIEW".to_string()),
+            ]));
+        }
+
+        let schema_ref = std::sync::Arc::new(schema);
+        let batch = RecordBatch::from_rows(schema_ref.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+        let result = super::ExecuteResult::from_batches(schema_ref, vec![batch], start.elapsed());
+        Ok(StatementResult::Query(result))
+    }
+
+    /// SELECT * FROM information_schema.columns
+    fn information_schema_columns(&self, start: Instant) -> DatabaseResult<StatementResult> {
+        use nexus_sql::executor::{RecordBatch, Row, Value};
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        let schema = Schema::new(vec![
+            Field::nullable("table_catalog", DataType::Text),
+            Field::nullable("table_schema", DataType::Text),
+            Field::nullable("table_name", DataType::Text),
+            Field::nullable("column_name", DataType::Text),
+            Field::nullable("ordinal_position", DataType::Int),
+            Field::nullable("is_nullable", DataType::Text),
+            Field::nullable("data_type", DataType::Text),
+        ]);
+
+        let mut rows = Vec::new();
+        for table_name in self.storage().list_tables() {
+            if let Some(info) = self.storage().get_table_info(&table_name) {
+                for (i, field) in info.schema.fields().iter().enumerate() {
+                    rows.push(Row::new(vec![
+                        Value::String(self.current_database.clone()),
+                        Value::String("public".to_string()),
+                        Value::String(table_name.clone()),
+                        Value::String(field.name().to_string()),
+                        Value::Int((i + 1) as i32),
+                        Value::String(if field.nullable { "YES" } else { "NO" }.to_string()),
+                        Value::String(format!("{:?}", field.data_type)),
+                    ]));
+                }
+            }
+        }
+
+        let schema_ref = std::sync::Arc::new(schema);
+        let batch = RecordBatch::from_rows(schema_ref.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+        let result = super::ExecuteResult::from_batches(schema_ref, vec![batch], start.elapsed());
+        Ok(StatementResult::Query(result))
+    }
+
+    /// SELECT * FROM pg_catalog.pg_tables
+    fn pg_catalog_tables(&self, start: Instant) -> DatabaseResult<StatementResult> {
+        use nexus_sql::executor::{RecordBatch, Row, Value};
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        let schema = Schema::new(vec![
+            Field::nullable("schemaname", DataType::Text),
+            Field::nullable("tablename", DataType::Text),
+            Field::nullable("tableowner", DataType::Text),
+            Field::nullable("hasindexes", DataType::Boolean),
+        ]);
+
+        let mut rows = Vec::new();
+        for name in self.storage().list_tables() {
+            let has_indexes = self
+                .storage()
+                .get_table_info(&name)
+                .map(|i| !i.indexes.is_empty())
+                .unwrap_or(false);
+            rows.push(Row::new(vec![
+                Value::String("public".to_string()),
+                Value::String(name),
+                Value::String(self.identity.username.clone()),
+                Value::Boolean(has_indexes),
+            ]));
+        }
+
+        let schema_ref = std::sync::Arc::new(schema);
+        let batch = RecordBatch::from_rows(schema_ref.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+        let result = super::ExecuteResult::from_batches(schema_ref, vec![batch], start.elapsed());
+        Ok(StatementResult::Query(result))
+    }
+
+    /// SELECT * FROM pg_catalog.pg_type (commonly probed by PG drivers)
+    fn pg_catalog_types(&self, start: Instant) -> DatabaseResult<StatementResult> {
+        use nexus_sql::executor::{RecordBatch, Row, Value};
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        let schema = Schema::new(vec![
+            Field::nullable("oid", DataType::Int),
+            Field::nullable("typname", DataType::Text),
+            Field::nullable("typlen", DataType::Int),
+            Field::nullable("typtype", DataType::Text),
+        ]);
+
+        // Core PG types that drivers probe for
+        let types = vec![
+            (16, "bool", 1),
+            (20, "int8", 8),
+            (21, "int2", 2),
+            (23, "int4", 4),
+            (25, "text", -1),
+            (700, "float4", 4),
+            (701, "float8", 8),
+            (1043, "varchar", -1),
+            (1082, "date", 4),
+            (1083, "time", 8),
+            (1114, "timestamp", 8),
+            (1700, "numeric", -1),
+            (17, "bytea", -1),
+        ];
+
+        let rows: Vec<Row> = types
+            .into_iter()
+            .map(|(oid, name, len)| {
+                Row::new(vec![
+                    Value::Int(oid),
+                    Value::String(name.to_string()),
+                    Value::Int(len),
+                    Value::String("b".to_string()),
+                ])
+            })
+            .collect();
+
+        let schema_ref = std::sync::Arc::new(schema);
+        let batch = RecordBatch::from_rows(schema_ref.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+        let result = super::ExecuteResult::from_batches(schema_ref, vec![batch], start.elapsed());
+        Ok(StatementResult::Query(result))
+    }
+
+    /// SELECT * FROM pg_catalog.pg_namespace
+    fn pg_catalog_namespaces(&self, start: Instant) -> DatabaseResult<StatementResult> {
+        use nexus_sql::executor::{RecordBatch, Row, Value};
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        let schema = Schema::new(vec![
+            Field::nullable("oid", DataType::Int),
+            Field::nullable("nspname", DataType::Text),
+        ]);
+
+        let rows = vec![
+            Row::new(vec![
+                Value::Int(11),
+                Value::String("pg_catalog".to_string()),
+            ]),
+            Row::new(vec![Value::Int(2200), Value::String("public".to_string())]),
+            Row::new(vec![
+                Value::Int(12695),
+                Value::String("information_schema".to_string()),
+            ]),
+        ];
+
+        let schema_ref = std::sync::Arc::new(schema);
+        let batch = RecordBatch::from_rows(schema_ref.clone(), &rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+        let result = super::ExecuteResult::from_batches(schema_ref, vec![batch], start.elapsed());
+        Ok(StatementResult::Query(result))
+    }
+
+    /// Returns SELECT version() result.
+    fn server_version_result(&self) -> StatementResult {
+        use nexus_sql::executor::{RecordBatch, Row, Value};
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        let schema = Schema::new(vec![Field::nullable("version", DataType::Text)]);
+        let row = Row::new(vec![Value::String(
+            "NexusDB 0.1.0 (PostgreSQL compatible)".to_string(),
+        )]);
+        let schema_ref = std::sync::Arc::new(schema);
+        let batch = RecordBatch::from_rows(schema_ref.clone(), &[row])
+            .unwrap_or_else(|_| RecordBatch::empty(schema_ref.clone()));
+        let result =
+            super::ExecuteResult::from_batches(schema_ref, vec![batch], std::time::Duration::ZERO);
+        StatementResult::Query(result)
     }
 
     /// Checks whether the current identity is authorized to execute the given statement.
