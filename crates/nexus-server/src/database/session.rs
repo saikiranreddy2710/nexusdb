@@ -390,6 +390,79 @@ impl Session {
     }
 
     // =========================================================================
+    // =========================================================================
+    // Backup / Dump Support
+    // =========================================================================
+
+    /// Generates a SQL dump of all tables in the current database.
+    ///
+    /// Returns CREATE TABLE + INSERT statements that can recreate the database.
+    pub fn dump_database(&self) -> DatabaseResult<String> {
+        let mut output = String::new();
+        output.push_str("-- NexusDB database dump\n");
+        output.push_str(&format!("-- Database: {}\n\n", self.current_database));
+
+        for table_name in self.storage().list_tables() {
+            if let Some(info) = self.storage().get_table_info(&table_name) {
+                output.push_str(&self.generate_create_table(&table_name, &info));
+                output.push_str("\n\n");
+            }
+
+            if let Ok(batches) = self.storage().execute_scan(&table_name) {
+                let rows: Vec<Row> = batches.iter().flat_map(|b| b.rows()).collect();
+                for row in &rows {
+                    let values: Vec<String> = row
+                        .iter()
+                        .map(|v| match v {
+                            Value::Null => "NULL".to_string(),
+                            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                            Value::Boolean(b) => b.to_string(),
+                            _ => v.to_string(),
+                        })
+                        .collect();
+                    output.push_str(&format!(
+                        "INSERT INTO {} VALUES ({});\n",
+                        table_name,
+                        values.join(", ")
+                    ));
+                }
+                output.push('\n');
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Generates a CREATE TABLE statement from table metadata.
+    fn generate_create_table(&self, name: &str, info: &nexus_sql::storage::TableInfo) -> String {
+        let mut sql = format!("CREATE TABLE {} (\n", name);
+
+        for (i, field) in info.schema.fields().iter().enumerate() {
+            if i > 0 {
+                sql.push_str(",\n");
+            }
+            sql.push_str(&format!("  {} {:?}", field.name(), field.data_type));
+            if !field.nullable {
+                sql.push_str(" NOT NULL");
+            }
+        }
+
+        if !info.primary_key.is_empty() {
+            let pk_cols: Vec<&str> = info
+                .primary_key
+                .iter()
+                .filter_map(|&i| info.schema.field(i).map(|f| f.name()))
+                .collect();
+            if !pk_cols.is_empty() {
+                sql.push_str(&format!(",\n  PRIMARY KEY ({})", pk_cols.join(", ")));
+            }
+        }
+
+        sql.push_str("\n);");
+        sql
+    }
+
+    // =========================================================================
     // Virtual Schema Queries (information_schema, pg_catalog)
     // =========================================================================
 

@@ -41,6 +41,8 @@ pub enum Command {
     ConnectionInfo,
     /// Switch to a different database (and optionally user).
     ConnectDatabase { db: String, user: Option<String> },
+    /// Dump database to SQL file.
+    Dump(Option<String>),
     /// Toggle timing.
     Timing,
     /// Toggle expanded/vertical display.
@@ -99,6 +101,7 @@ impl Command {
                 None => Command::ConnectionInfo,
             },
             "timing" | "t" => Command::Timing,
+            "dump" => Command::Dump(args),
             "x" | "expanded" => Command::Expanded,
             "format" | "f" => Command::Format(args.unwrap_or_else(|| "table".to_string())),
             "version" | "v" => Command::Version,
@@ -155,6 +158,79 @@ impl Command {
             }
             
             Command::Timing => Ok(CommandResult::ToggleTiming),
+
+            Command::Dump(path) => {
+                if let Some(client) = repl.client() {
+                    // Execute a special dump query that returns all table DDL + data
+                    match client.execute("SHOW TABLES").await {
+                        Ok(result) => {
+                            let mut dump = String::new();
+                            dump.push_str("-- NexusDB SQL Dump\n\n");
+
+                            // Get table list from result
+                            for row in &result.rows {
+                                if let Some(nexus_client::Value::String(table_name)) =
+                                    row.first()
+                                {
+                                    // Get CREATE TABLE via DESCRIBE
+                                    dump.push_str(&format!("-- Table: {}\n", table_name));
+
+                                    // Get data
+                                    if let Ok(data) = client
+                                        .execute(&format!(
+                                            "SELECT * FROM {}",
+                                            table_name
+                                        ))
+                                        .await
+                                    {
+                                        for row in &data.rows {
+                                            let vals: Vec<String> = row
+                                                .iter()
+                                                .map(|v| match v {
+                                                    nexus_client::Value::Null => {
+                                                        "NULL".to_string()
+                                                    }
+                                                    nexus_client::Value::String(s) => {
+                                                        format!(
+                                                            "'{}'",
+                                                            s.replace('\'', "''")
+                                                        )
+                                                    }
+                                                    v => v.to_string(),
+                                                })
+                                                .collect();
+                                            dump.push_str(&format!(
+                                                "INSERT INTO {} VALUES ({});\n",
+                                                table_name,
+                                                vals.join(", ")
+                                            ));
+                                        }
+                                        dump.push('\n');
+                                    }
+                                }
+                            }
+
+                            if let Some(file_path) = path {
+                                match std::fs::write(&file_path, &dump) {
+                                    Ok(_) => Ok(CommandResult::Output(format!(
+                                        "Database dumped to {}",
+                                        file_path
+                                    ))),
+                                    Err(e) => Ok(CommandResult::Output(format!(
+                                        "Error writing dump: {}",
+                                        e
+                                    ))),
+                                }
+                            } else {
+                                Ok(CommandResult::Output(dump))
+                            }
+                        }
+                        Err(e) => Ok(CommandResult::Output(format!("Dump error: {}", e))),
+                    }
+                } else {
+                    Ok(CommandResult::Output("Not connected.".to_string()))
+                }
+            }
             Command::Expanded => Ok(CommandResult::ToggleExpanded),
             
             Command::Format(format) => {
@@ -247,6 +323,7 @@ Transaction:
   \rollback       Rollback the transaction
 
 Display:
+  \dump [FILE]    Dump database to SQL (CREATE TABLE + INSERT statements)
   \x, \expanded   Toggle expanded/vertical display (one column per line)
   \t, \timing     Toggle timing display
   \f FORMAT       Set output format: table, json, csv, raw
