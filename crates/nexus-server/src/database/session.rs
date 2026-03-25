@@ -351,6 +351,33 @@ impl Session {
             return Ok(self.server_version_result());
         }
 
+        // Handle SET commands (client_encoding, timezone, etc.)
+        // PG drivers send these on connect — accept and acknowledge.
+        if sql_lower.starts_with("set ") {
+            return self.handle_set_command(sql, &sql_lower);
+        }
+
+        // Handle RESET commands
+        if sql_lower.starts_with("reset ") {
+            return Ok(StatementResult::ddl("RESET"));
+        }
+
+        // Handle DEALLOCATE (cleanup of prepared statements)
+        if sql_lower.starts_with("deallocate ") {
+            return Ok(StatementResult::ddl("DEALLOCATE"));
+        }
+
+        // Handle DISCARD ALL (sent by connection poolers)
+        if sql_lower.starts_with("discard ") {
+            return Ok(StatementResult::ddl("DISCARD"));
+        }
+
+        // Handle server variable queries (SELECT version(), SHOW server_version)
+        if sql_lower.starts_with("select version()") || sql_lower.starts_with("show server_version")
+        {
+            return Ok(self.server_version_result());
+        }
+
         // Log slow queries
         let slow_threshold = self.config.slow_query_threshold_ms;
 
@@ -390,6 +417,72 @@ impl Session {
     }
 
     // =========================================================================
+    // =========================================================================
+    // SET Command Handling
+    // =========================================================================
+
+    /// Handles SET commands from PG drivers.
+    ///
+    /// Common commands sent automatically by drivers on connect:
+    /// - `SET client_encoding = 'UTF8'`
+    /// - `SET timezone = 'UTC'`
+    /// - `SET DateStyle = 'ISO'`
+    /// - `SET extra_float_digits = 3`
+    /// - `SET application_name = 'psycopg2'`
+    /// - `SET search_path = ...`
+    fn handle_set_command(
+        &mut self,
+        _sql: &str,
+        sql_lower: &str,
+    ) -> DatabaseResult<StatementResult> {
+        // Parse "SET name = value" or "SET name TO value"
+        let remainder = sql_lower.strip_prefix("set ").unwrap_or("");
+
+        // Handle SET search_path (used by ORMs)
+        if remainder.contains("search_path") {
+            return Ok(StatementResult::ddl("SET"));
+        }
+
+        // Handle SET client_encoding (always UTF8)
+        if remainder.contains("client_encoding") || remainder.contains("client_min_messages") {
+            return Ok(StatementResult::ddl("SET"));
+        }
+
+        // Handle SET timezone
+        if remainder.contains("timezone") || remainder.contains("time zone") {
+            return Ok(StatementResult::ddl("SET"));
+        }
+
+        // Handle SET DateStyle
+        if remainder.contains("datestyle") {
+            return Ok(StatementResult::ddl("SET"));
+        }
+
+        // Handle SET extra_float_digits (psycopg2 sends this)
+        if remainder.contains("extra_float_digits") || remainder.contains("intervalstyle") {
+            return Ok(StatementResult::ddl("SET"));
+        }
+
+        // Handle SET application_name
+        if remainder.contains("application_name") {
+            return Ok(StatementResult::ddl("SET"));
+        }
+
+        // Handle SET statement_timeout
+        if remainder.contains("statement_timeout") || remainder.contains("lock_timeout") {
+            return Ok(StatementResult::ddl("SET"));
+        }
+
+        // Handle SET standard_conforming_strings (node-postgres sends this)
+        if remainder.contains("standard_conforming_strings") {
+            return Ok(StatementResult::ddl("SET"));
+        }
+
+        // Accept any other SET command — log and acknowledge
+        tracing::debug!("Accepted SET command: {}", _sql);
+        Ok(StatementResult::ddl("SET"))
+    }
+
     // =========================================================================
     // Backup / Dump Support
     // =========================================================================
