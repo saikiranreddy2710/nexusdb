@@ -13,9 +13,15 @@ use tracing::{debug, error};
 
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
-use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type};
+use pgwire::api::portal::Portal;
+use pgwire::api::store::PortalStore;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{
+    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
+    QueryResponse, Response, Tag,
+};
+use pgwire::api::stmt::{NoopQueryParser, QueryParser, StoredStatement};
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireHandlerFactory, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
@@ -241,6 +247,67 @@ impl SimpleQueryHandler for PgWireQueryHandler {
 }
 
 // =========================================================================
+// Extended Query Handler (Parse/Bind/Describe/Execute/Sync)
+// =========================================================================
+
+#[async_trait]
+impl ExtendedQueryHandler for PgWireQueryHandler {
+    type Statement = String;
+    type QueryParser = NoopQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(NoopQueryParser::default())
+    }
+
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        _client: &mut C,
+        portal: &'a Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response<'a>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let sql = &portal.statement.statement;
+        debug!("pgwire extended query: {}", sql);
+        self.execute_one(sql)
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // For DESCRIBE, return empty param types and inferred result columns.
+        // A full implementation would parse the SQL to infer column types.
+        Ok(DescribeStatementResponse::new(vec![], vec![]))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Ok(DescribePortalResponse::new(vec![]))
+    }
+}
+
+// =========================================================================
 // Handler Factory
 // =========================================================================
 
@@ -260,7 +327,7 @@ impl NexusPgWireFactory {
 impl PgWireHandlerFactory for NexusPgWireFactory {
     type StartupHandler = NoopStartupHandler;
     type SimpleQueryHandler = PgWireQueryHandler;
-    type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
+    type ExtendedQueryHandler = PgWireQueryHandler;
     type CopyHandler = NoopCopyHandler;
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
@@ -272,7 +339,7 @@ impl PgWireHandlerFactory for NexusPgWireFactory {
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        Arc::new(PlaceholderExtendedQueryHandler)
+        self.handler.clone()
     }
 
     fn copy_handler(&self) -> Arc<Self::CopyHandler> {
