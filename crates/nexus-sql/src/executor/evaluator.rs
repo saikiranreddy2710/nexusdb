@@ -644,6 +644,212 @@ pub fn evaluate_scalar_function(name: &str, args: &[Value]) -> Result<Value, Eva
             }
         }
 
+        // ── Date/Time functions ───────────────────────────────────
+        "now" | "current_timestamp" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            let dt = format!(
+                "{}-{:02}-{:02} {:02}:{:02}:{:02}",
+                1970 + secs / 31557600,
+                (secs % 31557600) / 2629800 + 1,
+                (secs % 2629800) / 86400 + 1,
+                (secs % 86400) / 3600,
+                (secs % 3600) / 60,
+                secs % 60,
+            );
+            // Use chrono-free manual formatting; precise enough for SQL
+            // Return as String since our Timestamp type needs more work
+            Ok(Value::String(dt))
+        }
+        "current_date" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            let dt = format!(
+                "{}-{:02}-{:02}",
+                1970 + secs / 31557600,
+                (secs % 31557600) / 2629800 + 1,
+                (secs % 2629800) / 86400 + 1,
+            );
+            Ok(Value::String(dt))
+        }
+        "current_time" | "localtime" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            let dt = format!(
+                "{:02}:{:02}:{:02}",
+                (secs % 86400) / 3600,
+                (secs % 3600) / 60,
+                secs % 60,
+            );
+            Ok(Value::String(dt))
+        }
+
+        // ── Additional string functions ─────────────────────────────
+        "trim" | "btrim" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            Ok(Value::String(s.trim().to_string()))
+        }
+        "ltrim" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            Ok(Value::String(s.trim_start().to_string()))
+        }
+        "rtrim" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            Ok(Value::String(s.trim_end().to_string()))
+        }
+        "replace" => {
+            if args.len() < 3 || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            let from = args[1].to_string_value().unwrap_or_default();
+            let to = args[2].to_string_value().unwrap_or_default();
+            Ok(Value::String(s.replace(&from, &to)))
+        }
+        "position" | "strpos" => {
+            if args.len() < 2 || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let haystack = args[0].to_string_value().unwrap_or_default();
+            let needle = args[1].to_string_value().unwrap_or_default();
+            let pos = haystack.find(&needle).map(|i| i + 1).unwrap_or(0);
+            Ok(Value::Int(pos as i32))
+        }
+        "split_part" => {
+            if args.len() < 3 || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            let delim = args[1].to_string_value().unwrap_or_default();
+            let idx = args[2].to_i64().unwrap_or(1) as usize;
+            let part = s.split(&delim).nth(idx.saturating_sub(1)).unwrap_or("");
+            Ok(Value::String(part.to_string()))
+        }
+        "left" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            let n = args.get(1).and_then(|v| v.to_i64()).unwrap_or(0) as usize;
+            Ok(Value::String(s.chars().take(n).collect()))
+        }
+        "right" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            let n = args.get(1).and_then(|v| v.to_i64()).unwrap_or(0) as usize;
+            let len = s.chars().count();
+            Ok(Value::String(
+                s.chars().skip(len.saturating_sub(n)).collect(),
+            ))
+        }
+        "reverse" => {
+            if args.is_empty() || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            Ok(Value::String(s.chars().rev().collect()))
+        }
+        "repeat" => {
+            if args.len() < 2 || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            let n = args[1].to_i64().unwrap_or(0) as usize;
+            Ok(Value::String(s.repeat(n)))
+        }
+        "lpad" => {
+            if args.len() < 2 || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            let len = args[1].to_i64().unwrap_or(0) as usize;
+            let pad = args
+                .get(2)
+                .and_then(|v| v.to_string_value())
+                .unwrap_or_else(|| " ".to_string());
+            let mut result = s.clone();
+            while result.len() < len {
+                result = format!("{}{}", pad, result);
+            }
+            Ok(Value::String(result[..len.min(result.len())].to_string()))
+        }
+        "rpad" => {
+            if args.len() < 2 || args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = args[0].to_string_value().unwrap_or_default();
+            let len = args[1].to_i64().unwrap_or(0) as usize;
+            let pad = args
+                .get(2)
+                .and_then(|v| v.to_string_value())
+                .unwrap_or_else(|| " ".to_string());
+            let mut result = s.clone();
+            while result.len() < len {
+                result.push_str(&pad);
+            }
+            Ok(Value::String(result[..len.min(result.len())].to_string()))
+        }
+
+        // ── Additional math functions ───────────────────────────────
+        "mod" => {
+            if args.len() < 2 {
+                return Err(EvalError::InvalidArgument("mod requires 2 args".into()));
+            }
+            let a = args[0].to_i64().unwrap_or(0);
+            let b = args[1].to_i64().unwrap_or(1);
+            if b == 0 {
+                return Err(EvalError::DivisionByZero);
+            }
+            Ok(Value::BigInt(a % b))
+        }
+        "random" => Ok(Value::Double(rand::random::<f64>())),
+        "greatest" => {
+            let mut max = Value::Null;
+            for v in args {
+                if !v.is_null() && (max.is_null() || v > &max) {
+                    max = v.clone();
+                }
+            }
+            Ok(max)
+        }
+        "least" => {
+            let mut min = Value::Null;
+            for v in args {
+                if !v.is_null() && (min.is_null() || v < &min) {
+                    min = v.clone();
+                }
+            }
+            Ok(min)
+        }
+        "gen_random_uuid" => {
+            let uuid = format!(
+                "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                rand::random::<u32>(),
+                rand::random::<u16>(),
+                rand::random::<u16>() & 0x0FFF,
+                (rand::random::<u16>() & 0x3FFF) | 0x8000,
+                rand::random::<u64>() & 0xFFFFFFFFFFFF,
+            );
+            Ok(Value::String(uuid))
+        }
+
         _ => Err(EvalError::UnknownFunction(name.to_string())),
     }
 }
