@@ -418,6 +418,72 @@ impl Session {
 
     // =========================================================================
     // =========================================================================
+    // RETURNING clause
+    // =========================================================================
+
+    /// Builds a query result from affected rows projected by RETURNING items.
+    ///
+    /// `INSERT INTO t (a,b) VALUES (1,2) RETURNING a, b` → returns the inserted row.
+    fn build_returning_result(
+        &self,
+        rows: &[Row],
+        table_info: &nexus_sql::storage::TableInfo,
+        returning: &[nexus_sql::parser::SelectItem],
+    ) -> DatabaseResult<StatementResult> {
+        use nexus_sql::executor::RecordBatch;
+        use nexus_sql::logical::{Field, Schema};
+
+        // Determine which columns to return
+        let mut fields = Vec::new();
+        let mut col_indices = Vec::new();
+
+        for item in returning {
+            match &item.expr {
+                nexus_sql::parser::Expr::Wildcard => {
+                    // RETURNING * — all columns
+                    for (i, f) in table_info.schema.fields().iter().enumerate() {
+                        fields.push(f.clone());
+                        col_indices.push(i);
+                    }
+                }
+                nexus_sql::parser::Expr::Column(cr) => {
+                    if let Some(idx) = table_info.schema.index_of(&cr.column) {
+                        fields.push(table_info.schema.field(idx).cloned().unwrap());
+                        col_indices.push(idx);
+                    }
+                }
+                _ => {
+                    // For complex expressions, fall back to returning all columns
+                    for (i, f) in table_info.schema.fields().iter().enumerate() {
+                        fields.push(f.clone());
+                        col_indices.push(i);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Project rows
+        let projected_rows: Vec<Row> = rows
+            .iter()
+            .map(|row| {
+                let values: Vec<Value> = col_indices
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                    .collect();
+                Row::new(values)
+            })
+            .collect();
+
+        let schema = std::sync::Arc::new(Schema::new(fields));
+        let batch = RecordBatch::from_rows(schema.clone(), &projected_rows)
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+        let result =
+            super::ExecuteResult::from_batches(schema, vec![batch], std::time::Duration::ZERO);
+        Ok(StatementResult::Query(result))
+    }
+
+    // =========================================================================
     // SET Command Handling
     // =========================================================================
 
@@ -2104,6 +2170,11 @@ impl Session {
             }
         }
 
+        // Handle RETURNING clause — return affected rows as a query result
+        if !insert.returning.is_empty() {
+            return self.build_returning_result(&rows, &table_info, &insert.returning);
+        }
+
         Ok(StatementResult::Insert {
             rows_affected: count,
         })
@@ -2126,6 +2197,7 @@ impl Session {
         let all_rows: Vec<Row> = batches.iter().flat_map(|b| b.rows()).collect();
 
         let mut updated_count = 0u64;
+        let mut updated_rows = Vec::new();
 
         for row in all_rows {
             // Check WHERE clause
@@ -2180,8 +2252,14 @@ impl Session {
                 }
                 // Sync HNSW vector indexes if any vector columns changed
                 self.sync_hnsw_update(table_name, &table_info, &row, &new_row);
+                updated_rows.push(new_row);
                 updated_count += 1;
             }
+        }
+
+        // Handle RETURNING clause
+        if !update.returning.is_empty() {
+            return self.build_returning_result(&updated_rows, &table_info, &update.returning);
         }
 
         Ok(StatementResult::Update {
@@ -2211,6 +2289,7 @@ impl Session {
             .filter_map(|name| table_info.schema.index_of(name))
             .collect();
         let mut deleted_count = 0u64;
+        let mut deleted_rows = Vec::new();
 
         for row in all_rows {
             // Check WHERE clause
@@ -2236,8 +2315,14 @@ impl Session {
                 }
                 // Sync HNSW vector indexes — remove deleted vector entries
                 self.sync_hnsw_delete(table_name, &table_info, &row);
+                deleted_rows.push(row);
                 deleted_count += 1;
             }
+        }
+
+        // Handle RETURNING clause
+        if !delete.returning.is_empty() {
+            return self.build_returning_result(&deleted_rows, &table_info, &delete.returning);
         }
 
         Ok(StatementResult::Delete {
