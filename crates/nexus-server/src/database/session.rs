@@ -351,6 +351,28 @@ impl Session {
             return Ok(self.server_version_result());
         }
 
+        // Handle TRUNCATE TABLE
+        if sql_lower.starts_with("truncate ") {
+            let table_name = sql_lower
+                .strip_prefix("truncate table ")
+                .or_else(|| sql_lower.strip_prefix("truncate "))
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches(';')
+                .to_string();
+            if !table_name.is_empty() {
+                if let Some(store) = self.storage().get_table(&table_name) {
+                    store.clear();
+                    return Ok(StatementResult::ddl("TRUNCATE TABLE"));
+                } else {
+                    return Err(DatabaseError::ExecutionError(format!(
+                        "table \"{}\" does not exist",
+                        table_name
+                    )));
+                }
+            }
+        }
+
         // Handle SET commands (client_encoding, timezone, etc.)
         // PG drivers send these on connect — accept and acknowledge.
         if sql_lower.starts_with("set ") {
