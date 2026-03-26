@@ -2016,7 +2016,59 @@ impl Session {
             self.validate_foreign_keys(row, &table_info)?;
         }
 
-        let count = self.storage().execute_insert(table_name, rows.clone())?;
+        // Handle ON CONFLICT clause
+        let on_conflict = &insert.on_conflict;
+        let count = if on_conflict.is_some() {
+            let mut inserted = 0u64;
+            for row in &rows {
+                match self.storage().execute_insert(table_name, vec![row.clone()]) {
+                    Ok(n) => inserted += n,
+                    Err(nexus_sql::storage::StorageError::PrimaryKeyViolation(_)) => {
+                        match on_conflict.as_ref().unwrap().action {
+                            nexus_sql::parser::ConflictAction::DoNothing => {
+                                // Skip this row silently
+                                continue;
+                            }
+                            nexus_sql::parser::ConflictAction::DoUpdate(ref assignments) => {
+                                // Update the existing row with the assignment expressions
+                                let pk_vals: Vec<Value> = table_info
+                                    .primary_key
+                                    .iter()
+                                    .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                                    .collect();
+                                // Build a simple WHERE clause matching PK
+                                let pk_col = table_info
+                                    .primary_key
+                                    .first()
+                                    .and_then(|&i| table_info.schema.field(i))
+                                    .map(|f| f.name().to_string())
+                                    .unwrap_or_default();
+                                let pk_val = pk_vals.first().cloned().unwrap_or(Value::Null);
+
+                                // Build SET assignments and execute as UPDATE
+                                let set_parts: Vec<String> = assignments
+                                    .iter()
+                                    .map(|a| format!("{} = {:?}", a.column.column, a.value))
+                                    .collect();
+                                let update_sql = format!(
+                                    "UPDATE {} SET {} WHERE {} = {}",
+                                    table_name,
+                                    set_parts.join(", "),
+                                    pk_col,
+                                    pk_val,
+                                );
+                                let _ = self.execute(&update_sql);
+                                inserted += 1;
+                            }
+                        }
+                    }
+                    Err(e) => return Err(DatabaseError::StorageError(e)),
+                }
+            }
+            inserted
+        } else {
+            self.storage().execute_insert(table_name, rows.clone())?
+        };
 
         // Record undo entries for transaction rollback
         if self.in_transaction() {

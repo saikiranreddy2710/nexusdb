@@ -114,9 +114,10 @@ impl Statement {
                 columns,
                 source,
                 returning,
+                on,
                 ..
             } => Ok(Statement::Insert(InsertStatement::from_parts(
-                table_name, columns, source, returning,
+                table_name, columns, source, returning, on,
             )?)),
             sql_ast::Statement::Update {
                 table,
@@ -783,6 +784,7 @@ impl InsertStatement {
         columns: Vec<sql_ast::Ident>,
         source: Option<Box<sql_ast::Query>>,
         returning: Option<Vec<sql_ast::SelectItem>>,
+        on_conflict: Option<sql_ast::OnInsert>,
     ) -> ParseResult<Self> {
         let table = table_ref_from_object_name(&table_name);
         let columns: Vec<_> = columns.into_iter().map(|c| c.value).collect();
@@ -798,11 +800,72 @@ impl InsertStatement {
             .map(SelectItem::from_sql_ast)
             .collect();
 
+        // Parse ON CONFLICT clause
+        let parsed_conflict = match on_conflict {
+            Some(sql_ast::OnInsert::OnConflict(oc)) => {
+                let target: Vec<String> = oc
+                    .conflict_target
+                    .map(|ct| match ct {
+                        sql_ast::ConflictTarget::Columns(cols) => {
+                            cols.into_iter().map(|c| c.value).collect()
+                        }
+                        _ => Vec::new(),
+                    })
+                    .unwrap_or_default();
+
+                let action = match oc.action {
+                    sql_ast::OnConflictAction::DoNothing => ConflictAction::DoNothing,
+                    sql_ast::OnConflictAction::DoUpdate(updates) => {
+                        let assignments: ParseResult<Vec<_>> = updates
+                            .assignments
+                            .into_iter()
+                            .map(|a| {
+                                let col_name =
+                                    a.id.iter()
+                                        .map(|i| i.value.clone())
+                                        .collect::<Vec<_>>()
+                                        .join(".");
+                                Ok(Assignment {
+                                    column: ColumnRef::new(col_name),
+                                    value: Expr::from_sql_ast(a.value)?,
+                                })
+                            })
+                            .collect();
+                        ConflictAction::DoUpdate(assignments?)
+                    }
+                };
+
+                Some(OnConflict { target, action })
+            }
+            Some(sql_ast::OnInsert::DuplicateKeyUpdate(updates)) => {
+                let assignments: ParseResult<Vec<_>> = updates
+                    .into_iter()
+                    .map(|a| {
+                        let col_name =
+                            a.id.iter()
+                                .map(|i| i.value.clone())
+                                .collect::<Vec<_>>()
+                                .join(".");
+                        Ok(Assignment {
+                            column: ColumnRef::new(col_name),
+                            value: Expr::from_sql_ast(a.value)?,
+                        })
+                    })
+                    .collect();
+                Some(OnConflict {
+                    target: Vec::new(),
+                    action: ConflictAction::DoUpdate(assignments?),
+                })
+            }
+            Some(_) => None, // Other ON INSERT variants not supported
+            None => None,
+        };
+
         Ok(Self {
             table,
             columns,
             values,
-            on_conflict: None, // TODO: Parse ON CONFLICT
+            on_conflict: parsed_conflict,
             returning: returning?,
         })
     }
