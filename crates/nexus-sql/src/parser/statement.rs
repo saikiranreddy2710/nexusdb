@@ -505,9 +505,15 @@ impl SelectStatement {
     /// Converts from sqlparser's Query.
     pub fn from_sql_ast(query: sql_ast::Query) -> ParseResult<Self> {
         // Parse CTEs
+        let is_recursive = query.with.as_ref().map(|w| w.recursive).unwrap_or(false);
         let ctes: ParseResult<Vec<_>> = query
             .with
-            .map(|w| w.cte_tables.into_iter().map(CTE::from_sql_ast).collect())
+            .map(|w| {
+                w.cte_tables
+                    .into_iter()
+                    .map(|c| CTE::from_sql_ast(c, is_recursive))
+                    .collect()
+            })
             .unwrap_or_else(|| Ok(Vec::new()));
 
         // Parse the main SELECT
@@ -749,15 +755,18 @@ pub struct CTE {
     pub columns: Vec<String>,
     /// The query.
     pub query: SelectStatement,
+    /// Whether this is a recursive CTE.
+    pub recursive: bool,
 }
 
 impl CTE {
     /// Converts from sqlparser's Cte.
-    pub fn from_sql_ast(cte: sql_ast::Cte) -> ParseResult<Self> {
+    pub fn from_sql_ast(cte: sql_ast::Cte, recursive: bool) -> ParseResult<Self> {
         Ok(Self {
             name: cte.alias.name.value,
             columns: cte.alias.columns.into_iter().map(|c| c.value).collect(),
             query: SelectStatement::from_sql_ast(*cte.query)?,
+            recursive,
         })
     }
 }

@@ -2504,7 +2504,12 @@ impl Session {
         // as virtual tables so the main query can reference them via SeqScan.
         if let Statement::Select(select) = statement {
             for cte in &select.ctes {
-                if let Ok(cte_result) = self.execute_cte_query(&cte.query) {
+                if cte.recursive {
+                    // Recursive CTE: iterate until no new rows
+                    if let Ok(batches) = self.execute_recursive_cte(cte) {
+                        executor.register_table(cte.name.clone(), batches);
+                    }
+                } else if let Ok(cte_result) = self.execute_cte_query(&cte.query) {
                     executor.register_table(cte.name.clone(), cte_result);
                 }
             }
@@ -2709,6 +2714,89 @@ impl Session {
     /// Executes a CTE subquery and returns its results as RecordBatches.
     ///
     /// Used to materialize CTE definitions before the main query runs.
+    /// Executes a recursive CTE by iterating until fixpoint (no new rows).
+    ///
+    /// WITH RECURSIVE cte AS (
+    ///   base_query          -- executed once
+    ///   UNION ALL
+    ///   recursive_query     -- executed repeatedly, referencing cte
+    /// )
+    fn execute_recursive_cte(
+        &self,
+        cte: &nexus_sql::parser::CTE,
+    ) -> DatabaseResult<Vec<nexus_sql::executor::RecordBatch>> {
+        const MAX_ITERATIONS: usize = 1000;
+
+        // Execute the CTE query once to get the base case results
+        let mut all_batches = self.execute_cte_query(&cte.query)?;
+        let mut prev_row_count = all_batches.iter().map(|b| b.num_rows()).sum::<usize>();
+
+        // Iterate: re-execute the CTE query with previous results registered
+        // as the CTE name, accumulating new rows each iteration
+        for _ in 0..MAX_ITERATIONS {
+            // Build a catalog + executor with current CTE results registered
+            let mut catalog = MemoryCatalog::new();
+            for table_name in self.storage().list_tables() {
+                if let Some(table_info) = self.storage().get_table_info(&table_name) {
+                    let meta = nexus_sql::logical::TableMeta::new(
+                        table_name.clone(),
+                        (*table_info.schema).clone(),
+                    );
+                    catalog.add_table(meta);
+                }
+            }
+            // Register the CTE itself as a table (for recursive reference)
+            if let Some(first_batch) = all_batches.first() {
+                let schema_ref = first_batch.schema();
+                let cte_schema = nexus_sql::logical::Schema::new(schema_ref.fields().to_vec());
+                let meta = nexus_sql::logical::TableMeta::new(cte.name.clone(), cte_schema);
+                catalog.add_table(meta);
+            }
+
+            let stmt = Statement::Select(cte.query.clone());
+            let logical_plan = match build_plan(&stmt, &catalog) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let optimizer = Optimizer::new(OptimizerConfig::default());
+            let optimized = match optimizer.optimize(logical_plan) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let ctx = ExecutionContext::default();
+            let physical_planner = PhysicalPlanner::new(&ctx);
+            let plan = match physical_planner.create_physical_plan(&optimized.root) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+
+            let exec_ctx = ExecutionContext::default();
+            let mut executor = nexus_sql::executor::QueryExecutor::new(exec_ctx);
+            for table_name in self.storage().list_tables() {
+                if let Ok(batches) = self.storage().execute_scan(&table_name) {
+                    executor.register_table(table_name, batches);
+                }
+            }
+            // Register current CTE results as the CTE table
+            executor.register_table(cte.name.clone(), all_batches.clone());
+
+            let result = match executor.execute(&plan) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+
+            let new_row_count: usize = result.batches.iter().map(|b| b.num_rows()).sum();
+            if new_row_count == 0 || new_row_count == prev_row_count {
+                break; // fixpoint reached
+            }
+
+            all_batches = result.batches;
+            prev_row_count = new_row_count;
+        }
+
+        Ok(all_batches)
+    }
+
     fn execute_cte_query(
         &self,
         cte_select: &nexus_sql::parser::SelectStatement,
