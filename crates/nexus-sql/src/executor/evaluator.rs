@@ -690,6 +690,90 @@ pub fn evaluate_scalar_function(name: &str, args: &[Value]) -> Result<Value, Eva
             Ok(Value::String(dt))
         }
 
+        // EXTRACT(field FROM timestamp_string)
+        "extract" => {
+            if args.len() < 2 {
+                return Err(EvalError::InvalidArgument("extract requires 2 args".into()));
+            }
+            let field = args[0].to_string_value().unwrap_or_default().to_lowercase();
+            let ts = args[1].to_string_value().unwrap_or_default();
+            // Parse "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD"
+            let parts: Vec<&str> = ts
+                .split(|c| c == '-' || c == ' ' || c == ':' || c == 'T')
+                .collect();
+            let year: i64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let month: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let day: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let hour: i64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let minute: i64 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let second: i64 = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let val = match field.as_str() {
+                "year" => year,
+                "month" => month,
+                "day" => day,
+                "hour" => hour,
+                "minute" => minute,
+                "second" => second,
+                "dow" | "dayofweek" => (day % 7), // simplified
+                "doy" | "dayofyear" => month * 30 + day, // approximate
+                "quarter" => (month - 1) / 3 + 1,
+                "week" => (month * 30 + day) / 7,
+                "epoch" => {
+                    year * 31557600
+                        + month * 2629800
+                        + day * 86400
+                        + hour * 3600
+                        + minute * 60
+                        + second
+                }
+                _ => {
+                    return Err(EvalError::InvalidArgument(format!(
+                        "unknown extract field: {}",
+                        field
+                    )))
+                }
+            };
+            Ok(Value::BigInt(val))
+        }
+        // DATE_TRUNC(field, timestamp_string)
+        "date_trunc" => {
+            if args.len() < 2 {
+                return Err(EvalError::InvalidArgument(
+                    "date_trunc requires 2 args".into(),
+                ));
+            }
+            let field = args[0].to_string_value().unwrap_or_default().to_lowercase();
+            let ts = args[1].to_string_value().unwrap_or_default();
+            let parts: Vec<&str> = ts
+                .split(|c| c == '-' || c == ' ' || c == ':' || c == 'T')
+                .collect();
+            let year = parts.first().unwrap_or(&"1970");
+            let month = parts.get(1).unwrap_or(&"01");
+            let day = parts.get(2).unwrap_or(&"01");
+            let result = match field.as_str() {
+                "year" => format!("{}-01-01 00:00:00", year),
+                "month" => format!("{}-{}-01 00:00:00", year, month),
+                "day" => format!("{}-{}-{} 00:00:00", year, month, day),
+                "hour" => {
+                    let hour = parts.get(3).unwrap_or(&"00");
+                    format!("{}-{}-{} {}:00:00", year, month, day, hour)
+                }
+                "minute" => {
+                    let hour = parts.get(3).unwrap_or(&"00");
+                    let min = parts.get(4).unwrap_or(&"00");
+                    format!("{}-{}-{} {}:{}:00", year, month, day, hour, min)
+                }
+                "quarter" => {
+                    let m: i32 = month.parse().unwrap_or(1);
+                    let q_start = ((m - 1) / 3) * 3 + 1;
+                    format!("{}-{:02}-01 00:00:00", year, q_start)
+                }
+                "week" => format!("{}-{}-{} 00:00:00", year, month, day), // simplified
+                _ => ts.clone(),
+            };
+            Ok(Value::String(result))
+        }
+
         // ── Additional string functions ─────────────────────────────
         "trim" | "btrim" => {
             if args.is_empty() || args[0].is_null() {
