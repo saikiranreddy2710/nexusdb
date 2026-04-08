@@ -31,6 +31,8 @@ pub struct StorageEngine {
     tables: RwLock<HashMap<String, Arc<TableStore>>>,
     /// View definitions (name → SQL query string).
     views: RwLock<HashMap<String, String>>,
+    /// Sequences (name → current value).
+    sequences: RwLock<HashMap<String, std::sync::atomic::AtomicI64>>,
     /// Default encoding format.
     encoding_format: EncodingFormat,
     /// Data directory for disk persistence (None = in-memory only).
@@ -44,6 +46,7 @@ impl StorageEngine {
             catalog: Catalog::new(),
             tables: RwLock::new(HashMap::new()),
             views: RwLock::new(HashMap::new()),
+            sequences: RwLock::new(HashMap::new()),
             encoding_format: EncodingFormat::Binary,
             data_dir: None,
         }
@@ -94,6 +97,7 @@ impl StorageEngine {
                 catalog,
                 tables: RwLock::new(table_map),
                 views: RwLock::new(HashMap::new()),
+                sequences: RwLock::new(HashMap::new()),
                 encoding_format: EncodingFormat::Binary,
                 data_dir: Some(data_dir),
             })
@@ -103,6 +107,7 @@ impl StorageEngine {
                 catalog: Catalog::new(),
                 tables: RwLock::new(HashMap::new()),
                 views: RwLock::new(HashMap::new()),
+                sequences: RwLock::new(HashMap::new()),
                 encoding_format: EncodingFormat::Binary,
                 data_dir: Some(data_dir),
             })
@@ -456,6 +461,58 @@ impl StorageEngine {
     pub fn list_views(&self) -> Vec<String> {
         let views = self.views.read().unwrap();
         views.keys().cloned().collect()
+    }
+
+    // =========================================================================
+    // Sequence Operations
+    // =========================================================================
+
+    /// Creates a new sequence with a starting value.
+    pub fn create_sequence(&self, name: &str, start: i64) -> StorageResult<()> {
+        let mut seqs = self.sequences.write().unwrap();
+        if seqs.contains_key(name) {
+            return Err(StorageError::InvalidOperation(format!(
+                "sequence \"{}\" already exists",
+                name
+            )));
+        }
+        seqs.insert(name.to_string(), std::sync::atomic::AtomicI64::new(start));
+        Ok(())
+    }
+
+    /// Drops a sequence.
+    pub fn drop_sequence(&self, name: &str, if_exists: bool) -> StorageResult<()> {
+        let mut seqs = self.sequences.write().unwrap();
+        if seqs.remove(name).is_none() && !if_exists {
+            return Err(StorageError::InvalidOperation(format!(
+                "sequence \"{}\" does not exist",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the next value from a sequence (atomic increment).
+    pub fn nextval(&self, name: &str) -> StorageResult<i64> {
+        let seqs = self.sequences.read().unwrap();
+        let seq = seqs.get(name).ok_or_else(|| {
+            StorageError::InvalidOperation(format!("sequence \"{}\" does not exist", name))
+        })?;
+        Ok(seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Returns the current value of a sequence without incrementing.
+    pub fn currval(&self, name: &str) -> StorageResult<i64> {
+        let seqs = self.sequences.read().unwrap();
+        let seq = seqs.get(name).ok_or_else(|| {
+            StorageError::InvalidOperation(format!("sequence \"{}\" does not exist", name))
+        })?;
+        Ok(seq.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Lists all sequence names.
+    pub fn list_sequences(&self) -> Vec<String> {
+        self.sequences.read().unwrap().keys().cloned().collect()
     }
 
     /// Consolidates all delta chains in all tables.

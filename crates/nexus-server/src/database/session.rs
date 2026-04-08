@@ -351,6 +351,56 @@ impl Session {
             return Ok(self.server_version_result());
         }
 
+        // Handle CREATE SEQUENCE / DROP SEQUENCE
+        if sql_lower.starts_with("create sequence ") {
+            let name = sql_lower
+                .strip_prefix("create sequence ")
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches(';')
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            // Parse optional START WITH value
+            let start_val = if let Some(pos) = sql_lower.find("start") {
+                sql_lower[pos..]
+                    .split_whitespace()
+                    .nth(2) // "start with N" or "start N"
+                    .or_else(|| sql_lower[pos..].split_whitespace().nth(1))
+                    .and_then(|s| s.trim_end_matches(';').parse::<i64>().ok())
+                    .unwrap_or(1)
+            } else {
+                1
+            };
+            if !name.is_empty() {
+                self.storage()
+                    .create_sequence(&name, start_val)
+                    .map_err(|e| DatabaseError::ExecutionError(e.to_string()))?;
+                return Ok(StatementResult::ddl("CREATE SEQUENCE"));
+            }
+        }
+        if sql_lower.starts_with("drop sequence ") {
+            let remainder = sql_lower.strip_prefix("drop sequence ").unwrap_or("");
+            let if_exists = remainder.contains("if exists");
+            let name = remainder
+                .replace("if exists", "")
+                .trim()
+                .trim_end_matches(';')
+                .to_string();
+            if !name.is_empty() {
+                self.storage()
+                    .drop_sequence(&name, if_exists)
+                    .map_err(|e| DatabaseError::ExecutionError(e.to_string()))?;
+                return Ok(StatementResult::ddl("DROP SEQUENCE"));
+            }
+        }
+
+        // Handle nextval() / currval() functions
+        if sql_lower.contains("nextval(") || sql_lower.contains("currval(") {
+            return self.handle_sequence_function(sql, &sql_lower, start);
+        }
+
         // Handle TRUNCATE TABLE
         if sql_lower.starts_with("truncate ") {
             let table_name = sql_lower
@@ -439,6 +489,68 @@ impl Session {
     }
 
     // =========================================================================
+    // =========================================================================
+    // Sequence Functions
+    // =========================================================================
+
+    /// Handles SELECT nextval('seq') / currval('seq').
+    fn handle_sequence_function(
+        &self,
+        _sql: &str,
+        sql_lower: &str,
+        _start: Instant,
+    ) -> DatabaseResult<StatementResult> {
+        use nexus_sql::executor::{RecordBatch, Row, Value};
+        use nexus_sql::logical::{Field, Schema};
+        use nexus_sql::parser::DataType;
+
+        // Extract function name and sequence name
+        let (func, seq_name) = if let Some(pos) = sql_lower.find("nextval(") {
+            let after = &sql_lower[pos + 8..];
+            let name = after
+                .trim_start_matches('\'')
+                .split('\'')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            ("nextval", name)
+        } else if let Some(pos) = sql_lower.find("currval(") {
+            let after = &sql_lower[pos + 8..];
+            let name = after
+                .trim_start_matches('\'')
+                .split('\'')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            ("currval", name)
+        } else {
+            return Err(DatabaseError::ExecutionError(
+                "invalid sequence function".into(),
+            ));
+        };
+
+        let val = match func {
+            "nextval" => self
+                .storage()
+                .nextval(&seq_name)
+                .map_err(|e| DatabaseError::ExecutionError(e.to_string()))?,
+            "currval" => self
+                .storage()
+                .currval(&seq_name)
+                .map_err(|e| DatabaseError::ExecutionError(e.to_string()))?,
+            _ => unreachable!(),
+        };
+
+        let schema = Schema::new(vec![Field::nullable(func, DataType::BigInt)]);
+        let row = Row::new(vec![Value::BigInt(val)]);
+        let schema_ref = std::sync::Arc::new(schema);
+        let batch = RecordBatch::from_rows(schema_ref.clone(), &[row])
+            .map_err(|e| DatabaseError::ExecutionError(e))?;
+        let result =
+            super::ExecuteResult::from_batches(schema_ref, vec![batch], std::time::Duration::ZERO);
+        Ok(StatementResult::Query(result))
+    }
+
     // =========================================================================
     // RETURNING clause
     // =========================================================================
